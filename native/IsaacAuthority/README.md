@@ -4,7 +4,9 @@
 
 Дополнительно реализован режим `observer`: принимает по UDP позиции и скорости настоящих игроков от внешнего read-only считывателя J460. [Проверка на живой игре и запуск](../../docs/j460-live-state-reader.md). Режимы `host/client` по-прежнему используют тестовое движение; observer не управляет вторым игровым процессом.
 
-Текущий этап — [коррекция врагов](../../docs/j460-enemy-correction-test.md): NpcSource/NpcReplica (флаг `ISAAC_WORLD_NPCS`) передают врагов комнаты секцией версии 2 протокола WLD1; реплика сопоставляет собственных врагов по InitSeed и после их обновления записывает состояние хоста. Живой тест прошёл по двум маршрутам.
+Текущий этап — [ввод клиента на хосте](../../docs/j460-client-input-test.md): `IsaacAuthorityInput.dll` меняет слот менеджера ввода и отвечает за один контроллер командами протокола INP1, принятыми по UDP; игрок хоста движется и стреляет через штатную физику игры. Живой тест прошёл.
+
+Предыдущий этап — [коррекция врагов](../../docs/j460-enemy-correction-test.md): NpcSource/NpcReplica (флаг `ISAAC_WORLD_NPCS`) передают врагов комнаты секцией версии 2 протокола WLD1; реплика сопоставляет собственных врагов по InitSeed и после их обновления записывает состояние хоста. Живой тест прошёл по двум маршрутам.
 
 Предыдущий этап — [настоящий переход комнат](../../docs/j460-room-transition.md): RoomSource/RoomReplica собираются из того же `world_adapter.cpp` с флагом `ISAAC_WORLD_ROOMS`. Реплика находит комнату хоста в собственном уровне, сверяет её и запрашивает штатный переход игры; для этого обе игры должны идти с одним seed. Установщик — `scripts/Install-IsaacRoom.ps1`, тест — `scripts/Test-IsaacRoom.py`. **Живой тест прошёл по двум маршрутам:** реплику проносит её собственная дверь (удержание игрока в проёме двери не отключает), а при потере снимков у двери она сама вызывает `StartRoomTransition` и достигает комнаты за 328 мс; состояния по обе стороны двери совпали побитово.
 
@@ -22,7 +24,7 @@
 .\scripts\Build-IsaacAuthority.ps1
 ```
 
-Скрипт собирает x86 Release и запускает десять CTest-проверок. Двадцать две Python-проверки запускаются отдельно: `python -m unittest discover -s scripts/tests -p test_*.py`. Исполняемый файл исходного стенда: `Binaries/authority-build/Release/IsaacAuthorityLab.exe`. Для его повторного запуска без пересборки:
+Скрипт собирает x86 Release и запускает одиннадцать CTest-проверок. Двадцать четыре Python-проверки запускаются отдельно: `python -m unittest discover -s scripts/tests -p test_*.py`. Исполняемый файл исходного стенда: `Binaries/authority-build/Release/IsaacAuthorityLab.exe`. Для его повторного запуска без пересборки:
 
 ```powershell
 python native/IsaacAuthority/tests/loopback.py Binaries/authority-build/Release/IsaacAuthorityLab.exe

@@ -1,0 +1,36 @@
+#pragma once
+#include <cstddef>
+#include <cstdint>
+
+// A client's input for one player of the host's game. The host keeps simulating that player with the game's own
+// movement and firing code; the client never sends positions.
+namespace authority::input {
+constexpr std::size_t kBytes = 56;
+constexpr std::uint64_t kMaxAgeMs = 250;
+constexpr int kMaxController = 7;
+// ButtonAction values of the game: four movement and four shooting directions, then single buttons.
+enum Action : int { Left = 0, Right, Up, Down, ShootLeft, ShootRight, ShootUp, ShootDown, Bomb, Item, PillCard, Drop, kActions };
+struct Command {
+    std::uint64_t session = 0, timeMs = 0;
+    std::uint32_t sequence = 0;
+    std::int32_t controller = 0;
+    float moveX = 0, moveY = 0, shootX = 0, shootY = 0; // -1..1, screen axes: +x right, +y down
+    std::uint32_t buttons = 0;                          // bit n is Action(Bomb + n)
+};
+bool Valid(const Command& command);
+bool Encode(const Command& command, std::uint8_t* bytes);
+bool Decode(const std::uint8_t* bytes, std::size_t size, Command& command);
+// Analogue value the game would read from a device for this action: 0..1.
+float Value(const Command& command, int action);
+bool Pressed(const Command& command, int action);
+// Accepts only newer, fresh commands of one session; a stale command never moves the player.
+class Gate {
+public:
+    explicit Gate(std::uint64_t session) : session_(session) {}
+    bool Receive(const Command& command, std::uint64_t now);
+private:
+    std::uint64_t session_;
+    std::uint32_t sequence_ = 0;
+};
+bool Fresh(const Command& command, std::uint64_t now);
+}

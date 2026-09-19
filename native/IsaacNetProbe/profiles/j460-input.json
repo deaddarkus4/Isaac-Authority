@@ -1,0 +1,44 @@
+{
+  "gameSha256": "3bdfc8bae0dc7e334b76009d0ad45dfbb16ee5f00c06ffbc3a0094e34d44616b",
+  "scope": "player-input-read-path",
+  "playerControllerIndexOffset": "0x1618",
+  "playerGetMovementInputRva": "0x379360",
+  "playerGetShootingInputRva": "0x379620",
+  "actionValueForPlayerRva": "0x5562d0",
+  "actionPressedForPlayerRva": "0x556110",
+  "inputManagerRva": "0x857b18",
+  "inputManagerVtableRva": "0x782950",
+  "withDeviceSlot": 29,
+  "withDeviceRva": "0x620fb0",
+  "withDeviceAbi": "thiscall InputManager, five stack arguments (controller, reader, in, out, deviceIdOut), ret 0x14, returns the reader's bool",
+  "readers": {
+    "actionValue": "0x620ab0",
+    "actionPressed": "0x620940",
+    "actionTriggered": "0x6209e0"
+  },
+  "networkDevicesVector": "Manager+0x4b3d8, polled through vfunc +0x38 when the controller index is -1",
+  "buttonActions": [
+    "left",
+    "right",
+    "up",
+    "down",
+    "shootLeft",
+    "shootRight",
+    "shootUp",
+    "shootDown",
+    "bomb",
+    "item",
+    "pillCard",
+    "drop"
+  ],
+  "validation": {
+    "slotHookedInLiveGame": true,
+    "movementDrivenByInjectedInput": true,
+    "shootingDrivenByInjectedInput": true,
+    "staleCommandStopsPlayer": true,
+    "buttonsVerified": false,
+    "secondPlayerOnHost": false,
+    "clientSideCapture": false,
+    "report": "docs/j460-client-input-test.md"
+  }
+}
