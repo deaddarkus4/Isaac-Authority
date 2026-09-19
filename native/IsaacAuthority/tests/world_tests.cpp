@@ -103,6 +103,13 @@ void Enemies() {
     g = f; g.npcCount = static_cast<std::uint32_t>(kMaxNpcs + 1); Check(!Encode(g, packet), "reject oversized enemy roster without truncation");
     g = f; g.npcs[1].variant = 1; Check(!SameNpc(g.npcs[1], f.npcs[1]) && SameNpc(g.npcs[0], f.npcs[0]), "identity is type, variant, subtype and seed");
     Gate gate(123); Check(gate.Receive(f, 1000) == Decision::Accept, "enemy frames pass the same gate");
+    auto next = f; ++next.sequence; next.npcCount = 1; // The second worm died on the host.
+    Check(Departed(&f, next, f.npcs[1]) && !Departed(&f, next, f.npcs[0]), "an enemy the host stops listing has died there");
+    Check(!Departed(nullptr, next, f.npcs[1]), "nothing dies before a first snapshot");
+    auto stranger = f.npcs[1]; ++stranger.seed; Check(!Departed(&f, next, stranger), "an enemy the host never listed is not killed");
+    auto elsewhere = next; ++elsewhere.epoch; Check(!Departed(&f, elsewhere, f.npcs[1]), "another room generation proves no death");
+    elsewhere = next; ++elsewhere.room.visits; Check(!Departed(&f, elsewhere, f.npcs[1]), "another visit proves no death");
+    elsewhere = next; ++elsewhere.session; Check(!Departed(&f, elsewhere, f.npcs[1]), "another session proves no death");
 }
 void Contract(const wchar_t* path) {
     HMODULE dll = LoadLibraryW(path); Check(dll != nullptr, "load world adapter");

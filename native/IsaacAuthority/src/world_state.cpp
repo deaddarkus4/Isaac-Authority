@@ -51,6 +51,12 @@ Route Decide(const RoomKey& local, const Frame* applied, const Frame& next) {
     if (applied && (applied->epoch != next.epoch || !SameRoom(applied->room, next.room))) return Route::Restart;
     return Route::Apply;
 }
+bool Departed(const Frame* previous, const Frame& next, const Npc& npc) {
+    if (!previous || previous->session != next.session || previous->epoch != next.epoch || !SameRoom(previous->room, next.room)) return false;
+    for (std::size_t i = 0; i < next.npcCount; ++i) if (SameNpc(next.npcs[i], npc)) return false;
+    for (std::size_t i = 0; i < previous->npcCount; ++i) if (SameNpc(previous->npcs[i], npc)) return true;
+    return false;
+}
 bool Valid(const Frame& f) {
     if (!f.session || !f.epoch || !f.sequence || f.count > kMaxEntities || f.npcCount > kMaxNpcs || !BodyValid(f.player) ||
         f.room.stage > 20 || f.room.stageType > 10 || f.room.dimension > 2 || f.room.type > 40 ||

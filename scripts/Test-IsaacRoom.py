@@ -154,7 +154,29 @@ def run(args):
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
     before = set(logs.glob(stage + "-*.jsonl"))
     processes, started, failures, transmitted = {}, [], [], []
-    control = None; left_ms = None; final_rooms = {}; withheld = 0; census = {}
+    control = None; left_ms = None; final_rooms = {}; withheld = 0; census = {}; roster = 0; killed_ms = None
+
+    def fight(frame):
+        """Steer the HOST at the nearest surfaced enemy: line up on one axis, shoot along the other."""
+        px, py = frame["player"][:2]; wanted = set()
+        targets = [npc for npc in frame.get("npcs", []) if npc["flags"][0] and npc["flags"][2]]
+        if targets:
+            enemy = min(targets, key=lambda npc: (npc["body"][0] - px) ** 2 + (npc["body"][1] - py) ** 2)
+            dx, dy = enemy["body"][0] - px, enemy["body"][1] - py
+            vertical = abs(dx) <= abs(dy)  # shoot along the longer axis, line up on the shorter one
+            across, along = (dx, dy) if vertical else (dy, dx)
+            keys = ("D", "A", "S", "W", chr(0x28), chr(0x26)) if vertical else ("S", "W", "D", "A", chr(0x27), chr(0x25))
+            if abs(across) > 8:
+                wanted.add(keys[0] if across > 0 else keys[1])
+            if abs(along) > 220:  # tears fall short beyond this
+                wanted.add(keys[2] if along > 0 else keys[3])
+            if abs(across) <= 22:
+                wanted.add(keys[4] if along > 0 else keys[5])
+        for held in tuple(control.held):
+            if held not in wanted:
+                control.key(held, False)
+        for needed in wanted - control.held:
+            control.key(needed, True)
 
     def survey(*games):
         result = {}
@@ -213,8 +235,14 @@ def run(args):
                             packet = bytearray(data); struct.pack_into("<Q", packet, 8, int(endpoint["session"]))
                             udp.sendto(packet, address); transmitted.append(frame)
                         if left_ms is None and frame["room"][2] == destination["grid"]:
-                            left_ms = now; phase = "arrived"; control.release()
-                            inputs = [(now - start_ms + 1500, shoot, True), (now - start_ms + 2100, shoot, False)]
+                            left_ms = now; phase = "fight" if args.fight else "arrived"; control.release()
+                            inputs = [] if args.fight else [(now - start_ms + 1500, shoot, True), (now - start_ms + 2100, shoot, False)]
+                        elif phase == "fight":
+                            roster = max(roster, len(frame.get("npcs", [])))
+                            if len(frame.get("npcs", [])) < roster:  # the host stopped listing an enemy: it died there
+                                killed_ms = now; phase = "done"; control.release()
+                            else:
+                                fight(frame)
                         elif phase == "align":
                             error = frame["player"][axis] - centre
                             wanted = None if abs(error) <= 10 else sideways[1] if error > 0 else sideways[0]
@@ -237,7 +265,12 @@ def run(args):
                     sampled = now; census["series"].append(dict(ms=now - left_ms, **survey(source, replica)))
                 if left_ms is None and now - start_ms > 12000:
                     raise RuntimeError(f"HOST did not reach room {destination['grid']} through the {direction} door ({phase})")
-                if left_ms is not None and now - left_ms > 4000:
+                if args.fight:
+                    if killed_ms is not None and now - killed_ms > 1500:
+                        break
+                    if left_ms is not None and now - left_ms > 18000:
+                        raise RuntimeError("HOST did not kill an enemy in time")
+                elif left_ms is not None and now - left_ms > 4000:
                     break
                 time.sleep(0.005)
         census["end"] = survey(source, replica)
@@ -338,10 +371,22 @@ def run(args):
                     raise RuntimeError("Enemy capture fault or the replica player was left without collisions")
                 if not enemies["matched"] or not footer["npcCorrections"] or not footer["npcUpdates"]:
                     raise RuntimeError("No enemy of the host was matched and corrected on the replica")
+                if args.fight:
+                    fell = [r for r in applied if r["observedMs"] > reached[0]["observedMs"] and
+                            len(host_frames[(r["epoch"], r["sequence"])].get("npcs", [])) < enemies["host"]]
+                    hurt = sum(any(npc["hp"][0] < npc["hp"][1] for npc in r.get("npcs", [])) for r in applied)
+                    if not fell or not footer["npcKilled"] or footer["npcKillUnconfirmed"] or not hurt:
+                        raise RuntimeError("The host's kill or its damage did not reach the replica's enemy")
+                    summary.update(enemiesKilledByHost=enemies["host"] - len(host_frames[(fell[-1]["epoch"], fell[-1]["sequence"])].get("npcs", [])),
+                                   npcKilledOnReplica=footer["npcKilled"], damagedEnemyStatesApplied=hurt,
+                                   killAppliedAfterHostMs=fell[0]["observedMs"] - host_frames[(fell[0]["epoch"], fell[0]["sequence"])]["observedMs"])
                 # External reads of both games at the end: corrected enemies must sit where the host has them.
-                ends = {role: {(e["type"], e["variant"], e["subtype"], e["seed"]): e for e in rows if e["vtableRva"] == level.NPC_VTABLE_RVA}
+                ends = {role: {(e["type"], e["variant"], e["subtype"], e["seed"]): e for e in rows
+                               if e["vtableRva"] == level.NPC_VTABLE_RVA and not e["dead"]}
                         for role, rows in census.get("end", {}).items() if isinstance(rows, list)}
                 shared = set(ends.get("host", {})) & set(ends.get("replica", {}))
+                if args.fight and set(ends.get("host", {})) != set(ends.get("replica", {})):
+                    raise RuntimeError("The games do not agree on which enemies are alive")
                 apart = [((ends["host"][k]["position"][0] - ends["replica"][k]["position"][0]) ** 2 +
                           (ends["host"][k]["position"][1] - ends["replica"][k]["position"][1]) ** 2) ** 0.5 for k in shared]
                 summary.update(enemiesOnHost=enemies["host"], enemiesMatched=enemies["matched"], enemyFrames=enemies["frames"],
@@ -383,6 +428,7 @@ if __name__ == "__main__":
     parser.add_argument("--check", action="store_true", help="only report whether both games share the run seed and room")
     parser.add_argument("--restart-runs", action="store_true", help="first hold R in both games to restart their seeded runs")
     parser.add_argument("--stage", choices=("room", "npc"), default="room", help="npc: modules that also correct the room's enemies")
+    parser.add_argument("--fight", action="store_true", help="npc stage: the HOST kills an enemy behind the door")
     parser.add_argument("--direction", choices=sorted(level.DOORS))
     parser.add_argument("--route", choices=("door", "request"), default="door",
                         help="door: the replica is carried through by its own game; request: snapshots near the door are lost")

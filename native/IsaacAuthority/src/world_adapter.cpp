@@ -30,6 +30,8 @@ constexpr bool kNpcs = false;
 constexpr std::uintptr_t kPlayerTable = 0x76bdd0, kPlayerUpdate = 0x382af0;
 // Entity_NPC shares the entity vtable layout: slot 3 is Update.
 constexpr std::uintptr_t kNpcTable = 0x767468, kNpcUpdate = 0x2c4b30;
+// What Lua's entity:Kill() runs: builds an empty damage source and calls the virtual Kill (slot 9).
+constexpr std::uintptr_t kKill = 0x45dc30;
 constexpr std::uintptr_t kTearTable = 0x764eac, kTearUpdate = 0x2670f0, kRemove = 0x2acb00, kSpawn = 0x28b20;
 // Game::StartRoomTransition only latches a request in RoomTransition (Game+0x1b83c); the game loads the room later.
 constexpr std::uintptr_t kTransition = 0x2fd7c0, kTransitionUnwind = 0x6fc200, kRoomTransition = 0x1b83c;
@@ -68,7 +70,7 @@ std::uint64_t relocatedAt = 0;
 // Enemies of the replica's own room that the host also has; corrected after each of their own updates.
 struct Adopted { std::uintptr_t address = 0; Npc state; };
 std::array<Adopted, kMaxNpcs> adopted{};
-unsigned npcCorrections = 0, npcUpdates = 0, npcStateDrift = 0, npcVisibleDrift = 0, npcUnmatched = 0, npcOrphans = 0, lastFault = 0;
+unsigned npcKilled = 0, npcKillUnconfirmed = 0, npcCorrections = 0, npcUpdates = 0, npcStateDrift = 0, npcVisibleDrift = 0, npcUnmatched = 0, npcOrphans = 0, lastFault = 0;
 float npcDriftMax = 0;
 double npcDriftSum = 0;
 std::uint32_t playerCollision = 0;
@@ -142,6 +144,10 @@ bool WriteNpc(std::uintptr_t address, const Npc& n) {
         *reinterpret_cast<std::uint32_t*>(address + 0x184) = n.gridCollision; *reinterpret_cast<std::uint32_t*>(address + 0x188) = n.entityCollision;
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+bool KillNpc(std::uintptr_t address) {
+    __try { reinterpret_cast<Update>(base + kKill)(reinterpret_cast<void*>(address)); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 // The replica's enemies fight their own simulation; its held player must not take their hits.
 bool Shield(bool on) {
@@ -271,7 +277,13 @@ bool Adopt(std::uintptr_t game, const Frame& frame, Frame& readback) {
             if (!WriteNpc(pointers[p], frame.npcs[i]) || !ReadNpc(pointers[p], actual)) return false;
             ++npcCorrections; readback.npcs[readback.npcCount++] = actual;
         }
-        if (!found) ++npcOrphans;
+        if (found) continue;
+        // Enemies the host never listed are left alone until later spawns are replicated.
+        if (!Departed(haveFrame ? &lastFrame : nullptr, frame, local)) { ++npcOrphans; continue; }
+        unsigned char dead = 0;
+        if (!KillNpc(pointers[p])) return false;
+        ++npcKilled;
+        if (!Read(pointers[p] + 0x173, dead) || !dead) ++npcKillUnconfirmed;
     }
     for (unsigned i = 0; i < frame.npcCount; ++i) if (!matched[i]) ++npcUnmatched;
     return true;
@@ -533,6 +545,12 @@ extern "C" DWORD WINAPI IsaacAuthorityWorldStart(void*) noexcept {
             if (!Read(reinterpret_cast<std::uintptr_t>(npcSlot), npcFunction) || npcFunction != base + kNpcUpdate) return ERROR_REVISION_MISMATCH;
             originalNpc = reinterpret_cast<Update>(npcFunction);
         }
+        if constexpr (kNpcs && !kSource) {
+            // push ebp; mov ebp,esp; sub esp,0x28; movss xmm1,[...]
+            std::array<unsigned char, 10> killPrefix{};
+            constexpr std::array<unsigned char, 10> expectedKill{0x55,0x8b,0xec,0x83,0xec,0x28,0xf3,0x0f,0x10,0x0d};
+            if (!Read(base + kKill, killPrefix) || killPrefix != expectedKill) return ERROR_REVISION_MISMATCH;
+        }
         if constexpr (kRooms && !kSource) {
             // push ebp; mov ebp,esp; push -1; push <relocated unwind table>
             std::array<unsigned char, 6> transitionPrefix{}; std::uintptr_t unwind = 0;
@@ -555,7 +573,7 @@ extern "C" DWORD WINAPI IsaacAuthorityWorldStart(void*) noexcept {
         sourceSequence = 0; sourceEpoch = 1; created = removed = faults = contextChanges = tearHolds = playerHolds = frameCount = dropped = 0;
         traveling = false; travelFrame = {}; travelDeadline = 0; transitions = arrivals = levelMismatches = localFailures = 0;
         selfMoves = vanished = settled = 0; departedEpoch = 0; relocatedAt = 0;
-        adopted = {}; npcCorrections = npcUpdates = npcStateDrift = npcVisibleDrift = npcUnmatched = npcOrphans = lastFault = 0;
+        adopted = {}; npcKilled = npcKillUnconfirmed = npcCorrections = npcUpdates = npcStateDrift = npcVisibleDrift = npcUnmatched = npcOrphans = lastFault = 0;
         npcDriftMax = 0; npcDriftSum = 0; playerCollision = 0; playerShielded = false;
         stopRequested = false; cleaned = false; owner = 0;
         published = Published{}; published.session = session;
@@ -626,7 +644,7 @@ extern "C" DWORD WINAPI IsaacAuthorityWorldStop(void*) noexcept {
             << ",\"settled\":" << settled << ",\"npcCorrections\":" << npcCorrections << ",\"npcUpdates\":" << npcUpdates
             << ",\"npcStateDrift\":" << npcStateDrift << ",\"npcVisibleDrift\":" << npcVisibleDrift << ",\"npcDriftMax\":" << npcDriftMax
             << ",\"npcDriftMean\":" << (npcUpdates ? npcDriftSum / npcUpdates : 0.0) << ",\"npcUnmatched\":" << npcUnmatched
-            << ",\"npcOrphans\":" << npcOrphans << ",\"playerShielded\":" << (playerShielded ? "true" : "false") << ",\"lastFault\":" << lastFault
+            << ",\"npcOrphans\":" << npcOrphans << ",\"npcKilled\":" << npcKilled << ",\"npcKillUnconfirmed\":" << npcKillUnconfirmed << ",\"playerShielded\":" << (playerShielded ? "true" : "false") << ",\"lastFault\":" << lastFault
             << ",\"slotsRestored\":true,\"accepted\":" << receiver.accepted.load() << ",\"rejected\":" << receiver.rejected.load()
             << ",\"replaced\":" << receiver.replaced.load() << ",\"networkErrors\":" << receiver.errors.load() << "}\n";
         const auto text = out.str(); DWORD written = 0;

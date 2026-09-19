@@ -32,6 +32,10 @@ struct Npc {
     std::uint32_t visible = 0, gridCollision = 0, entityCollision = 0;
 };
 bool SameNpc(const Npc& a, const Npc& b);
+struct Frame;
+// Death is the host's decision: true when its previous snapshot of this room generation listed the enemy and the
+// next one no longer does. An enemy the host never listed is not the replica's to kill.
+bool Departed(const Frame* previous, const Frame& next, const Npc& npc);
 struct Frame {
     std::uint64_t session = 0, timeMs = 0;
     std::uint32_t epoch = 1, sequence = 0;

@@ -12,13 +12,18 @@
     "init": 1,
     "update": 3,
     "remove": 10,
-    "note": "Same layout in all four classes: slots 7, 12, 13 are shared base functions, slot 1 of the player is the known init RVA 0x355470, slot 3 of player and tear are their known update functions."
+    "note": "Same layout in all four classes: slots 7, 12, 13 are shared base functions, slot 1 of the player is the known init RVA 0x355470, slot 3 of player and tear are their known update functions.",
+    "takeDamage": 8,
+    "kill": 9
   },
   "npcFunctionsRva": {
     "update": "0x2c4b30",
     "remove": "0x2b8f00",
-    "slot9KillCandidate": "0x2be6f0",
-    "effectUpdate": "0x1d4380"
+    "effectUpdate": "0x1d4380",
+    "kill": "0x2be6f0",
+    "entityKillBase": "0x2ac920",
+    "luaKillWrapper": "0x45dc30",
+    "luaKillWrapperPrefix": "558bec83ec28f30f100d"
   },
   "entityOffsets": {
     "index": "0x20",
@@ -68,6 +73,8 @@
       "gridCollisionClass",
       "entityCollisionClass"
     ],
-    "observationReport": "docs/j460-enemies-research.md"
+    "observationReport": "docs/j460-enemies-research.md",
+    "killCalledInLiveGame": true,
+    "hostDamageAndDeathReplicated": true
   }
 }
