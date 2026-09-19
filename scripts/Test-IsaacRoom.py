@@ -69,24 +69,21 @@ def wait_running(process, role, control=None):
     game = level.u32(process.read, process.base + level.GAME_RVA)
     manager = level.u32(process.read, process.base + level.MANAGER_RVA)
 
-    def advancing(seconds):
-        first = level.u32(process.read, game + level.FRAME_COUNT)
-        until = time.monotonic() + seconds
-        while time.monotonic() < until:
-            time.sleep(0.05)
-            if level.u32(process.read, game + level.FRAME_COUNT) != first:
-                return True
-        return False
-
-    if advancing(1.5):
-        return
-    state, menu = level.u32(process.read, manager + level.MANAGER_STATE), level.u32(process.read, game + level.PAUSE_MENU)
-    # The same field is set on the death screen, where Escape means "exit to the main menu".
-    if control is not None and state == level.IN_RUN and menu and alive(process):
-        control.key(chr(0x1B), True); time.sleep(0.1); control.key(chr(0x1B), False)
-    if state == level.IN_RUN and advancing(8.0):
-        return
-    raise RuntimeError(f"{role} is not running a level (game state {state}, pause menu {menu}): "
+    first = level.u32(process.read, game + level.FRAME_COUNT)
+    until, next_escape, escapes = time.monotonic() + 12, 0.0, 0
+    state = menu = 0
+    while time.monotonic() < until:
+        time.sleep(0.05)
+        if level.u32(process.read, game + level.FRAME_COUNT) != first:
+            return
+        state, menu = level.u32(process.read, manager + level.MANAGER_STATE), level.u32(process.read, game + level.PAUSE_MENU)
+        over = level.u32(process.read, game + level.GAME_OVER)
+        # On the death screen Escape means "exit to the main menu": never send it there or for a dead player.
+        if control is not None and state == level.IN_RUN and menu and not over and alive(process) and escapes < 2 \
+                and time.monotonic() >= next_escape:
+            control.key(chr(0x1B), True); time.sleep(0.1); control.key(chr(0x1B), False)
+            escapes += 1; next_escape = time.monotonic() + 3
+    raise RuntimeError(f"{role} is not running a level (game state {state}, pause menu {menu}, Escape sent {escapes}x): "
                        "a death screen or a menu needs the player")
 
 
@@ -98,7 +95,8 @@ def restart(pid, role):
         control = pair.HostWindow(pid)
         game = level.u32(process.read, process.base + level.GAME_RVA)
         manager = level.u32(process.read, process.base + level.MANAGER_RVA)
-        if level.u32(process.read, manager + level.MANAGER_STATE) == level.IN_RUN and not alive(process):
+        if level.u32(process.read, manager + level.MANAGER_STATE) == level.IN_RUN and \
+                (level.u32(process.read, game + level.GAME_OVER) or not alive(process)):
             # Death screen: Space restarts the run; R does nothing there and Escape would leave for the main menu.
             time.sleep(0.5); control.key(" ", True); time.sleep(0.15); control.key(" ", False)
             until = time.monotonic() + 8
@@ -155,7 +153,16 @@ def run(args):
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
     before = set(logs.glob("room-*.jsonl"))
     processes, started, failures, transmitted = {}, [], [], []
-    control = None; left_ms = None; final_rooms = {}; withheld = 0
+    control = None; left_ms = None; final_rooms = {}; withheld = 0; census = {}
+
+    def survey(*games):
+        result = {}
+        for role, process in zip(("host", "replica"), games):
+            try:
+                result[role] = level.entities(process.read, process.base)
+            except (OSError, ValueError, struct.error) as error:
+                result[role] = str(error)
+        return result
 
     def invoke(action, pid, dll):
         result = subprocess.run([str(attach), action, str(pid), str(dll)], capture_output=True, text=True, timeout=20)
@@ -220,11 +227,19 @@ def run(args):
                 # The host publishes nothing while its own transition plays; only a long silence is a failure.
                 elif now - last_valid > 3000:
                     raise RuntimeError("Source stopped publishing world frames")
+                # Observation for the next stage: what each game spawned in the shared room, before the two
+                # independent simulations drift apart. Read-only and best effort.
+                if left_ms is not None and "arrival" not in census and \
+                        level.u32(replica.read, level.u32(replica.read, replica.base + level.GAME_RVA) + level.ROOM_INDEX) == destination["grid"]:
+                    census["arrival"] = survey(source, replica); census["series"] = []; sampled = now
+                elif "arrival" in census and now - sampled >= 500:
+                    sampled = now; census["series"].append(dict(ms=now - left_ms, **survey(source, replica)))
                 if left_ms is None and now - start_ms > 12000:
                     raise RuntimeError(f"HOST did not reach room {destination['grid']} through the {direction} door ({phase})")
                 if left_ms is not None and now - left_ms > 4000:
                     break
                 time.sleep(0.005)
+        census["end"] = survey(source, replica)
         for role, process in (("host", source), ("replica", replica)):
             final_rooms[role] = level.snapshot(process.read, process.base)
     except BaseException as error:
@@ -319,6 +334,9 @@ def run(args):
                            rejected=footer["rejected"], allStatesMatchFloat32=True, slotsRestored=True)
         except (RuntimeError, KeyError, IndexError, TypeError) as error:
             failures.append(str(error))
+    if census:
+        with (output / f"room-{stamp}.entities.json").open("x", encoding="utf-8") as file:
+            json.dump(census, file, indent=1)
     trace = output / f"room-{stamp}.sent.jsonl"
     with trace.open("x", encoding="utf-8") as file:
         for frame in transmitted:

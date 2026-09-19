@@ -7,7 +7,9 @@ ROOM_INDEX, DIMENSION = 0x18304, 0x1830C
 ROOM_COUNT, ROOMS, ROOM_STRIDE, ROOM_LOOKUP = 0x182CC, 0x14, 0xB8, 0x17ADC
 ROOM_TRANSITION = 0x1B83C
 FRAME_COUNT = 0x264F8
-PAUSE_MENU = 0x1D520  # 0 during play; 2 observed both with the pause menu open and on the death screen
+# Both are inputs of Game::IsPaused (RVA 0x2fd350). Observed: PAUSE_MENU 1 with Options / Resume / Exit open,
+# GAME_OVER 2 on the death screen; both 0 during play.
+PAUSE_MENU, GAME_OVER = 0x23A74, 0x1D520
 MANAGER_RVA, MANAGER_STATE, IN_RUN = 0x87169C, 8, 2  # 1 observed in the main menu
 GRID, MAX_ROOMS = 13, 527
 PLACE = ("grid", "dimension", "type", "variant", "subtype", "shape", "spawnSeed")
@@ -15,7 +17,8 @@ PLACE = ("grid", "dimension", "type", "variant", "subtype", "shape", "spawnSeed"
 DOORS = {"right": (1, "D", chr(0x27)), "left": (-1, "A", chr(0x25)), "down": (GRID, "S", chr(0x28)), "up": (-GRID, "W", chr(0x26))}
 
 
-SEED_ALPHABET = "ABCDEFGHJKLMNPQRSTWXYZ01234V6789"
+NPC_VTABLE_RVA = 0x767468  # Entity_NPC; field offsets below come from the Lua property registration of J460
+SEED_ALPHABET ="ABCDEFGHJKLMNPQRSTWXYZ01234V6789"
 
 
 def seed_checksum(value):
@@ -76,6 +79,36 @@ def snapshot(read, base):
     return dict(startSeed=u32(read, game + START_SEED), stage=u32(read, game), stageType=u32(read, game + 4),
                 index=u32(read, game + ROOM_INDEX), dimension=u32(read, game + DIMENSION),
                 transition=u32(read, game + ROOM_TRANSITION), rooms=rooms)
+
+
+def entities(read, base):
+    """Best-effort read of the current room's entity list (Room+0x125c); not an atomic snapshot."""
+    game = u32(read, base + GAME_RVA)
+    room = u32(read, game + 0x18300)
+    data, capacity, count = (u32(read, room + offset) for offset in (0x125C, 0x1260, 0x1264))
+    if count > 4096 or count > capacity:
+        raise ValueError("Invalid entity list")
+    result = []
+    for pointer in struct.unpack(f"<{count}I", read(data, count * 4)) if count else ():
+        blob = read(pointer, 0x3F0)
+        field = lambda offset: struct.unpack_from("<I", blob, offset)[0]
+        if not blob[0x172]:
+            continue
+        entity = dict(vtableRva=field(0) - base, index=field(0x20), type=field(0x28), variant=field(0x2C),
+                      subtype=field(0x30), seed=field(0x3EC), dead=blob[0x173], visible=blob[0x171],
+                      gridCollision=field(0x184), entityCollision=field(0x188),
+                      hitPoints=list(struct.unpack_from("<2f", blob, 0x380)),  # current, maximum
+                      position=list(struct.unpack_from("<2f", blob, 0x33C)),
+                      velocity=list(struct.unpack_from("<2f", blob, 0x360)),
+                      target=list(struct.unpack_from("<2f", blob, 0x334)))
+        if entity["vtableRva"] == NPC_VTABLE_RVA:
+            npc = read(pointer + 0xB60, 0x68)
+            entity["npc"] = dict(state=struct.unpack_from("<i", npc, 4)[0], stateFrame=struct.unpack_from("<i", read(pointer + 0x410, 4))[0],
+                                 projectileCooldown=struct.unpack_from("<i", npc, 0x40)[0],
+                                 v1=list(struct.unpack_from("<2f", npc, 0x50)), v2=list(struct.unpack_from("<2f", npc, 0x58)),
+                                 i1=struct.unpack_from("<i", npc, 0x60)[0], i2=struct.unpack_from("<i", npc, 0x64)[0])
+        result.append(entity)
+    return result
 
 
 def place(room):

@@ -1,0 +1,49 @@
+{
+  "gameSha256": "3bdfc8bae0dc7e334b76009d0ad45dfbb16ee5f00c06ffbc3a0094e34d44616b",
+  "scope": "entity-and-npc-fields-read-only",
+  "source": "Lua property registration in RVA 0x466960: PUSH writable; PUSH field offset; PUSH name. Accessor functions for properties bound through getters.",
+  "vtablesRva": {
+    "player": "0x76bdd0",
+    "tear": "0x764eac",
+    "npc": "0x767468",
+    "effect": "0x763bdc"
+  },
+  "entityOffsets": {
+    "index": "0x20",
+    "type": "0x28",
+    "variant": "0x2c",
+    "subtype": "0x30",
+    "visible": "0x171",
+    "exists": "0x172",
+    "dead": "0x173",
+    "gridCollisionClass": "0x184",
+    "entityCollisionClass": "0x188",
+    "spawnFrame": "0x328",
+    "targetPosition": "0x334",
+    "position": "0x33c",
+    "velocity": "0x360",
+    "hitPoints": "0x380",
+    "maxHitPoints": "0x384",
+    "collisionDamage": "0x388",
+    "initSeed": "0x3ec"
+  },
+  "npcOffsets": {
+    "stateFrame": "0x410",
+    "state": "0xb64",
+    "projectileCooldown": "0xba0",
+    "v1": "0xbb0",
+    "v2": "0xbb8",
+    "i1": "0xbc0",
+    "i2": "0xbc4"
+  },
+  "validation": {
+    "observedEnemy": "244.0.0 Round Worm, five per game, room 97 of seed CZH4 8E6W",
+    "hitPointsMatchGameData": true,
+    "stateVisibleCollisionCoherent": true,
+    "sameRosterInBothGamesByInitSeed": true,
+    "stateFrameI1I2V1V2CooldownObservedNonZero": false,
+    "npcUpdateSlotVerified": false,
+    "anyFieldWrittenInLiveGame": false,
+    "report": "docs/j460-enemies-research.md"
+  }
+}

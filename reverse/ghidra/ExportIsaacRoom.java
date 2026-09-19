@@ -19,6 +19,7 @@ public class ExportIsaacRoom extends GhidraScript {
         long imageEnd = currentProgram.getMaxAddress().getOffset();
         List<String> index = new ArrayList<>(); index.add("name\tstring\treference\tfunctionRva\tcontainingFunction");
         Map<Long, String> targets = new LinkedHashMap<>();
+        List<String> contexts = new ArrayList<>();
         for (int i = 1; i < args.length; ++i) {
             if (!args[i].startsWith("name:")) { targets.putIfAbsent(Long.decode(args[i]), "rva"); continue; }
             String name = args[i].substring(5);
@@ -45,6 +46,13 @@ public class ExportIsaacRoom extends GhidraScript {
                             }
                         }
                     }
+                    // Properties are registered with getter/setter thunks or field offsets instead of one method
+                    // pointer; keep the surrounding instructions so those can be read from the listing.
+                    contexts.add("\nSTRING " + name + " at " + text + " reference " + reference);
+                    Instruction first = push;
+                    for (int step = 0; step < 8 && first != null && first.getPrevious() != null; ++step) first = first.getPrevious();
+                    for (int step = 0; step < 14 && first != null; ++step, first = first.getNext())
+                        contexts.add(first.getAddress() + " " + first.toString());
                     Function container = getFunctionContaining(reference);
                     index.add(name + "\t" + text + "\t" + reference + "\t" + resolved + "\t" +
                         (container == null ? "" : container.getEntryPoint().toString()));
@@ -53,6 +61,7 @@ public class ExportIsaacRoom extends GhidraScript {
             }
         }
         Files.write(out.resolve("anchors.tsv"), index, StandardCharsets.UTF_8);
+        Files.write(out.resolve("contexts.txt"), contexts, StandardCharsets.UTF_8);
         DecompInterface decompiler = new DecompInterface();
         try {
             decompiler.openProgram(currentProgram);
