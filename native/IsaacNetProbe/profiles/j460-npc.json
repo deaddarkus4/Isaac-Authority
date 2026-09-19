@@ -8,6 +8,18 @@
     "npc": "0x767468",
     "effect": "0x763bdc"
   },
+  "vtableSlots": {
+    "init": 1,
+    "update": 3,
+    "remove": 10,
+    "note": "Same layout in all four classes: slots 7, 12, 13 are shared base functions, slot 1 of the player is the known init RVA 0x355470, slot 3 of player and tear are their known update functions."
+  },
+  "npcFunctionsRva": {
+    "update": "0x2c4b30",
+    "remove": "0x2b8f00",
+    "slot9KillCandidate": "0x2be6f0",
+    "effectUpdate": "0x1d4380"
+  },
   "entityOffsets": {
     "index": "0x20",
     "type": "0x28",
@@ -42,7 +54,8 @@
     "stateVisibleCollisionCoherent": true,
     "sameRosterInBothGamesByInitSeed": true,
     "stateFrameI1I2V1V2CooldownObservedNonZero": false,
-    "npcUpdateSlotVerified": false,
+    "npcUpdateSlotVerifiedStatically": true,
+    "npcUpdateHookedInLiveGame": false,
     "anyFieldWrittenInLiveGame": false,
     "report": "docs/j460-enemies-research.md"
   }
