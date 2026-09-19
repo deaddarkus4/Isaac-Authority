@@ -26,19 +26,46 @@
     "shootRight",
     "shootUp",
     "shootDown",
-    "bomb",
-    "item",
-    "pillCard",
-    "drop"
+    "bomb(8)",
+    "item(9)",
+    "pillCard(10)",
+    "drop(11)",
+    "menuConfirm(14)",
+    "menuBack(15)",
+    "join(19)",
+    "menuLeft(20)",
+    "menuRight(21)",
+    "menuUp(22)",
+    "menuDown(23)"
   ],
   "validation": {
     "slotHookedInLiveGame": true,
     "movementDrivenByInjectedInput": true,
     "shootingDrivenByInjectedInput": true,
     "staleCommandStopsPlayer": true,
-    "buttonsVerified": false,
-    "secondPlayerOnHost": false,
+    "buttonsVerified": "join and menuConfirm only",
+    "secondPlayerOnHost": true,
     "clientSideCapture": false,
-    "report": "docs/j460-client-input-test.md"
+    "report": "docs/j460-client-input-test.md",
+    "secondPlayerDrivenByInjectedInput": true,
+    "firstPlayerUnaffected": true,
+    "joinRequiresExistingSecondDevice": true
+  },
+  "coopJoinHandlerRva": "0x5bac40",
+  "coopJoin": {
+    "joinAction": 19,
+    "characterChoiceActions": {
+      "left": 20,
+      "right": 21,
+      "confirm": 14,
+      "back": 15
+    },
+    "polledOnlyForExistingDevices": true,
+    "hiddenComboActions": [
+      19,
+      8,
+      10
+    ],
+    "hiddenComboCallRva": "0x3a6450"
   }
 }

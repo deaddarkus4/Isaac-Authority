@@ -31,9 +31,14 @@ SCRIPT = [("idle", 0.5, (0, 0), (0, 0), True), ("right", 0.8, (1, 0), (0, 0), Tr
           ("rest4", 0.6, (0, 0), (0, 0), True), ("right2", 0.4, (1, 0), (0, 0), True), ("silence", 1.2, (1, 0), (0, 0), False)]
 
 
-def observe(process):
+def observe(process, controller=0):
+    """The player driven by this controller index (Entity_Player+0x1618), plus how far every other player is from its start."""
     state = reader.sample(process.read, process.base)
-    player = state["players"][0]
+    owners = {struct.unpack("<i", process.read(int(p["address"], 16) + 0x1618, 4))[0]: p for p in state["players"]}
+    if controller not in owners:
+        raise ValueError("No player is bound to this controller")
+    player = owners[controller]
+    observe.others = {index: p["position"] for index, p in owners.items() if index != controller}
     tears = [e for e in level.entities(process.read, process.base) if e["type"] == 2]
     return player["position"], player["velocity"], tears
 
@@ -52,24 +57,33 @@ def run(args):
     before = set(logs.glob("input-*.jsonl"))
     if args.restart_run:
         rooms.restart(args.pid, "HOST"); time.sleep(2.0)
-    failures, samples, started, process, control = [], [], False, None, None
+    failures, samples, started, process, control, census = [], [], False, None, None, []
 
     def invoke(action):
         result = subprocess.run([str(attach), action, str(args.pid), str(dll)], capture_output=True, text=True, timeout=20)
         if result.returncode:
             raise RuntimeError(f"{action}: {result.stdout} {result.stderr}")
 
+    script = [("observe", args.observe, (0, 0), (0, 0), False)] if args.observe else SCRIPT
+    if args.join:
+        # A free controller index asks to join the host's run; afterwards it stays neutral while the game is watched.
+        # The join opens a character choice for that controller; confirming it spawns the player.
+        script = [("before", 0.5, (0, 0), (0, 0), True), ("join", 0.3, (0, 0), (0, 0), True), ("choice", 1.2, (0, 0), (0, 0), True),
+                  ("menuConfirm", 0.3, (0, 0), (0, 0), True), ("after", args.join, (0, 0), (0, 0), True)]
     try:
         process = reader.WindowsProcess(args.pid)
         control = pair.HostWindow(args.pid)  # focus only: a game paused by focus loss simulates nothing
         rooms.wait_running(process, "HOST", control)
-        if len(reader.sample(process.read, process.base)["players"]) != 1 or not rooms.alive(process):
-            raise RuntimeError("One living player in a run is required")
+        first = reader.sample(process.read, process.base)["players"]
+        if not first or tuple(process.read(int(first[0]["address"], 16) + 0x170, 4)[2:4]) != (1, 0):  # exists, not dead
+            raise RuntimeError("A living first player in a run is required")
+        if not args.join and not args.observe:
+            observe(process, args.controller)  # the driven controller must already own a player
         invoke("input"); started = True
         endpoint = json.loads((directory / f"input-host-{args.pid}.json").read_text())
         address, sequence = ("127.0.0.1", endpoint["port"]), 0
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
-            for name, seconds, move, shoot, send in SCRIPT:
+            for name, seconds, move, shoot, send in script:
                 until = time.monotonic() + seconds
                 while time.monotonic() < until:
                     control.require_focus()
@@ -77,10 +91,15 @@ def run(args):
                         raise RuntimeError("The test itself must not hold any key")
                     if send:
                         sequence += 1
-                        udp.sendto(commands.encode(endpoint["session"], sequence, pair.uptime_ms(), args.controller, move, shoot), address)
+                        udp.sendto(commands.encode(endpoint["session"], sequence, pair.uptime_ms(), args.controller, move, shoot,
+                                                   (name,) if name in commands.BUTTONS else ()), address)
                     try:
-                        position, velocity, tears = observe(process)
-                        samples.append(dict(phase=name, ms=pair.uptime_ms(), position=position, velocity=velocity,
+                        census.append((name, len(reader.sample(process.read, process.base)["players"])))
+                    except (reader.InvalidState, OSError, ValueError, struct.error):
+                        pass
+                    try:
+                        position, velocity, tears = observe(process, 0 if args.join else args.controller)
+                        samples.append(dict(phase=name, ms=pair.uptime_ms(), position=position, velocity=velocity, others=observe.others,
                                             tears=[[t["position"][0], t["velocity"][0]] for t in tears]))
                     except (reader.InvalidState, OSError, ValueError, struct.error):
                         pass
@@ -108,7 +127,22 @@ def run(args):
         footer = json.loads(target.read_text().splitlines()[-1])
     summary = dict(utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), pid=args.pid, controller=args.controller,
                    keysPressedByTest=0, commandsSent=sequence if started else 0, reports=copied, failures=failures, passed=False)
-    if not failures:
+    if args.join and not failures:
+        counts = {name: sorted({n for phase, n in census if phase == name}) for name, *_ in script}
+        asked = {}
+        for controller, kind, action, count in (footer or {}).get("polls", []):
+            if controller == args.controller:
+                asked.setdefault(("value", "pressed", "triggered")[kind], {})[action] = count
+        summary.update(passed=bool(footer and footer["slotRestored"]), playersSeen=counts, pollsOfJoiningController=asked,
+                       triggeredReads=(footer or {}).get("triggeredReads"), accepted=(footer or {}).get("accepted"))
+    elif args.observe and not failures:
+        # Nothing is injected: only report what the game asks the input manager, per controller and action.
+        asked = {}
+        for controller, kind, action, count in (footer or {}).get("polls", []):
+            asked.setdefault(str(controller), {}).setdefault(("value", "pressed", "triggered")[kind], {})[action] = count
+        summary.update(passed=bool(footer and footer["slotRestored"]), observedSeconds=args.observe, polls=asked,
+                       passedThrough=(footer or {}).get("passedThrough"))
+    elif not failures:
         try:
             if not footer or footer["networkErrors"] or not footer["slotRestored"] or not footer["accepted"] or not footer["valueReads"]:
                 raise RuntimeError("The host module accepted or injected nothing")
@@ -131,7 +165,12 @@ def run(args):
             quiet = [s for s in by["silence"] if s["ms"] - by["silence"][0]["ms"] > 700]
             if not quiet or max(abs(v) for s in quiet for v in s["velocity"]) > 0.5:
                 raise RuntimeError("The player kept moving on a stale command")
-            summary.update(passed=True, movedByPhase={k: [round(v, 1) for v in d] for k, d in moved.items()},
+            # Players of other controllers belong to other people: commands for this controller must not move them.
+            strayed = {str(index): max(abs(s["others"][index][axis] - samples[0]["others"][index][axis]) for s in samples if index in s["others"]
+                                       for axis in (0, 1)) for index in samples[0]["others"]}
+            if any(distance > 1.0 for distance in strayed.values()):
+                raise RuntimeError(f"A player of another controller moved: {strayed}")
+            summary.update(passed=True, otherPlayersMoved=strayed, movedByPhase={k: [round(v, 1) for v in d] for k, d in moved.items()},
                            tearsObserved=len({round(t[0]) for t in fired}), accepted=footer["accepted"], rejected=footer["rejected"],
                            valueReads=footer["valueReads"], pressedReads=footer["pressedReads"], triggeredReads=footer["triggeredReads"],
                            passedThrough=footer["passedThrough"], stoppedOnSilence=True, slotRestored=True)
@@ -152,6 +191,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--pid", type=int, required=True)
     parser.add_argument("--controller", type=int, default=0, help="controller index of the player to drive")
+    parser.add_argument("--join", type=float, help="press the co-op join button for --controller, then watch for this many seconds")
+    parser.add_argument("--observe", type=float, help="inject nothing for this many seconds and report what the game polls")
     parser.add_argument("--restart-run", action="store_true", help="first hold R so the player starts in the middle of the first room")
     parser.add_argument("--binary-directory", type=Path)
     parser.add_argument("--output-directory", type=Path)

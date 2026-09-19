@@ -18,7 +18,7 @@ void Wire() {
     c = Example(); c.shootX = std::numeric_limits<float>::quiet_NaN(); Check(!Valid(c), "NaN axis");
     c = Example(); c.controller = 8; Check(!Valid(c), "controller out of range");
     c = Example(); c.controller = -1; Check(!Valid(c), "the any-device index is never driven");
-    c = Example(); c.buttons = 1u << (kActions - Bomb); Check(!Valid(c), "unknown button");
+    c = Example(); c.buttons = 1u << kButtonCount; Check(!Valid(c), "unknown button");
     c = Example(); c.sequence = 0; Check(!Valid(c), "sequence starts at one");
 }
 void Actions() {
@@ -26,6 +26,10 @@ void Actions() {
     Check(Value(c, Right) == 1 && Value(c, Left) == 0 && Value(c, Up) == 0 && Value(c, Down) == 0, "movement right only");
     Check(Value(c, ShootUp) == 0.75f && Value(c, ShootDown) == 0 && Pressed(c, ShootUp) && !Pressed(c, ShootLeft), "shooting up");
     Check(Pressed(c, Bomb) && !Pressed(c, Item) && Value(c, kActions) == 0 && Value(c, -1) == 0 && Value(c, 12) == 0, "buttons and unknown actions");
+    Check(Known(Left) && Known(ShootDown) && Known(Drop) && Known(Join) && Known(MenuDown) && !Known(12) && !Known(13) && !Known(16) && !Known(-1) && !Known(kActions),
+        "pause, map and restart stay with the host's own devices");
+    c.buttons = 1u << 4; Check(Pressed(c, Join) && !Pressed(c, Bomb) && !Pressed(c, MenuConfirm), "join is its own button");
+    c.buttons = 1u << 5 | 1u << 8; Check(Pressed(c, MenuConfirm) && Pressed(c, MenuRight) && !Pressed(c, MenuLeft) && !Pressed(c, Join), "menu buttons");
     c.moveX = -0.4f; Check(Value(c, Left) == 0.4f && !Pressed(c, Left), "a light tilt has a value but is not a press");
     Command idle; Check(Value(idle, Left) == 0 && !Pressed(idle, Bomb), "a default command is neutral");
 }

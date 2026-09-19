@@ -13,7 +13,7 @@ float Positive(float v) { return v > 0 ? v : 0; }
 }
 bool Valid(const Command& c) {
     return c.session && c.sequence && c.controller >= 0 && c.controller <= kMaxController &&
-        Axis(c.moveX) && Axis(c.moveY) && Axis(c.shootX) && Axis(c.shootY) && c.buttons < (1u << (kActions - Bomb));
+        Axis(c.moveX) && Axis(c.moveY) && Axis(c.shootX) && Axis(c.shootY) && c.buttons < (1u << kButtonCount);
 }
 bool Fresh(const Command& c, std::uint64_t now) { return c.timeMs <= now && now - c.timeMs <= kMaxAgeMs; }
 bool Encode(const Command& c, std::uint8_t* b) {
@@ -37,6 +37,11 @@ bool Decode(const std::uint8_t* b, std::size_t size, Command& out) {
     if (!Valid(c)) return false;
     out = c; return true;
 }
+bool Known(int action) {
+    if (action >= Left && action <= ShootDown) return true;
+    for (const auto button : kButtons) if (button == action) return true;
+    return false;
+}
 float Value(const Command& c, int action) {
     switch (action) {
     case Left: return Positive(-c.moveX);
@@ -47,7 +52,9 @@ float Value(const Command& c, int action) {
     case ShootRight: return Positive(c.shootX);
     case ShootUp: return Positive(-c.shootY);
     case ShootDown: return Positive(c.shootY);
-    default: return action >= Bomb && action < kActions && (c.buttons >> (action - Bomb) & 1u) ? 1.0f : 0.0f;
+    default:
+        for (std::uint32_t bit = 0; bit < kButtonCount; ++bit) if (kButtons[bit] == action) return c.buttons >> bit & 1u ? 1.0f : 0.0f;
+        return 0;
     }
 }
 bool Pressed(const Command& c, int action) { return Value(c, action) > 0.5f; }

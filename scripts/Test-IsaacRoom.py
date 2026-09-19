@@ -53,10 +53,10 @@ def check(args):
 
 
 def alive(process):
-    """The single player exists and is not dead (Entity+0x172, +0x173)."""
+    """The first player exists and is not dead (Entity+0x172, +0x173); co-op players may follow it."""
     game = level.u32(process.read, process.base + level.GAME_RVA)
     begin, end = level.u32(process.read, game + 0x1BAA8), level.u32(process.read, game + 0x1BAAC)
-    if end - begin != 4:
+    if end <= begin or (end - begin) % 4 or end - begin > 64:
         return False
     flags = process.read(level.u32(process.read, begin) + 0x170, 4)
     return flags[2] == 1 and flags[3] == 0

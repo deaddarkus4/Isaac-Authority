@@ -3,8 +3,8 @@ import math
 import struct
 
 COMMAND = struct.Struct("<IIQIiQ4fII")
-ACTIONS = ("left", "right", "up", "down", "shootLeft", "shootRight", "shootUp", "shootDown", "bomb", "item", "pillCard", "drop")
-BUTTONS = ACTIONS[8:]
+# Bit n of the button mask; the game's ButtonAction numbers are 8, 9, 10, 11, 19, 14, 15, 20, 21, 22, 23.
+BUTTONS = ("bomb", "item", "pillCard", "drop", "join", "menuConfirm", "menuBack", "menuLeft", "menuRight", "menuUp", "menuDown")
 
 
 def encode(session, sequence, time_ms, controller=0, move=(0.0, 0.0), shoot=(0.0, 0.0), buttons=()):

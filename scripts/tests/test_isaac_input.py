@@ -28,6 +28,7 @@ class InputTests(unittest.TestCase):
                 commands.encode(**arguments)
         with self.assertRaises(ValueError):
             commands.encode(77, 1, 1000, buttons=("pause",))
+        self.assertEqual(commands.decode(commands.encode(77, 1, 1000, controller=1, buttons=("join", "menuRight")))["buttons"], ["join", "menuRight"])
 
 
 if __name__ == "__main__":

@@ -27,10 +27,17 @@ WithDevice original = nullptr;
 bool installed = false;
 std::atomic<bool> running{false};
 std::atomic<unsigned> active{0}, values{0}, presses{0}, triggers{0}, passedThrough{0}, accepted{0}, rejected{0}, errors{0};
+// What the game asks: [controller + 1 (-1..7)][reader][action]. Shows e.g. which controllers are polled for a join button.
+constexpr int kControllers = 9, kPolledActions = 40;
+std::atomic<unsigned> polls[kControllers][3][kPolledActions]{};
 SRWLOCK lifecycle = SRWLOCK_INIT, state = SRWLOCK_INIT;
 Command latest;          // guarded by state
-std::uint32_t consumed[kActions]{}; // sequence whose rising edge each action already reported; guarded by state
-Command previous;        // command before latest, for rising edges; guarded by state
+// A real device reports "just pressed" for one whole frame, and the game may ask several times in that frame
+// (the co-op join asks twice). A press seen by the receiver stays pending until the game first asks, then
+// answers true for one frame's worth of time. Guarded by state.
+bool pendingEdge[kActions]{};
+std::int64_t edgeOpened[kActions]{};
+std::int64_t ticksPerFrame = 0; // about 12 ms: shorter than a 60 Hz frame, far longer than one polling pass
 bool have = false;
 std::uint64_t session = 0, deadline = 0;
 SOCKET udp = INVALID_SOCKET;
@@ -45,11 +52,13 @@ int __fastcall OnInput(void* self, void*, int controller, void* reader, void* in
     const auto kind = reinterpret_cast<std::uintptr_t>(reader);
     if (running.load(std::memory_order_acquire) && in &&
         (kind == base + kReadValue || kind == base + kReadPressed || kind == base + kReadTriggered)) {
+        const int asked = *static_cast<const int*>(in), reads = kind == base + kReadValue ? 0 : kind == base + kReadPressed ? 1 : 2;
+        if (controller >= -1 && controller < kControllers - 1 && asked >= 0 && asked < kPolledActions) ++polls[controller + 1][reads][asked];
         AcquireSRWLockExclusive(&state);
         // A silent client is a neutral client: without a fresh command the real device decides again.
         if (have && controller == latest.controller && Fresh(latest, GetTickCount64())) {
             const int action = *static_cast<const int*>(in);
-            if (action >= 0 && action < kActions) {
+            if (Known(action)) {
                 injected = true;
                 if (kind == base + kReadValue) {
                     const auto value = Value(latest, action);
@@ -57,9 +66,9 @@ int __fastcall OnInput(void* self, void*, int controller, void* reader, void* in
                     result = value != 0; ++values;
                 } else if (kind == base + kReadPressed) { result = Pressed(latest, action); ++presses; }
                 else {
-                    // Reported once per command that newly holds the action.
-                    result = Pressed(latest, action) && !Pressed(previous, action) && consumed[action] != latest.sequence;
-                    if (result) consumed[action] = latest.sequence;
+                    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+                    if (pendingEdge[action]) { pendingEdge[action] = false; edgeOpened[action] = now.QuadPart; }
+                    result = edgeOpened[action] && now.QuadPart - edgeOpened[action] <= ticksPerFrame;
                     ++triggers;
                 }
             }
@@ -86,7 +95,9 @@ DWORD WINAPI Receive(void*) {
             if (from.sin_family != AF_INET || from.sin_addr.s_addr != htonl(INADDR_LOOPBACK) ||
                 !Decode(bytes, static_cast<std::size_t>(n), command) || !gate.Receive(command, GetTickCount64())) { ++rejected; continue; }
             AcquireSRWLockExclusive(&state);
-            previous = have ? latest : Command{}; latest = command; have = true;
+            for (int action = 0; action < kActions; ++action)
+                if (Known(action) && Pressed(command, action) && !(have && Pressed(latest, action))) pendingEdge[action] = true;
+            latest = command; have = true;
             ReleaseSRWLockExclusive(&state);
             ++accepted;
         }
@@ -133,8 +144,12 @@ extern "C" DWORD WINAPI IsaacAuthorityInputStart(void*) noexcept {
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&OnInput), &pinned)) return GetLastError();
         if (BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(&session), sizeof(session), BCRYPT_USE_SYSTEM_PREFERRED_RNG) < 0) return ERROR_GEN_FAILURE;
         if (!session) session = 1;
-        have = false; latest = previous = {}; for (auto& sequence : consumed) sequence = 0;
+        have = false; latest = {};
+        for (auto& edge : pendingEdge) edge = false;
+        for (auto& opened : edgeOpened) opened = 0;
+        LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency); ticksPerFrame = frequency.QuadPart * 12 / 1000;
         values = presses = triggers = passedThrough = accepted = rejected = errors = 0;
+        for (auto& controller : polls) for (auto& reader : controller) for (auto& count : reader) count = 0;
         WSADATA data{}; const auto started = WSAStartup(MAKEWORD(2, 2), &data);
         if (started) return static_cast<DWORD>(started);
         winsock = true; udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -180,7 +195,14 @@ extern "C" DWORD WINAPI IsaacAuthorityInputStop(void*) noexcept {
     out << "{\"type\":\"stop\",\"role\":\"input-host\",\"accepted\":" << accepted.load() << ",\"rejected\":" << rejected.load()
         << ",\"networkErrors\":" << errors.load() << ",\"valueReads\":" << values.load() << ",\"pressedReads\":" << presses.load()
         << ",\"triggeredReads\":" << triggers.load() << ",\"passedThrough\":" << passedThrough.load()
-        << ",\"controller\":" << latest.controller << ",\"lastSequence\":" << latest.sequence << ",\"slotRestored\":true}\n";
+        << ",\"controller\":" << latest.controller << ",\"lastSequence\":" << latest.sequence << ",\"polls\":[";
+    bool first = true; // [controller, reader (0 value, 1 pressed, 2 triggered), action, count]
+    for (int c = 0; c < kControllers; ++c) for (int r = 0; r < 3; ++r) for (int a = 0; a < kPolledActions; ++a) {
+        const auto count = polls[c][r][a].load();
+        if (!count) continue;
+        out << (first ? "" : ",") << '[' << c - 1 << ',' << r << ',' << a << ',' << count << ']'; first = false;
+    }
+    out << "],\"slotRestored\":true}\n";
     const auto text = out.str(); DWORD written = 0;
     const BOOL ok = WriteFile(report, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
     CloseHandle(report); report = INVALID_HANDLE_VALUE;
