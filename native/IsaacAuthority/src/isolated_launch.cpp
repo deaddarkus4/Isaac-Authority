@@ -22,8 +22,11 @@ struct Child {
 }
 int wmain(int argc, wchar_t** argv) {
     try {
-        Check(argc == 4 || (argc == 5 && std::wstring(argv[4]) == L"--verify-only"),
-            "Usage: IsaacAuthorityLaunch GAME_EXE WORKING_DIRECTORY SAVE_LEAF [--verify-only]");
+        // Everything after "--" goes to the game unchanged, e.g. its own --networktest or --set-stage= switches.
+        const bool verifyOnly = argc == 5 && std::wstring(argv[4]) == L"--verify-only";
+        const bool forwarded = argc > 5 && std::wstring(argv[4]) == L"--";
+        Check(argc == 4 || verifyOnly || forwarded,
+            "Usage: IsaacAuthorityLaunch GAME_EXE WORKING_DIRECTORY SAVE_LEAF [--verify-only | -- GAME_ARGUMENT...]");
         const auto exe = std::filesystem::absolute(argv[1]);
         const auto working = std::filesystem::absolute(argv[2]);
         Check(isaac_probe::AnalyzeBytes(isaac_probe::ReadFile(exe)).supported, "Original J460 required");
@@ -41,6 +44,11 @@ int wmain(int argc, wchar_t** argv) {
         STARTUPINFOW startup{}; startup.cb = sizeof(startup);
         Child child;
         std::wstring command = L"\"" + exe.wstring() + L"\"";
+        for (int i = 5; forwarded && i < argc; ++i) {
+            const std::wstring argument = argv[i];
+            Check(argument.find_first_of(L"\" 	") == std::wstring::npos, "Game arguments must not contain quotes or spaces");
+            command += L" " + argument;
+        }
         // Child launch context, not a machine-wide environment change.
         Check(SetEnvironmentVariableW(L"SteamAppId", L"250900") && SetEnvironmentVariableW(L"SteamGameId", L"250900"),
             "Cannot set Steam child launch context");
@@ -72,7 +80,7 @@ int wmain(int argc, wchar_t** argv) {
         Check(changed && written == replacement.size() && restored, "Cannot set isolated child save directory");
         Check(ReadProcessMemory(child.info.hProcess, address, original.data(), original.size(), &got) &&
             got == original.size() && original == replacement, "Child save-directory readback differs");
-        if (argc == 5) {
+        if (verifyOnly) {
             std::cout << "{\"verified\":true,\"startedGame\":false}\n";
             return 0;
         }

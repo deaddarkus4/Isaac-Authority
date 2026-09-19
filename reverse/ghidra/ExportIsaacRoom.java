@@ -9,7 +9,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.util.*;
 
-// Arguments: OUTPUT_DIRECTORY, then "name:LuaMethod" (resolved through its binding registration) or a hex RVA.
+// Arguments: OUTPUT_DIRECTORY, then "name:LuaMethod" (resolved through its binding registration), "data:RVA"
+// (every function referencing that global) or a hex RVA.
 public class ExportIsaacRoom extends GhidraScript {
     @Override public void run() throws Exception {
         if (!"3bdfc8bae0dc7e334b76009d0ad45dfbb16ee5f00c06ffbc3a0094e34d44616b".equalsIgnoreCase(currentProgram.getExecutableSHA256()))
@@ -21,6 +22,25 @@ public class ExportIsaacRoom extends GhidraScript {
         Map<Long, String> targets = new LinkedHashMap<>();
         List<String> contexts = new ArrayList<>();
         for (int i = 1; i < args.length; ++i) {
+            if (args[i].startsWith("data:")) {
+                // Every function that touches a global, e.g. a flag set by a command-line switch.
+                Address global = currentProgram.getImageBase().add(Long.decode(args[i].substring(5)));
+                ReferenceIterator users = currentProgram.getReferenceManager().getReferencesTo(global);
+                while (users.hasNext()) {
+                    ghidra.program.model.symbol.Reference use = users.next();
+                    Function user = getFunctionContaining(use.getFromAddress());
+                    index.add(args[i] + "	" + global + "	" + use.getFromAddress() + "	" + use.getReferenceType() + "	" +
+                        (user == null ? "" : user.getEntryPoint().toString()));
+                    if (user != null) targets.putIfAbsent(user.getEntryPoint().getOffset() - imageBase, args[i]);
+                }
+                continue;
+            }
+            if (args[i].startsWith("addr:")) {
+                // The function containing an instruction address, e.g. one found by scanning for a field offset.
+                Function owner = getFunctionContaining(currentProgram.getImageBase().add(Long.decode(args[i].substring(5))));
+                if (owner != null) targets.putIfAbsent(owner.getEntryPoint().getOffset() - imageBase, args[i]);
+                continue;
+            }
             if (!args[i].startsWith("name:")) { targets.putIfAbsent(Long.decode(args[i]), "rva"); continue; }
             String name = args[i].substring(5);
             byte[] needle = ("\0" + name + "\0").getBytes(StandardCharsets.US_ASCII);
