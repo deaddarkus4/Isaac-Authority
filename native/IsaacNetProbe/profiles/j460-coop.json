@@ -55,6 +55,20 @@
     "report": "docs/j460-closed-loop-test.md",
     "summary": "coop-20260919-231819-324003"
   },
+  "prediction": {
+    "liveTwoGames": true,
+    "acknowledgement": "last u32 of the WLD1 v3 player record: sequence of the client command whose movement the host's game last read for that player, 0 for none",
+    "crossModuleLookup": "the world module finds the input module of the same process by the export IsaacAuthorityInputAcknowledged(controller*, sequence*)",
+    "ownPlayer": "list index 1, local controller 1 (two-player prototype); runs its own update and is never overwritten",
+    "localInput": "the last captured command, movement only; shooting and items are the host's",
+    "rule": "deadband 10, shift above it, snap above 48, settle a quarter per snapshot when both stand still; the history shifts with every mend",
+    "errorAfterSameCommand": {"median": 0.009, "mean": 0.76, "p95": 4.418, "max": 4.421, "note": "the maximum is one 60 Hz step of walking: the two games are never in phase"},
+    "mends": {"settled": 44, "shifted": 0, "snapped": 0},
+    "playerDistanceAtEnd": [0.0, 0.008],
+    "shiftAndSnapSeenLive": false,
+    "report": "docs/j460-prediction-test.md",
+    "summary": "predict-20260919-233247-482969"
+  },
   "candidatesFromRepentogonSignatures": {
     "note": "found by byte signature in the J460 image, exactly one match each; none has been called or otherwise verified",
     "PlayerManager::SpawnCoPlayer2(int playerType)": "0x5b9cd0",

@@ -1,4 +1,4 @@
-LIBRARY IsaacAuthorityInput
+LIBRARY IsaacAuthorityInputPredict
 EXPORTS
     IsaacAuthorityInputStart=_IsaacAuthorityInputStart@4
     IsaacAuthorityInputStop=_IsaacAuthorityInputStop@4

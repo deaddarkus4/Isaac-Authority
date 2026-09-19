@@ -85,7 +85,7 @@ class WorldTests(unittest.TestCase):
     def test_player_section_is_version_three(self):
         frame = self.frame()
         alone = world.encode(frame)
-        self.assertEqual(world.players(frame), [dict(controller=0, body=[320, 280, 0, 0])])
+        self.assertEqual(world.players(frame), [dict(controller=0, body=[320, 280, 0, 0], ack=0)])
         frame["players"] = [dict(controller=0, body=[320, 280, 0, 0]), dict(controller=1, body=[200, 300, -4.5, 0.25])]
         packet = world.encode(frame)
         self.assertEqual((alone[4], alone[92], packet[4], packet[92], len(packet)), (1, 0, 3, 2, len(alone) + 2 * world.PLAYER.size))
@@ -95,11 +95,22 @@ class WorldTests(unittest.TestCase):
         for length in range(len(packet)):
             with self.assertRaises(ValueError):
                 world.decode(packet[:length])
-        # version without a section, wrong count, no section, reserved field, header against first record, controller
-        for offset, value in ((4, 1), (92, 3), (92, 0), (len(packet) - 4, 1), (68, packet[68] ^ 1), (len(packet) - world.PLAYER.size, 8)):
+        # version without a section, wrong count, no section, header against first record, controller
+        for offset, value in ((4, 1), (92, 3), (92, 0), (68, packet[68] ^ 1), (len(packet) - world.PLAYER.size, 8)):
             bad = bytearray(packet); bad[offset] = value
             with self.assertRaises(ValueError):
                 world.decode(bad)
+        # The last field of a record is the client command the host's game consumed for that player.
+        acked = dict(frame, players=[frame["players"][0], dict(frame["players"][1], ack=41)])
+        packet = world.encode(acked)
+        self.assertEqual((packet[-4], world.decode(packet)), (41, acked))
+        self.assertEqual([p["ack"] for p in world.players(world.decode(packet))], [0, 41])
+        self.assertFalse(world.same_players(frame, acked))
+        driven = dict(self.frame(), players=[dict(controller=0, body=[320, 280, 0, 0], ack=7)])
+        self.assertEqual(world.decode(world.encode(driven)), driven)
+        with self.assertRaises(ValueError):
+            world.encode(dict(self.frame(), players=[dict(controller=0, body=[320, 280, 0, 0], ack=2**32)]))
+        packet = world.encode(frame)
         enemies = dict(frame, npcs=[dict(type=244, variant=0, subtype=0, seed=2078110152, body=[80, 160, 0, 0], target=[80, 160],
                                          hp=[10, 10], state=8, flags=[1, 5, 4])])
         packet = world.encode(enemies)

@@ -12,7 +12,7 @@ $component = 'IsaacAuthority' + $Stage
 # Input: the host-side module that lets received client commands drive one controller of the host's game.
 # Coop: the world adapter for every player of a co-op run, the input module that creates and drives the second one on the
 # host, and its client side that captures the client's keyboard: together the closed loop.
-$release = @{Room=@('0.5.0-experimental','standard-tears-rooms');Npc=@('0.6.0-experimental','standard-tears-rooms-enemies');Input=@('0.7.0-experimental','client-input-on-host');Coop=@('0.9.0-experimental','standard-tears-rooms-enemies-players-closed-loop')}[$Stage]
+$release = @{Room=@('0.5.0-experimental','standard-tears-rooms');Npc=@('0.6.0-experimental','standard-tears-rooms-enemies');Input=@('0.7.0-experimental','client-input-on-host');Coop=@('0.10.0-experimental','standard-tears-rooms-enemies-players-closed-loop-prediction')}[$Stage]
 $target = Join-Path (Split-Path -Parent $GameExecutable) (Join-Path 'IsaacAuthority' $Stage)
 $manifestPath = Join-Path $target 'installation.json'
 if (Test-Path -LiteralPath $target) {
@@ -20,7 +20,14 @@ if (Test-Path -LiteralPath $target) {
     if ((Get-Content -Raw -Encoding UTF8 -LiteralPath $manifestPath | ConvertFrom-Json).component -ne $component) { throw 'Different component owns destination.' }
 }
 $modules = if ($Stage -eq 'Input') { [ordered]@{host=$component} } else { [ordered]@{source=($component + 'Source');replica=($component + 'Replica')} }
-if ($Stage -eq 'Coop') { $modules['host'] = 'IsaacAuthorityInput'; $modules['client'] = 'IsaacAuthorityInputClient' }
+if ($Stage -eq 'Coop') {
+    $modules['host'] = 'IsaacAuthorityInput'; $modules['client'] = 'IsaacAuthorityInputClient'
+    # Prediction: a source that acknowledges consumed commands, a replica that lets the client's own player run, and the
+    # client input module that walks that player with the command it sends.
+    $modules['predictSource'] = 'IsaacAuthorityPredictSource'; $modules['predictReplica'] = 'IsaacAuthorityPredictReplica'
+    $modules['predictClient'] = 'IsaacAuthorityInputPredict'
+}
+$inputRoles = 'host','client','predictClient'
 # The injector refuses a file name that a game already loaded from another folder, and the Input package installs the
 # same input module: this package's copy carries the package's name.
 $installedBase = [ordered]@{}
@@ -51,12 +58,12 @@ foreach ($stale in @(@($modules.Values) + @($installedBase.Values) | Select-Obje
     try { Remove-Item -LiteralPath $stale.FullName -Force -ErrorAction Stop } catch { Write-Verbose "Still loaded by a running game: $($stale.Name)" }
 }
 # World modules and the input module answer to different contracts.
-$world = @($installed.Keys | Where-Object { $_ -notin 'host','client' } | ForEach-Object { Join-Path $target $installed[$_] })
+$world = @($installed.Keys | Where-Object { $_ -notin $inputRoles } | ForEach-Object { Join-Path $target $installed[$_] })
 if ($world.Count) {
     & (Join-Path $bin 'world_tests.exe') $world
     if ($LASTEXITCODE -ne 0) { throw 'Installed world module contract failed.' }
 }
-$inputs = @($installed.Keys | Where-Object { $_ -in 'host','client' } | ForEach-Object { Join-Path $target $installed[$_] })
+$inputs = @($installed.Keys | Where-Object { $_ -in $inputRoles } | ForEach-Object { Join-Path $target $installed[$_] })
 if ($inputs.Count) {
     & (Join-Path $bin 'input_tests.exe') $inputs
     if ($LASTEXITCODE -ne 0) { throw 'Installed input module contract failed.' }

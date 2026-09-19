@@ -75,6 +75,13 @@ if(WIN32)
     add_library(IsaacAuthorityCoopReplica SHARED src/world_adapter.cpp coop_replica.def)
     target_compile_definitions(IsaacAuthorityCoopReplica PRIVATE ISAAC_WORLD_ROOMS ISAAC_WORLD_NPCS ISAAC_WORLD_PLAYERS)
     target_link_libraries(IsaacAuthorityCoopReplica PRIVATE authority_game_support world_receiver)
+    # Prediction: the source acknowledges the consumed client command, the replica lets the client's own player run and mends it.
+    add_library(IsaacAuthorityPredictSource SHARED src/world_adapter.cpp predict_source.def)
+    target_compile_definitions(IsaacAuthorityPredictSource PRIVATE ISAAC_WORLD_SOURCE ISAAC_WORLD_ROOMS ISAAC_WORLD_NPCS ISAAC_WORLD_PLAYERS ISAAC_WORLD_PREDICT)
+    target_link_libraries(IsaacAuthorityPredictSource PRIVATE authority_game_support world_receiver)
+    add_library(IsaacAuthorityPredictReplica SHARED src/world_adapter.cpp predict_replica.def)
+    target_compile_definitions(IsaacAuthorityPredictReplica PRIVATE ISAAC_WORLD_ROOMS ISAAC_WORLD_NPCS ISAAC_WORLD_PLAYERS ISAAC_WORLD_PREDICT)
+    target_link_libraries(IsaacAuthorityPredictReplica PRIVATE authority_game_support world_receiver)
     # Client input on the host: received commands replace what the game reads from one controller.
     add_library(input_core STATIC src/input_state.cpp)
     target_include_directories(input_core PUBLIC include)
@@ -84,12 +91,16 @@ if(WIN32)
     add_library(IsaacAuthorityInputClient SHARED src/input_adapter.cpp input_client.def)
     target_compile_definitions(IsaacAuthorityInputClient PRIVATE ISAAC_INPUT_CLIENT)
     target_link_libraries(IsaacAuthorityInputClient PRIVATE authority_game_support input_core ws2_32)
+    # A predicting client also walks its own player at once with the command it sends.
+    add_library(IsaacAuthorityInputPredict SHARED src/input_adapter.cpp input_predict.def)
+    target_compile_definitions(IsaacAuthorityInputPredict PRIVATE ISAAC_INPUT_PREDICT)
+    target_link_libraries(IsaacAuthorityInputPredict PRIVATE authority_game_support input_core ws2_32)
     add_executable(input_tests tests/input_tests.cpp)
     target_link_libraries(input_tests PRIVATE input_core)
     add_executable(world_tests tests/world_tests.cpp)
     target_link_libraries(world_tests PRIVATE world_receiver)
 endif()
-foreach(target authority_core snapshot_bridge snapshot_receiver snapshot_tests world_core world_receiver world_tests IsaacAuthorityWorldSource IsaacAuthorityWorldReplica IsaacAuthorityRoomSource IsaacAuthorityRoomReplica IsaacAuthorityNpcSource IsaacAuthorityNpcReplica IsaacAuthorityCoopSource IsaacAuthorityCoopReplica input_core IsaacAuthorityInput IsaacAuthorityInputClient input_tests authority_tests IsaacAuthorityLab authority_game_support IsaacAuthorityGame IsaacAuthoritySource IsaacAuthorityNetwork IsaacAuthorityReplica IsaacAuthorityAttach IsaacAuthorityLaunch game_adapter_tests)
+foreach(target authority_core snapshot_bridge snapshot_receiver snapshot_tests world_core world_receiver world_tests IsaacAuthorityWorldSource IsaacAuthorityWorldReplica IsaacAuthorityRoomSource IsaacAuthorityRoomReplica IsaacAuthorityNpcSource IsaacAuthorityNpcReplica IsaacAuthorityCoopSource IsaacAuthorityCoopReplica IsaacAuthorityPredictSource IsaacAuthorityPredictReplica input_core IsaacAuthorityInput IsaacAuthorityInputClient IsaacAuthorityInputPredict input_tests authority_tests IsaacAuthorityLab authority_game_support IsaacAuthorityGame IsaacAuthoritySource IsaacAuthorityNetwork IsaacAuthorityReplica IsaacAuthorityAttach IsaacAuthorityLaunch game_adapter_tests)
     if(TARGET ${target} AND MSVC)
         target_compile_options(${target} PRIVATE /W4 /WX /permissive- /utf-8)
     endif()
@@ -112,8 +123,10 @@ if(WIN32)
     add_test(NAME world_protocol_lifecycle COMMAND world_tests $<TARGET_FILE:IsaacAuthorityWorldSource> $<TARGET_FILE:IsaacAuthorityWorldReplica>
         $<TARGET_FILE:IsaacAuthorityRoomSource> $<TARGET_FILE:IsaacAuthorityRoomReplica>
         $<TARGET_FILE:IsaacAuthorityNpcSource> $<TARGET_FILE:IsaacAuthorityNpcReplica>
-        $<TARGET_FILE:IsaacAuthorityCoopSource> $<TARGET_FILE:IsaacAuthorityCoopReplica>)
-    add_test(NAME input_commands COMMAND input_tests $<TARGET_FILE:IsaacAuthorityInput> $<TARGET_FILE:IsaacAuthorityInputClient>)
+        $<TARGET_FILE:IsaacAuthorityCoopSource> $<TARGET_FILE:IsaacAuthorityCoopReplica>
+        $<TARGET_FILE:IsaacAuthorityPredictSource> $<TARGET_FILE:IsaacAuthorityPredictReplica>)
+    add_test(NAME input_commands COMMAND input_tests $<TARGET_FILE:IsaacAuthorityInput> $<TARGET_FILE:IsaacAuthorityInputClient>
+        $<TARGET_FILE:IsaacAuthorityInputPredict>)
     add_test(NAME world_two_processes COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/Test-IsaacWorld.py --fixture $<TARGET_FILE:world_tests>)
     set_tests_properties(world_two_processes PROPERTIES TIMEOUT 10)

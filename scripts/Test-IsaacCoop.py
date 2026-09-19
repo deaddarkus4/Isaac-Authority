@@ -107,7 +107,8 @@ def run(args):
     here = Path(__file__).resolve().parent; root = here.parent
     binaries = args.binary_directory or (here if (here / "installation.json").is_file() else root / "Binaries/authority-build/Release")
     names = dict(source="IsaacAuthorityCoopSource.dll", replica="IsaacAuthorityCoopReplica.dll", host="IsaacAuthorityInput.dll",
-                 client="IsaacAuthorityInputClient.dll")
+                 client="IsaacAuthorityInputClient.dll", predictSource="IsaacAuthorityPredictSource.dll",
+                 predictReplica="IsaacAuthorityPredictReplica.dll", predictClient="IsaacAuthorityInputPredict.dll")
     if (binaries / "installation.json").is_file():
         names.update(json.loads((binaries / "installation.json").read_text(encoding="utf-8")).get("modules", {}))
     attach = binaries / "IsaacAuthorityAttach.exe"
@@ -115,7 +116,12 @@ def run(args):
     output = args.output_directory or (root / "Binaries/diagnostics/coop" if (root / "native").is_dir() else directory / "verified-coop")
     output.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
-    before = set(logs.glob("coop-*.jsonl")) | set(logs.glob("input-*.jsonl"))
+    # Prediction is its own set of modules: the source acknowledges consumed commands, the replica lets the client's own
+    # player run, the client's input module walks that player with the command it sends.
+    stage = "predict" if args.predict else "coop"
+    source_dll, replica_dll, client_dll = (binaries / names[role] for role in (
+        ("predictSource", "predictReplica", "predictClient") if args.predict else ("source", "replica", "client")))
+    before = set(logs.glob(stage + "-*.jsonl")) | set(logs.glob("input-*.jsonl"))
     processes, started, failures, transmitted, joined, ends = {}, [], [], [], {}, {}
     control = None; start_ms = None; sent_commands = 0; pressed_ms = {}
     # The keyboard belongs to the focused game. In the closed loop that is the client; otherwise it is the host.
@@ -139,14 +145,14 @@ def run(args):
         rooms.wait_running(replica if keyboard_pid == args.source_pid else source, "the game without the keyboard")
         invoke("input", args.source_pid, binaries / names["host"]); started.append(("input-stop", args.source_pid, binaries / names["host"]))
         client = json.loads((directory / f"input-host-{args.source_pid}.json").read_text())
-        invoke("world", args.source_pid, binaries / names["source"]); started.append(("world-stop", args.source_pid, binaries / names["source"]))
-        source_endpoint = json.loads((directory / f"coop-source-{args.source_pid}.json").read_text())
+        invoke("world", args.source_pid, source_dll); started.append(("world-stop", args.source_pid, source_dll))
+        source_endpoint = json.loads((directory / f"{stage}-source-{args.source_pid}.json").read_text())
         tears.wait_frame(source, source_endpoint)
-        invoke("world", args.replica_pid, binaries / names["replica"]); started.append(("world-stop", args.replica_pid, binaries / names["replica"]))
-        endpoint = json.loads((directory / f"coop-replica-{args.replica_pid}.json").read_text())
+        invoke("world", args.replica_pid, replica_dll); started.append(("world-stop", args.replica_pid, replica_dll))
+        endpoint = json.loads((directory / f"{stage}-replica-{args.replica_pid}.json").read_text())
         captured = None
         if args.loop:
-            invoke("input", args.replica_pid, binaries / names["client"]); started.append(("input-stop", args.replica_pid, binaries / names["client"]))
+            invoke("input", args.replica_pid, client_dll); started.append(("input-stop", args.replica_pid, client_dll))
             captured = json.loads((directory / f"input-client-{args.replica_pid}.json").read_text())
         address, client_address = ("127.0.0.1", endpoint["port"]), ("127.0.0.1", client["port"])
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
@@ -206,7 +212,7 @@ def run(args):
             process.close()
     reports, inputs, copied = {}, [], []
     # Oldest first: the last input session is the one that drove the second player.
-    for file in sorted((set(logs.glob("coop-*.jsonl")) | set(logs.glob("input-*.jsonl"))) - before, key=lambda f: f.stat().st_mtime):
+    for file in sorted((set(logs.glob(stage + "-*.jsonl")) | set(logs.glob("input-*.jsonl"))) - before, key=lambda f: f.stat().st_mtime):
         target = output / file.name
         if target.exists():
             raise RuntimeError("Report already exists")
@@ -218,7 +224,7 @@ def run(args):
             reports[records[0]["role"]] = records
     summary = dict(utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), sourcePid=args.source_pid, replicaPid=args.replica_pid,
                    scope="standard-tears-rooms-enemies-players", realRoomTransition=False, runSeed=report["hostSeed"], room=report["room"],
-                   mode="closed-loop" if args.loop else "scripted-client", keyboardIn=keyboard_role,
+                   mode="closed-loop-predicted" if args.predict else "closed-loop" if args.loop else "scripted-client", keyboardIn=keyboard_role,
                    clientController=args.controller, secondPlayer=joined, commandsSent=sent_commands,
                    **({} if args.loop else dict(keysPressedForSecondPlayer=0)),
                    transmitted=len(transmitted), reports=copied, failures=failures, passed=False)
@@ -291,12 +297,39 @@ def run(args):
                 summary.update(keysPressedOnHost=0, capturedSamples=capture[0]["samples"], capturedActiveSamples=capture[0]["activeSamples"],
                                localAnswersWithheld=capture[0]["withheld"], keyToHostPlayerMovesMs=reaction(host_frames.values()),
                                keyToClientSeesItMs=reaction(applied))
+            if args.predict:
+                # The own player ran its own update; beside every applied snapshot the replica recorded where it really stood
+                # and how far that was from the host after the same command.
+                own = [r["own"] for r in applied if "own" in r]
+                matched = sorted(o["error"] for o in own if o["matched"])
+                acks = [world.players(r)[1]["ack"] for r in applied]
+                if footer["ownIndex"] != 1 or len(own) != len(applied) or len(matched) < 200 or footer["predictRemembered"] < 300:
+                    raise RuntimeError(f"The replica did not predict its own player: {len(matched)} matched of {len(own)}")
+                if sum(a > 0 for a in acks) < 200 or any(b < a for a, b in zip(acks, acks[1:])) or not capture[0]["predicts"]:
+                    raise RuntimeError("The host did not acknowledge consumed commands in order, or the client module does not predict")
+                if footer["predictSnaps"] or matched[-1] > 48:
+                    raise RuntimeError(f"Prediction left the host by {matched[-1]} or was teleported {footer['predictSnaps']} times")
+                local = {}
+                for name, begin, end, player, axis, sign in expected:
+                    if player == 1:
+                        rows = [r["own"]["local"] for r in applied if begin <= r["observedMs"] - start_ms <= end]
+                        shift = [rows[-1][i] - rows[0][i] for i in (0, 1)]; local[name] = [round(v, 1) for v in shift]
+                        if shift[axis] * sign < 25 or abs(shift[1 - axis]) > 12:
+                            raise RuntimeError(f"On the client's own screen the {name}: moved by {shift}")
+                def own_reaction():
+                    return min(r["observedMs"] for r in applied if r["observedMs"] >= pressed and abs(r["own"]["local"][2]) > 0.01) - pressed
+                summary.update(ownPlayerIndex=1, movedOnClientsOwnScreen=local, keyToOwnPlayerMovesLocallyMs=own_reaction(),
+                               predictionSamples=len(own), predictionMatched=len(matched),
+                               predictionErrorMean=round(sum(matched) / len(matched), 3), predictionErrorMedian=round(matched[len(matched) // 2], 3),
+                               predictionErrorP95=round(matched[int(len(matched) * 0.95)], 3), predictionErrorMax=round(matched[-1], 3),
+                               mendsSettled=footer["predictSettles"], mendsShifted=footer["predictShifts"], mendsSnapped=footer["predictSnaps"],
+                               acknowledgedFrames=sum(a > 0 for a in acks), ownUpdatesRemembered=footer["predictRemembered"])
         except (RuntimeError, KeyError, IndexError, TypeError, ValueError) as error:
             failures.append(str(error))
-    with (output / f"coop-{stamp}.sent.jsonl").open("x", encoding="utf-8") as file:
+    with (output / f"{stage}-{stamp}.sent.jsonl").open("x", encoding="utf-8") as file:
         for frame in transmitted:
             file.write(json.dumps(frame) + "\n")
-    summary_path = output / f"coop-{stamp}.summary.json"
+    summary_path = output / f"{stage}-{stamp}.summary.json"
     with summary_path.open("x", encoding="utf-8") as file:
         json.dump(summary, file, indent=2)
     print(json.dumps(dict(summary=str(summary_path), **summary)))
@@ -309,6 +342,8 @@ if __name__ == "__main__":
     parser.add_argument("--source-pid", type=int)
     parser.add_argument("--replica-pid", type=int)
     parser.add_argument("--controller", type=int, default=1, help="free controller index that joins as the second player")
+    parser.add_argument("--predict", action="store_true",
+                        help="closed loop with prediction: the client walks its own player at once and the host mends it (implies --loop)")
     parser.add_argument("--loop", action="store_true",
                         help="closed loop: keys go to the game of --replica-pid (the client, focused) and drive the second player of "
                              "--source-pid (the host, which must keep running without focus)")
@@ -316,4 +351,8 @@ if __name__ == "__main__":
     parser.add_argument("--restart-runs", action="store_true", help="first hold R in both games to restart their seeded runs")
     parser.add_argument("--binary-directory", type=Path)
     parser.add_argument("--output-directory", type=Path)
-    run(parser.parse_args())
+    options = parser.parse_args()
+    options.loop = options.loop or options.predict
+    if options.predict and options.controller != 1:
+        parser.error("the prediction modules know the client's own player as controller 1")
+    run(options)

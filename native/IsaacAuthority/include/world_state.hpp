@@ -34,7 +34,9 @@ struct Npc {
 bool SameNpc(const Npc& a, const Npc& b);
 // A player of the host's game. Players join in the same order in both games, so the place in the list is the
 // identity; the controller index says whose input drives this player on the host (two may share one controller).
-struct Player { std::uint32_t controller = 0; Body body; };
+// acknowledged is the sequence of the client command the host's game last consumed for this player, 0 for none: a
+// predicting client compares the body with its own state after that same command, not with its present.
+struct Player { std::uint32_t controller = 0; Body body; std::uint32_t acknowledged = 0; };
 struct Frame;
 // Death is the host's decision: true when its previous snapshot of this room generation listed the enemy and the
 // next one no longer does. An enemy the host never listed is not the replica's to kill.
@@ -85,4 +87,30 @@ bool Plan(const Frame& previous, const Frame& next, Delta& delta);
 // Travel means the host is elsewhere and the replica must load that room before applying anything.
 enum class Route { Apply, Restart, Travel };
 Route Decide(const RoomKey& local, const Frame* applied, const Frame& next);
+
+// A predicting client simulates its own player at once and is corrected by the host afterwards. The history says where
+// the client's player stood after its game consumed each command; a snapshot says where the host's stood after the same
+// command. Their difference is an error of the past, and it is the present that gets shifted by it.
+// Both games step at about the rate commands are sampled, never in phase: up to two steps of walking are not an error.
+constexpr float kPredictDeadband = 10, kPredictSnap = 48, kPredictSettle = 0.25f, kPredictRest = 0.05f;
+enum class Mend { None, Settle, Shift, Snap };
+struct Correction {
+    Mend kind = Mend::None;
+    Vec shift;          // add to the present position (and to the history)
+    float error = 0;    // distance between the host and the client after the same command
+    bool matched = false;
+};
+class Prediction {
+public:
+    void Reset() { next_ = size_ = 0; }
+    void Remember(std::uint32_t sequence, Vec position);
+    // None inside the deadband while walking; Settle closes a small gap once both stand still; Shift corrects a real
+    // disagreement; Snap is a teleport and also takes the host's velocity.
+    Correction Reconcile(std::uint32_t acknowledged, const Body& host, const Body& local) const;
+    void Shift(Vec by);
+private:
+    struct Entry { std::uint32_t sequence = 0; Vec position; };
+    std::array<Entry, 128> history_{};
+    std::size_t next_ = 0, size_ = 0;
+};
 }

@@ -22,8 +22,8 @@ bool NpcValid(const Npc& n) {
         Number(n.hitPoints, -1e6f, 1e7f) && Number(n.maxHitPoints, 0, 1e7f) &&
         n.state >= -1 && n.state < 65536 && n.visible < 2 && n.gridCollision < 16 && n.entityCollision < 16;
 }
-// One player driven by controller 0 is what versions 1 and 2 already say in their header.
-bool PlayerSection(const Frame& f) { return f.playerCount != 1 || f.players[0].controller != 0; }
+// One player driven by controller 0 and by no client command is what versions 1 and 2 already say in their header.
+bool PlayerSection(const Frame& f) { return f.playerCount != 1 || f.players[0].controller != 0 || f.players[0].acknowledged != 0; }
 bool SameIdentity(const Identity& a, const Identity& b) { return a.address == b.address && a.seed == b.seed && a.index == b.index; }
 bool Has(const Frame& f, std::uint32_t id) {
     for (std::size_t i = 0; i < f.count; ++i) if (f.entities[i].id == id) return true;
@@ -58,6 +58,29 @@ bool Departed(const Frame* previous, const Frame& next, const Npc& npc) {
     for (std::size_t i = 0; i < next.npcCount; ++i) if (SameNpc(next.npcs[i], npc)) return false;
     for (std::size_t i = 0; i < previous->npcCount; ++i) if (SameNpc(previous->npcs[i], npc)) return true;
     return false;
+}
+void Prediction::Remember(std::uint32_t sequence, Vec position) {
+    history_[next_] = {sequence, position}; next_ = (next_ + 1) % history_.size();
+    if (size_ < history_.size()) ++size_;
+}
+void Prediction::Shift(Vec by) {
+    for (std::size_t i = 0; i < size_; ++i) { history_[i].position.x += by.x; history_[i].position.y += by.y; }
+}
+Correction Prediction::Reconcile(std::uint32_t acknowledged, const Body& host, const Body& local) const {
+    Correction c; Vec reference = local.position;
+    // Newest first: the client's state at the end of the last command the host has consumed too.
+    for (std::size_t back = 1; acknowledged && back <= size_ && !c.matched; ++back) {
+        const auto& entry = history_[(next_ + history_.size() - back) % history_.size()];
+        if (entry.sequence && entry.sequence <= acknowledged) { reference = entry.position; c.matched = true; }
+    }
+    const Vec gap{host.position.x - reference.x, host.position.y - reference.y};
+    c.error = std::sqrt(gap.x * gap.x + gap.y * gap.y);
+    const auto still = [](const Body& b) { return std::fabs(b.velocity.x) < kPredictRest && std::fabs(b.velocity.y) < kPredictRest; };
+    if (!std::isfinite(c.error)) return c;
+    if (c.error > kPredictSnap) { c.kind = Mend::Snap; c.shift = gap; }
+    else if (c.error > kPredictDeadband) { c.kind = Mend::Shift; c.shift = gap; }
+    else if (c.error > 0.01f && still(host) && still(local)) { c.kind = Mend::Settle; c.shift = {gap.x * kPredictSettle, gap.y * kPredictSettle}; }
+    return c;
 }
 bool Valid(const Frame& f) {
     if (!f.session || !f.epoch || !f.sequence || f.count > kMaxEntities || f.npcCount > kMaxNpcs ||
@@ -118,6 +141,7 @@ bool Encode(const Frame& f, Packet& p) {
         Put(b, at, f.players[i].controller);
         const float values[]{body.position.x, body.position.y, body.velocity.x, body.velocity.y};
         for (unsigned j = 0; j < 4; ++j) PutFloat(b, at + 4 + j * 4, values[j]);
+        Put(b, at + 20, f.players[i].acknowledged);
     }
     return true;
 }
@@ -150,10 +174,9 @@ bool Decode(const std::uint8_t* b, std::size_t size, Frame& out) {
     }
     for (std::size_t i = 0; i < listed; ++i) {
         const auto at = size - (listed - i) * kPlayerRecord;
-        if (Get(b, at + 20)) return false;
         // The first record repeats the header's body; two different answers are no answer.
         for (unsigned j = 0; !i && j < 4; ++j) if (Get(b, at + 4 + j * 4) != Get(b, 68 + j * 4)) return false;
-        f.players[i] = {Get(b, at), {{GetFloat(b, at + 4), GetFloat(b, at + 8)}, {GetFloat(b, at + 12), GetFloat(b, at + 16)}}};
+        f.players[i] = {Get(b, at), {{GetFloat(b, at + 4), GetFloat(b, at + 8)}, {GetFloat(b, at + 12), GetFloat(b, at + 16)}}, Get(b, at + 20)};
     }
     if (listed) f.playerCount = static_cast<std::uint32_t>(listed);
     if (version == 3 && !PlayerSection(f)) return false;

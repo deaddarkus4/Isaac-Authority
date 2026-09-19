@@ -16,13 +16,15 @@ LEGACY_SLOT_BYTES = SLOT_BYTES - MAX_PLAYERS * PLAYER.size
 
 
 def players(frame):
-    """Every player of a frame in list order; "player" alone means one player driven by controller 0."""
-    return frame.get("players") or [dict(controller=0, body=frame["player"])]
+    """Every player of a frame in list order; "player" alone means one player driven by controller 0. "ack" is the client
+    command the host's game last consumed for that player, 0 for none."""
+    return [dict(controller=p["controller"], body=p["body"], ack=p.get("ack", 0))
+            for p in frame.get("players") or [dict(controller=0, body=frame["player"])]]
 
 
 def same_players(a, b):
     a, b = players(a), players(b)
-    return len(a) == len(b) and all(x["controller"] == y["controller"] and
+    return len(a) == len(b) and all(x["controller"] == y["controller"] and x["ack"] == y["ack"] and
                                     struct.pack("<4f", *x["body"]) == struct.pack("<4f", *y["body"]) for x, y in zip(a, b))
 
 
@@ -38,10 +40,11 @@ def validate(frame):
         raise ValueError("Invalid player or incomplete roster")
     listed = frame.get("players")
     if listed is not None:
-        # One player on controller 0 has only the short spelling, and the first listed player is the header's player.
-        if not 0 < len(listed) <= MAX_PLAYERS or (len(listed) == 1 and listed[0]["controller"] == 0):
+        # One player on controller 0, driven by no client command, has only the short spelling; the first listed player
+        # is the header's player.
+        if not 0 < len(listed) <= MAX_PLAYERS or (len(listed) == 1 and listed[0]["controller"] == 0 and not listed[0].get("ack", 0)):
             raise ValueError("Invalid player section")
-        if not all(0 <= p["controller"] <= 7 and body(p["body"]) for p in listed):
+        if not all(0 <= p["controller"] <= 7 and 0 <= p.get("ack", 0) < 2**32 and body(p["body"]) for p in listed):
             raise ValueError("Invalid listed player")
         if struct.pack("<4f", *listed[0]["body"]) != struct.pack("<4f", *frame["player"]):
             raise ValueError("The header and the player section disagree on the first player")
@@ -79,7 +82,7 @@ def encode(frame):
                          frame["timeMs"], *frame["room"], *frame["player"], len(frame["entities"]), len(npcs), len(listed))
     tail = b"".join(NPC.pack(npc["type"], npc["variant"], npc["subtype"], npc["seed"], *npc["body"], *npc["target"], *npc["hp"],
                              npc["state"], *npc["flags"]) for npc in npcs)
-    tail += b"".join(PLAYER.pack(p["controller"], *p["body"], 0) for p in listed)
+    tail += b"".join(PLAYER.pack(p["controller"], *p["body"], p.get("ack", 0)) for p in listed)
     return packet + b"".join(ENTITY.pack(entity["id"], entity["seed"], entity["type"], entity["variant"], entity["subtype"],
                                          *entity["body"], *entity["tear"], 0) for entity in frame["entities"]) + tail
 
@@ -114,9 +117,8 @@ def decode(packet):
         frame["players"] = []
         for offset in range(len(packet) - listed * PLAYER.size, len(packet), PLAYER.size):
             player = PLAYER.unpack_from(packet, offset)
-            if player[-1]:
-                raise ValueError("Reserved player field is not zero")
-            frame["players"].append(dict(controller=player[0], body=list(player[1:5])))
+            # The key is present only for a player driven by a client command, as in the modules' own logs.
+            frame["players"].append(dict(controller=player[0], body=list(player[1:5]), **(dict(ack=player[5]) if player[5] else {})))
     validate(frame)
     return frame
 

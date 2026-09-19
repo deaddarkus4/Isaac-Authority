@@ -1,7 +1,9 @@
+#define PSAPI_VERSION 2 // EnumProcessModules from kernel32, no extra library
 #include "world_receiver.hpp"
 #include "profile.hpp"
 #include "vtable_slot.hpp"
 #include <bcrypt.h>
+#include <psapi.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -32,9 +34,18 @@ constexpr bool kPlayers = true;
 #else
 constexpr bool kPlayers = false;
 #endif
+// Prediction: the source acknowledges the client command its game consumed for each player; the replica lets the
+// client's own player run its own update and only reconciles it with the host.
+#ifdef ISAAC_WORLD_PREDICT
+constexpr bool kPredict = true;
+#else
+constexpr bool kPredict = false;
+#endif
 constexpr std::uintptr_t kPlayerTable = 0x76bdd0, kPlayerUpdate = 0x382af0;
 // Entity_Player::ControllerIndex: whose input drives this player.
 constexpr std::uintptr_t kController = 0x1618;
+// The client's own player is the one its game created for the joining controller (two-player prototype).
+constexpr std::int32_t kOwnController = 1;
 // Entity_NPC shares the entity vtable layout: slot 3 is Update.
 constexpr std::uintptr_t kNpcTable = 0x767468, kNpcUpdate = 0x2c4b30;
 // What Lua's entity:Kill() runs: builds an empty damage source and calls the virtual Kill (slot 9).
@@ -89,9 +100,22 @@ bool playerShielded = false;
 // Which player the game updated last, and how often the list order was not the update order.
 int lastUpdated = -1;
 unsigned orderSurprises = 0, rosterMismatches = 0;
+// The replica's own, predicted player: its place in the team (-1 for none), its history and what reconciling found.
+int ownIndex = -1;
+Prediction prediction;
+struct Own { Body local; float error = 0; unsigned mend = 0; bool matched = false; };
+Own lastOwn;
+unsigned predictSamples = 0, predictMatched = 0, predictSettles = 0, predictShifts = 0, predictSnaps = 0, predictRemembered = 0;
+float predictErrorMax = 0;
+double predictErrorSum = 0;
+// The input module is another DLL of this process under a name that carries a hash: it is found by its export.
+using Acknowledged = DWORD(WINAPI*)(std::int32_t*, std::uint32_t*);
+std::array<Acknowledged, 32> inputModules{};
+unsigned inputModuleCount = 0;
+std::uint64_t inputModulesScannedAt = 0;
 struct Tracked { std::uintptr_t address = 0; std::uint32_t localIndex = 0; Entity state; };
 std::array<Tracked, kMaxEntities> tracked{};
-struct Record { std::uint64_t now = 0; DWORD thread = 0; unsigned created = 0, removed = 0, action = 0; Frame frame; };
+struct Record { std::uint64_t now = 0; DWORD thread = 0; unsigned created = 0, removed = 0, action = 0; Frame frame; Own own; };
 std::array<Record, 2048> records;
 struct Guard { Guard() { AcquireSRWLockExclusive(&lifecycle); } ~Guard() { ReleaseSRWLockExclusive(&lifecycle); } };
 template<class T> bool Read(std::uintptr_t address, T& value) {
@@ -129,15 +153,55 @@ bool Local(std::uintptr_t& game, std::uintptr_t& room, Team& found, RoomKey& key
         Describe(game, index, dimension, key);
 }
 bool SameTeam(const Team& a, const Team& b) { return a.count == b.count && a.players == b.players; }
-// Bodies of the whole team in list order. The source also says which controller drives each player.
+void ScanInputModules() {
+    std::array<HMODULE, 512> modules{}; DWORD needed = 0;
+    inputModuleCount = 0; inputModulesScannedAt = GetTickCount64();
+    if (!EnumProcessModules(GetCurrentProcess(), modules.data(), sizeof(modules), &needed)) return;
+    const auto count = (std::min)(static_cast<std::size_t>(needed / sizeof(HMODULE)), modules.size());
+    for (std::size_t i = 0; i < count && inputModuleCount < inputModules.size(); ++i) {
+        const auto found = GetProcAddress(modules[i], "IsaacAuthorityInputAcknowledged");
+        if (found) inputModules[inputModuleCount++] = reinterpret_cast<Acknowledged>(found);
+    }
+}
+// Which command's movement this game last read, and for which controller. Inactive copies of the module answer nothing;
+// a module attached later is found by scanning again, at most twice a second.
+bool Consumed(std::int32_t& controller, std::uint32_t& sequence) {
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        for (unsigned i = 0; i < inputModuleCount; ++i) if (inputModules[i](&controller, &sequence) == ERROR_SUCCESS) return true;
+        if (pass || GetTickCount64() - inputModulesScannedAt < 500) return false;
+        ScanInputModules();
+    }
+    return false;
+}
+// Bodies of the whole team in list order. The source also says which controller drives each player and, when it
+// predicts, which client command its game last consumed for that controller.
 bool ReadPlayers(Frame& frame, bool controllers) {
     frame.playerCount = team.count;
+    std::int32_t driven = -1; std::uint32_t sequence = 0;
+    if (kPredict) { if (controllers && !Consumed(driven, sequence)) driven = -1; }
     for (unsigned i = 0; i < team.count; ++i) {
         std::int32_t controller = 0;
         if (!ReadBody(team.players[i], frame.players[i].body) || (controllers && !Read(team.players[i] + kController, controller))) return false;
-        if (controllers) frame.players[i].controller = static_cast<std::uint32_t>(controller);
+        if (controllers) {
+            frame.players[i].controller = static_cast<std::uint32_t>(controller);
+            frame.players[i].acknowledged = controller == driven ? sequence : 0;
+        }
     }
     return true;
+}
+// The replica's own player: the second or a later one of the team, driven here by the joining controller.
+void FindOwn() {
+    ownIndex = -1;
+    for (unsigned i = 1; i < team.count && ownIndex < 0; ++i) {
+        std::int32_t controller = 0;
+        if (Read(team.players[i] + kController, controller) && controller == kOwnController) ownIndex = static_cast<int>(i);
+    }
+}
+// After the own player's own update: where it stands once its game consumed this command.
+void RememberOwn(std::uintptr_t self) {
+    Body body; std::int32_t controller = 0; std::uint32_t sequence = 0;
+    if (!ReadBody(self, body)) { ++faults; return; }
+    if (Consumed(controller, sequence) && controller == kOwnController) { prediction.Remember(sequence, body.position); ++predictRemembered; }
 }
 bool List(std::uintptr_t room, std::array<std::uintptr_t, 4096>& pointers, unsigned& count) {
     std::uintptr_t data = 0; unsigned capacity = 0;
@@ -226,7 +290,7 @@ bool Clear() {
     for (auto& entry : tracked) if (!RemoveTear(entry)) ok = false;
     adopted = {};
     if (playerShielded && !Shield(false)) ok = false;
-    haveFrame = false;
+    haveFrame = false; prediction.Reset();
     if (!ok) ++faults;
     return ok;
 }
@@ -241,7 +305,7 @@ void InvalidatePublication() { InterlockedIncrement(&published.generation); publ
 // Actions: 0 captured, 1 applied, 2 held, 3 room requested, 4 requested room reached, 5 moved by the replica's own game.
 // Only world states are published.
 void RecordFrame(const Frame& frame, unsigned action = 0) {
-    if (frameCount < records.size()) records[frameCount++] = {GetTickCount64(), GetCurrentThreadId(), created, removed, action, frame};
+    if (frameCount < records.size()) records[frameCount++] = {GetTickCount64(), GetCurrentThreadId(), created, removed, action, frame, lastOwn};
     else ++dropped;
     if (action < 3) Publish(frame);
 }
@@ -319,6 +383,21 @@ bool Adopt(std::uintptr_t game, const Frame& frame, Frame& readback) {
     for (unsigned i = 0; i < frame.npcCount; ++i) if (!matched[i]) ++npcUnmatched;
     return true;
 }
+// The own player is not overwritten with the host's present: its error after the acknowledged command is mended.
+bool MendOwn(const Player& host) {
+    Body local;
+    if (!ReadBody(team.players[ownIndex], local)) return false;
+    const auto found = prediction.Reconcile(host.acknowledged, host.body, local);
+    lastOwn = {local, found.error, static_cast<unsigned>(found.kind), found.matched};
+    ++predictSamples;
+    if (found.matched) { ++predictMatched; predictErrorSum += found.error; predictErrorMax = (std::max)(predictErrorMax, found.error); }
+    if (found.kind == Mend::None) return true;
+    if (found.kind == Mend::Settle) ++predictSettles; else if (found.kind == Mend::Shift) ++predictShifts; else ++predictSnaps;
+    local.position.x += found.shift.x; local.position.y += found.shift.y;
+    if (found.kind == Mend::Snap) local.velocity = host.body.velocity;
+    prediction.Shift(found.shift);
+    return WriteBody(team.players[ownIndex], local);
+}
 bool Apply(std::uintptr_t game, const Frame& frame, Frame& readback) {
     Delta delta;
     // The host's players are this game's players one to one; a different number of them cannot be shown.
@@ -348,8 +427,12 @@ bool Apply(std::uintptr_t game, const Frame& frame, Frame& readback) {
             !Tear(match->address, actual)) return false;
         match->state = entity; actual.id = entity.id; readback.entities[i] = actual;
     }
-    for (unsigned i = 0; i < team.count; ++i) if (!WriteBody(team.players[i], frame.players[i].body)) return false;
+    for (unsigned i = 0; i < team.count; ++i) {
+        if (static_cast<int>(i) == ownIndex ? !MendOwn(frame.players[i]) : !WriteBody(team.players[i], frame.players[i].body)) return false;
+    }
     if (!ReadPlayers(readback, false)) return false;
+    // The readback says what the host said; where the own player really stands is recorded beside it.
+    if (ownIndex >= 0) readback.players[ownIndex].body = frame.players[ownIndex].body;
     if (kNpcs) { if (!Adopt(game, frame, readback) || !Shield(true)) return false; }
     lastFrame = frame; haveFrame = true; return true;
 }
@@ -420,11 +503,14 @@ void __fastcall OnPlayer(void* object, void*) {
             // One update per game step carries the step: the source captures after its last player, the replica
             // applies with its first. The other players are only held, or left to the game.
             if (index != (kSource ? found.count - 1 : 0)) {
-                const bool held = !kSource && haveFrame && !traveling && SameTeam(found, team);
+                // The predicted player runs its own update at once; the host mends it afterwards.
+                const bool predicted = static_cast<int>(index) == ownIndex && SameTeam(found, team);
+                const bool held = !predicted && !kSource && haveFrame && !traveling && SameTeam(found, team);
                 if (held) {
                     if (!WriteBody(self, lastFrame.players[index].body)) ++faults;
                     ++playerHolds;
                 } else originalPlayer(object);
+                if (predicted) RememberOwn(self);
                 active.fetch_sub(1, std::memory_order_release); return;
             }
         }
@@ -525,7 +611,9 @@ void FrameJson(std::ostringstream& out, const Frame& f) {
     if (f.playerCount != 1 || f.players[0].controller) {
         out << ",\"players\":[";
         for (unsigned i = 0; i < f.playerCount; ++i) {
-            out << (i ? "," : "") << "{\"controller\":" << f.players[i].controller << ",\"body\":"; BodyJson(out, f.players[i].body); out << '}';
+            out << (i ? "," : "") << "{\"controller\":" << f.players[i].controller << ",\"body\":"; BodyJson(out, f.players[i].body);
+            if (f.players[i].acknowledged) out << ",\"ack\":" << f.players[i].acknowledged;
+            out << '}';
         }
         out << ']';
     }
@@ -639,10 +727,13 @@ extern "C" DWORD WINAPI IsaacAuthorityWorldStart(void*) noexcept {
         adopted = {}; npcKilled = npcKillUnconfirmed = npcCorrections = npcUpdates = npcStateDrift = npcVisibleDrift = npcUnmatched = npcOrphans = lastFault = 0;
         npcDriftMax = 0; npcDriftSum = 0; playerCollision = {}; playerShielded = false;
         lastUpdated = -1; orderSurprises = rosterMismatches = 0;
+        prediction.Reset(); lastOwn = {}; ownIndex = -1; inputModuleCount = 0; inputModulesScannedAt = 0;
+        predictSamples = predictMatched = predictSettles = predictShifts = predictSnaps = predictRemembered = 0; predictErrorMax = 0; predictErrorSum = 0;
+        if (kPredict) { if (!kSource) FindOwn(); }
         stopRequested = false; cleaned = false; owner = 0;
         published = Published{}; published.session = session;
         const auto directory = Directory(); std::filesystem::create_directories(directory / L"logs");
-        const std::wstring role = std::wstring(kPlayers ? L"coop-" : kNpcs ? L"npc-" : kRooms ? L"room-" : L"world-") + (kSource ? L"source-" : L"replica-");
+        const std::wstring role = std::wstring(kPredict ? L"predict-" : kPlayers ? L"coop-" : kNpcs ? L"npc-" : kRooms ? L"room-" : L"world-") + (kSource ? L"source-" : L"replica-");
         const auto unique = role + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(session);
         const auto log = directory / L"logs" / (unique + L".jsonl");
         report = CreateFileW(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -693,12 +784,19 @@ extern "C" DWORD WINAPI IsaacAuthorityWorldStop(void*) noexcept {
     try {
         std::ostringstream out; out.precision(9);
         out << "{\"type\":\"start\",\"role\":\"" << (kSource ? "source" : "replica") << "\",\"scope\":\""
-            << (kPlayers ? "standard-tears-rooms-enemies-players" : kNpcs ? "standard-tears-rooms-enemies" : kRooms ? "standard-tears-rooms" : "standard-tears")
+            << (kPredict ? "standard-tears-rooms-enemies-players-prediction" : kPlayers ? "standard-tears-rooms-enemies-players" : kNpcs ? "standard-tears-rooms-enemies" : kRooms ? "standard-tears-rooms" : "standard-tears")
             << "\",\"worldSnapshot\":false}\n";
         for (unsigned i = 0; i < frameCount; ++i) {
             const auto& r = records[i];
             out << "{\"type\":\"frame\",\"observedMs\":" << r.now << ",\"thread\":" << r.thread << ",\"created\":" << r.created << ",\"removed\":" << r.removed << ",\"action\":" << r.action << ',';
-            FrameJson(out, r.frame); out << "}\n";
+            FrameJson(out, r.frame);
+            // Beside an applied snapshot: where the predicted player really stood, and what reconciling found and did
+            // (mend: 0 nothing, 1 settled, 2 shifted, 3 snapped).
+            if (ownIndex >= 0 && r.action == 1) {
+                out << ",\"own\":{\"index\":" << ownIndex << ",\"local\":"; BodyJson(out, r.own.local);
+                out << ",\"error\":" << r.own.error << ",\"mend\":" << r.own.mend << ",\"matched\":" << (r.own.matched ? "true" : "false") << '}';
+            }
+            out << "}\n";
         }
         unsigned remaining = 0; for (const auto& entry : tracked) if (entry.address) ++remaining;
         out << "{\"type\":\"stop\",\"frames\":" << frameCount << ",\"created\":" << created << ",\"removed\":" << removed
@@ -711,6 +809,10 @@ extern "C" DWORD WINAPI IsaacAuthorityWorldStop(void*) noexcept {
             << ",\"npcDriftMean\":" << (npcUpdates ? npcDriftSum / npcUpdates : 0.0) << ",\"npcUnmatched\":" << npcUnmatched
             << ",\"npcOrphans\":" << npcOrphans << ",\"npcKilled\":" << npcKilled << ",\"npcKillUnconfirmed\":" << npcKillUnconfirmed << ",\"playerShielded\":" << (playerShielded ? "true" : "false") << ",\"lastFault\":" << lastFault
             << ",\"players\":" << team.count << ",\"rosterMismatches\":" << rosterMismatches << ",\"updateOrderSurprises\":" << orderSurprises
+            << ",\"ownIndex\":" << ownIndex << ",\"predictRemembered\":" << predictRemembered << ",\"predictSamples\":" << predictSamples
+            << ",\"predictMatched\":" << predictMatched << ",\"predictSettles\":" << predictSettles << ",\"predictShifts\":" << predictShifts
+            << ",\"predictSnaps\":" << predictSnaps << ",\"predictErrorMax\":" << predictErrorMax
+            << ",\"predictErrorMean\":" << (predictMatched ? predictErrorSum / predictMatched : 0.0)
             << ",\"slotsRestored\":true,\"accepted\":" << receiver.accepted.load() << ",\"rejected\":" << receiver.rejected.load()
             << ",\"replaced\":" << receiver.replaced.load() << ",\"networkErrors\":" << receiver.errors.load() << "}\n";
         const auto text = out.str(); DWORD written = 0;

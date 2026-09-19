@@ -127,7 +127,11 @@ void Players() {
     auto bad = packet; bad.bytes[4] = 1; Check(!Decode(bad.bytes.data(), bad.size, out), "version 1 cannot list players");
     bad = packet; bad.bytes[92] = 3; Check(!Decode(bad.bytes.data(), bad.size, out), "player count must match the size");
     bad = packet; bad.bytes[92] = 0; Check(!Decode(bad.bytes.data(), bad.size, out), "version 3 needs a player section");
-    bad = packet; bad.bytes[packet.size - 4] = 1; Check(!Decode(bad.bytes.data(), bad.size, out), "reserved player field");
+    bad = packet; bad.bytes[packet.size - 4] = 7;
+    Check(Decode(bad.bytes.data(), bad.size, out) && out.players[1].acknowledged == 7 && !out.players[0].acknowledged, "the last field of a record is the consumed command");
+    auto acked = Example(); acked.players[0].acknowledged = 41;
+    Check(Encode(acked, bad) && bad.bytes[4] == 3 && bad.bytes[92] == 1 && Decode(bad.bytes.data(), bad.size, out) && out.players[0].acknowledged == 41,
+        "a lone player driven by a client is listed with its acknowledgement");
     bad = packet; bad.bytes[68] ^= 1; Check(!Decode(bad.bytes.data(), bad.size, out), "header and first record must agree on the first player");
     bad = packet; bad.bytes[packet.size - kPlayerRecord] = 8; Check(!Decode(bad.bytes.data(), bad.size, out), "controller out of range");
     auto enemies = f; enemies.npcCount = 1; enemies.npcs[0] = {244, 0, 0, 2078110152u, {{80, 160}, {0, 0}}, {80, 160}, 10, 10, 8, 1, 5, 4};
@@ -145,6 +149,36 @@ void Players() {
     g = f; g.players[1].body.position.x = std::numeric_limits<float>::quiet_NaN(); Check(!Valid(g), "every player body is checked");
     Gate gate(123); Check(gate.Receive(f, 1000) == Decision::Accept, "player frames pass the same gate");
     Check(kMaxBytes == 3136, "slot payload bound");
+}
+void Predictions() {
+    Prediction p; const Body rest{{100, 100}, {0, 0}};
+    auto c = p.Reconcile(0, rest, rest); Check(c.kind == Mend::None && !c.matched && c.error == 0, "nothing to mend before any command");
+    c = p.Reconcile(0, {{200, 100}, {0, 0}}, rest); Check(c.kind == Mend::Snap && !c.matched && c.shift.x == 100, "without history a far host is a teleport");
+    // The client walked right: after command n it stood at 100 + 4n.
+    for (std::uint32_t n = 1; n <= 10; ++n) p.Remember(n, {100.0f + 4 * n, 100});
+    const Body walking{{140, 100}, {4, 0}};
+    c = p.Reconcile(5, {{120, 100}, {4, 0}}, walking);
+    Check(c.kind == Mend::None && c.matched && c.error == 0, "the host after command 5 is compared with the client after command 5, not with its present");
+    c = p.Reconcile(5, {{126, 100}, {4, 0}}, walking); Check(c.kind == Mend::None && c.error == 6, "a step or two out of phase is not an error");
+    c = p.Reconcile(5, {{120, 120}, {4, 0}}, walking);
+    Check(c.kind == Mend::Shift && c.shift.x == 0 && c.shift.y == 20 && c.error == 20, "a real disagreement shifts the present by the error of the past");
+    p.Shift(c.shift); c = p.Reconcile(5, {{120, 120}, {4, 0}}, {{140, 120}, {4, 0}});
+    Check(c.kind == Mend::None && c.error == 0, "the history moves with the correction: the same snapshot asks for nothing more");
+    c = p.Reconcile(5, {{320, 120}, {0, 0}}, {{140, 120}, {4, 0}}); Check(c.kind == Mend::Snap && c.shift.x == 200, "a teleport on the host");
+    c = p.Reconcile(7, {{128, 120}, {4, 0}}, walking); Check(c.matched && c.error == 0, "a later acknowledgement moves along the history");
+    p.Remember(10, {140, 120}); p.Remember(10, {144, 120});
+    c = p.Reconcile(10, {{144, 120}, {0, 0}}, {{144, 120}, {0, 0}}); Check(c.error == 0, "of several updates on one command the last one counts");
+    c = p.Reconcile(3, {{112, 120}, {4, 0}}, walking); Check(c.matched && c.error == 0, "an old acknowledgement still finds its entry");
+    // Both stand still, four units apart: closed gently, never while anyone walks.
+    Prediction q; q.Remember(9, {100, 100});
+    c = q.Reconcile(9, {{104, 100}, {0, 0}}, rest); Check(c.kind == Mend::Settle && c.shift.x == 1 && c.error == 4, "a small gap at rest is closed by a quarter per snapshot");
+    c = q.Reconcile(9, {{104, 100}, {0, 0}}, {{100, 100}, {2, 0}}); Check(c.kind == Mend::None, "no settling while the client walks");
+    c = q.Reconcile(9, {{104, 100}, {2, 0}}, rest); Check(c.kind == Mend::None, "no settling while the host walks");
+    float gap = 4; for (int i = 0; i < 40; ++i) gap -= gap * kPredictSettle; Check(gap < 0.01f, "settling converges within a second");
+    c = q.Reconcile(9, {{std::numeric_limits<float>::quiet_NaN(), 100}, {0, 0}}, rest); Check(c.kind == Mend::None, "a broken snapshot mends nothing");
+    for (std::uint32_t n = 10; n < 400; ++n) q.Remember(n, {float(n), 0});
+    c = q.Reconcile(9, {{104, 100}, {0, 0}}, rest); Check(!c.matched, "history is bounded: an entry that fell out is not invented");
+    q.Reset(); c = q.Reconcile(399, rest, rest); Check(!c.matched, "reset forgets");
 }
 void Contract(const wchar_t* path) {
     HMODULE dll = LoadLibraryW(path); Check(dll != nullptr, "load world adapter");
@@ -179,8 +213,8 @@ int Fixture() {
 int wmain(int argc, wchar_t** argv) {
     try {
         if (argc == 2 && std::wstring(argv[1]) == L"--fixture") return Fixture();
-        Protocol(); Lifecycle(); Rooms(); Enemies(); Players();
+        Protocol(); Lifecycle(); Rooms(); Enemies(); Players(); Predictions();
         for (int i = 1; i < argc; ++i) Contract(argv[i]);
-        std::cout << "PASS world wire, stable identities, lifetimes, epochs, room routing, enemy and player sections, module contracts\n"; return 0;
+        std::cout << "PASS world wire, stable identities, lifetimes, epochs, room routing, enemy and player sections, prediction, module contracts\n"; return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

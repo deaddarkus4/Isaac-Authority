@@ -19,11 +19,19 @@
 namespace {
 using namespace authority;
 using namespace authority::input;
-#ifdef ISAAC_INPUT_CLIENT
+#if defined(ISAAC_INPUT_CLIENT) || defined(ISAAC_INPUT_PREDICT)
 constexpr bool kClient = true;
 #else
 constexpr bool kClient = false;
 #endif
+// A predicting client also walks its own player at once, with the very command it sends to the host. That player is the
+// one its game created for the joining controller: index 1 in both games of this two-player prototype.
+#ifdef ISAAC_INPUT_PREDICT
+constexpr bool kPredict = true;
+#else
+constexpr bool kPredict = false;
+#endif
+constexpr int kOwnController = 1;
 // InputManager at RVA 0x857b18; slot 29 is WithDevice(controller, reader, in, out, deviceId), thiscall, ret 0x14.
 // Readers: action value (float to out, returns value != 0), action pressed, action triggered (both return bool).
 constexpr std::uintptr_t kManager = 0x857b18, kManagerTable = 0x782950, kWithDevice = 0x620fb0;
@@ -71,6 +79,37 @@ std::atomic<DWORD> owner{0};
 std::uint64_t lastSampleMs = 0;
 std::uint32_t captureSequence = 0;
 std::atomic<unsigned> samples{0}, activeSamples{0}, withheld{0};
+// The command whose movement the game last read for the driven controller. The world module of the same process asks:
+// on the host to acknowledge it in the snapshot, on a predicting client to label its own history.
+std::atomic<std::int32_t> consumedController{0};
+std::atomic<std::uint32_t> consumedSequence{0};
+
+// Answer for the driven controller from the latest command. A silent client is a neutral client: without a fresh
+// command nothing is injected and the caller decides.
+bool Inject(int controller, std::uintptr_t kind, const void* in, void* out, int& result) {
+    bool injected = false;
+    AcquireSRWLockExclusive(&state);
+    if (have && controller == latest.controller && Fresh(latest, GetTickCount64())) {
+        const int action = *static_cast<const int*>(in);
+        if (Known(action)) {
+            injected = true;
+            if (kind == base + kReadValue) {
+                const auto value = Value(latest, action);
+                if (out) *static_cast<float*>(out) = value;
+                result = value != 0; ++values;
+                if (action <= Down) { consumedController.store(latest.controller); consumedSequence.store(latest.sequence); }
+            } else if (kind == base + kReadPressed) { result = Pressed(latest, action); ++presses; }
+            else {
+                LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
+                if (pendingEdge[action]) { pendingEdge[action] = false; edgeOpened[action] = now.QuadPart; }
+                result = edgeOpened[action] && now.QuadPart - edgeOpened[action] <= ticksPerFrame;
+                ++triggers;
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&state);
+    return injected;
+}
 
 // Ask the client's own device, on the game's thread and through the game's own reader, what it answers right now.
 void Capture(void* self) {
@@ -91,6 +130,13 @@ void Capture(void* self) {
     InterlockedIncrement(&published.generation);
     ++samples;
     if (!Neutral(command)) ++activeSamples;
+    if (kPredict) {
+        // The local game reads the same command the host will: movement only. What the player fires, drops or uses
+        // is the host's to decide, and its results come back in the world.
+        AcquireSRWLockExclusive(&state);
+        latest = command; latest.controller = kOwnController; latest.shootX = latest.shootY = 0; latest.buttons = 0; have = true;
+        ReleaseSRWLockExclusive(&state);
+    }
 }
 void InvalidatePublication() { InterlockedIncrement(&published.generation); published.alive = 0; InterlockedIncrement(&published.generation); }
 
@@ -110,31 +156,21 @@ int __fastcall OnInput(void* self, void*, int controller, void* reader, void* in
                     if (kind == base + kReadValue && out) *static_cast<float*>(out) = 0;
                     injected = true; ++withheld;
                 }
+                if (kPredict) {
+                    // The own player walks by the captured command. Whatever device really sits at that index, a
+                    // gamepad for one, never steers it: a known action without a command is neutral, not the device's.
+                    if (known && controller == kOwnController && Known(*static_cast<const int*>(in))) {
+                        if (!Inject(controller, kind, in, out, result)) { result = 0; if (kind == base + kReadValue && out) *static_cast<float*>(out) = 0; }
+                        injected = true;
+                    }
+                }
             }
         }
     } else if (running.load(std::memory_order_acquire) && known) {
         const int asked = *static_cast<const int*>(in), reads = kind == base + kReadValue ? 0 : kind == base + kReadPressed ? 1 : 2;
         if (controller >= -1 && controller < kControllers - 1 && asked >= 0 && asked < kPolledActions) ++polls[controller + 1][reads][asked];
-        AcquireSRWLockExclusive(&state);
         // A silent client is a neutral client: without a fresh command the real device decides again.
-        if (have && controller == latest.controller && Fresh(latest, GetTickCount64())) {
-            const int action = *static_cast<const int*>(in);
-            if (Known(action)) {
-                injected = true;
-                if (kind == base + kReadValue) {
-                    const auto value = Value(latest, action);
-                    if (out) *static_cast<float*>(out) = value;
-                    result = value != 0; ++values;
-                } else if (kind == base + kReadPressed) { result = Pressed(latest, action); ++presses; }
-                else {
-                    LARGE_INTEGER now{}; QueryPerformanceCounter(&now);
-                    if (pendingEdge[action]) { pendingEdge[action] = false; edgeOpened[action] = now.QuadPart; }
-                    result = edgeOpened[action] && now.QuadPart - edgeOpened[action] <= ticksPerFrame;
-                    ++triggers;
-                }
-            }
-        }
-        ReleaseSRWLockExclusive(&state);
+        injected = Inject(controller, kind, in, out, result);
     }
     if (!injected) { ++passedThrough; result = original(self, controller, reader, in, out, device); }
     active.fetch_sub(1, std::memory_order_release);
@@ -212,6 +248,7 @@ extern "C" DWORD WINAPI IsaacAuthorityInputStart(void*) noexcept {
         values = presses = triggers = passedThrough = accepted = rejected = errors = 0;
         for (auto& controller : polls) for (auto& reader : controller) for (auto& count : reader) count = 0;
         samples = activeSamples = withheld = 0; owner = 0; lastSampleMs = 0; captureSequence = 0; port = 0;
+        consumedController = 0; consumedSequence = 0;
         published = PublishedCommand{}; published.session = session;
         // The client opens no socket: its command is published in a slot and carried to the host from outside.
         if (!kClient) {
@@ -266,6 +303,7 @@ extern "C" DWORD WINAPI IsaacAuthorityInputStop(void*) noexcept {
     std::ostringstream out;
     out << "{\"type\":\"stop\",\"role\":\"" << (kClient ? "input-client" : "input-host") << "\",\"samples\":" << samples.load()
         << ",\"activeSamples\":" << activeSamples.load() << ",\"withheld\":" << withheld.load()
+        << ",\"predicts\":" << (kPredict ? "true" : "false") << ",\"consumedSequence\":" << consumedSequence.load()
         << ",\"accepted\":" << accepted.load() << ",\"rejected\":" << rejected.load()
         << ",\"networkErrors\":" << errors.load() << ",\"valueReads\":" << values.load() << ",\"pressedReads\":" << presses.load()
         << ",\"triggeredReads\":" << triggers.load() << ",\"passedThrough\":" << passedThrough.load()
@@ -281,5 +319,13 @@ extern "C" DWORD WINAPI IsaacAuthorityInputStop(void*) noexcept {
     const BOOL ok = WriteFile(report, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
     CloseHandle(report); report = INVALID_HANDLE_VALUE;
     return ok && written == text.size() && !errors.load() ? ERROR_SUCCESS : ERROR_INVALID_DATA;
+}
+// For the world module loaded in the same game: which command's movement the game last read, and for which controller.
+extern "C" DWORD WINAPI IsaacAuthorityInputAcknowledged(std::int32_t* controller, std::uint32_t* sequence) noexcept {
+    if (!controller || !sequence) return ERROR_INVALID_PARAMETER;
+    const auto consumed = consumedSequence.load();
+    if (!running.load() || !consumed) return ERROR_NOT_READY;
+    *controller = consumedController.load(); *sequence = consumed;
+    return ERROR_SUCCESS;
 }
 BOOL WINAPI DllMain(HINSTANCE, DWORD, LPVOID) { return TRUE; }

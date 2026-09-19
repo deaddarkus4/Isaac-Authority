@@ -2,3 +2,4 @@ LIBRARY IsaacAuthorityInputClient
 EXPORTS
     IsaacAuthorityInputStart=_IsaacAuthorityInputStart@4
     IsaacAuthorityInputStop=_IsaacAuthorityInputStop@4
+    IsaacAuthorityInputAcknowledged=_IsaacAuthorityInputAcknowledged@8
