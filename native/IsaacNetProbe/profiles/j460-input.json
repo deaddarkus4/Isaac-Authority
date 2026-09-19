@@ -45,11 +45,24 @@
     "staleCommandStopsPlayer": true,
     "buttonsVerified": "join and menuConfirm only",
     "secondPlayerOnHost": true,
-    "clientSideCapture": false,
+    "clientSideCapture": true,
+    "clientSideCaptureReport": "docs/j460-closed-loop-test.md",
+    "unfocusedGameStillPollsAndSimulatesTheClientsController": true,
     "report": "docs/j460-client-input-test.md",
     "secondPlayerDrivenByInjectedInput": true,
     "firstPlayerUnaffected": true,
     "joinRequiresExistingSecondDevice": true
+  },
+  "clientCapture": {
+    "module": "IsaacAuthorityInputClient (ISAAC_INPUT_CLIENT), same vtable slot",
+    "method": "every 8 ms, on the game's thread inside a hooked call, the module calls the original WithDevice(0, actionValue reader, &action, &out, null) for each captured action",
+    "capturedActions": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+    "notCaptured": "menu buttons (14, 15, 20-23), join (19), pause, map, restart",
+    "withDeviceDeviceIdMayBeNull": true,
+    "valueReaderWritesOutUnconditionally": true,
+    "localAnswersForCapturedActionsOfController0": "withheld (neutral) while capturing",
+    "publishedSlot": "88 bytes: magic 0x31534e49, version, generation (odd while written), alive, bytes, reserved, session u64, INP1 packet",
+    "transport": "outside the module: the relay sets the host's session and the controller the host assigned to this client"
   },
   "coopJoinHandlerRva": "0x5bac40",
   "coopJoin": {

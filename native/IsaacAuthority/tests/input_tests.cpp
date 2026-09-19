@@ -41,6 +41,26 @@ void Freshness() {
     ++c.sequence; c.session = 78; Check(!gate.Receive(c, 1000), "foreign session");
     c.session = 77; Check(gate.Receive(c, 1100) && !Fresh(c, 1300), "accepted, then too old to steer");
 }
+void Capture() {
+    Sample s; Check(Neutral(Compose(s)), "an untouched device composes a neutral command");
+    s.value[Right] = 1; s.value[ShootUp] = 0.75f; s.value[Bomb] = 1;
+    auto c = Compose(s);
+    Check(c.moveX == 1 && c.moveY == 0 && c.shootX == 0 && c.shootY == -0.75f && c.buttons == 1 && !Neutral(c), "a device sample becomes axes and buttons");
+    // What the client captured is what the host's game reads back for the same actions.
+    for (const auto action : kCaptured) Check(Value(c, action) == s.value[action], "capture and injection are inverse");
+    s.value[Left] = 1; Check(Compose(s).moveX == 0, "opposite keys cancel");
+    s = {}; s.value[Down] = 3; s.value[ShootLeft] = std::numeric_limits<float>::infinity(); s.value[Up] = std::numeric_limits<float>::quiet_NaN();
+    c = Compose(s); c.session = 77; c.sequence = 1;
+    Check(c.moveY == 0 && c.shootX == 0 && Valid(c), "a wild device answer never leaves the wire's range");
+    s = {}; s.value[Down] = 3; c = Compose(s); Check(c.moveY == 1, "a tilt is clamped to one");
+    s = {}; s.value[MenuConfirm] = 1; s.value[Join] = 1; s.value[MenuBack] = 1; s.value[12] = 1;
+    Check(Neutral(Compose(s)), "menu buttons, join and the pause key stay on the client");
+    Check(Captured(Left) && Captured(Drop) && !Captured(Join) && !Captured(MenuConfirm) && !Captured(12) && !Captured(-1) && !Captured(kActions),
+        "only the actions of play are captured");
+    s = {}; s.value[Item] = 0.4f; Check(Neutral(Compose(s)), "a half-pressed button is not pressed");
+    std::uint8_t bytes[kBytes]{}; s = {}; s.value[Left] = 1; c = Compose(s); c.session = 5; c.sequence = 9; c.timeMs = 1000; Command out;
+    Check(Encode(c, bytes) && Decode(bytes, kBytes, out) && out.moveX == -1 && out.controller == 0, "a captured command travels as INP1");
+}
 void Contract(const wchar_t* path) {
     HMODULE dll = LoadLibraryW(path); Check(dll != nullptr, "load input adapter");
     using Export = DWORD(WINAPI*)(void*);
@@ -53,8 +73,8 @@ void Contract(const wchar_t* path) {
 }
 int wmain(int argc, wchar_t** argv) {
     try {
-        Wire(); Actions(); Freshness();
+        Wire(); Actions(); Freshness(); Capture();
         for (int i = 1; i < argc; ++i) Contract(argv[i]);
-        std::cout << "PASS input wire, action mapping, freshness, module contract\n"; return 0;
+        std::cout << "PASS input wire, action mapping, freshness, client capture, module contracts\n"; return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

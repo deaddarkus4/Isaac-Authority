@@ -40,6 +40,21 @@
     "report": "docs/j460-coop-players-test.md",
     "summary": "coop-20260919-230429-841746"
   },
+  "closedLoop": {
+    "liveTwoGames": true,
+    "path": "client keyboard -> client input module -> INP1 -> host's second player simulated by the host's game -> WLD1 v3 -> client replica",
+    "keysPressedOnHost": 0,
+    "commandsAcceptedOfRelayed": "448 of 448",
+    "framesAppliedOfTransmitted": "450 of 450",
+    "hostOwnPlayerMoved": false,
+    "keyToHostPlayerMovesMs": 16,
+    "keyToClientSeesItMs": 31,
+    "latencyNote": "loopback, GetTickCount64 resolution about 16 ms",
+    "hostRanWithoutWindowFocus": true,
+    "clientPredictsItsPlayer": false,
+    "report": "docs/j460-closed-loop-test.md",
+    "summary": "coop-20260919-231819-324003"
+  },
   "candidatesFromRepentogonSignatures": {
     "note": "found by byte signature in the J460 image, exactly one match each; none has been called or otherwise verified",
     "PlayerManager::SpawnCoPlayer2(int playerType)": "0x5b9cd0",

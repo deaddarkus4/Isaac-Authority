@@ -58,6 +58,22 @@ float Value(const Command& c, int action) {
     }
 }
 bool Pressed(const Command& c, int action) { return Value(c, action) > 0.5f; }
+bool Captured(int action) {
+    for (const auto captured : kCaptured) if (captured == action) return true;
+    return false;
+}
+Command Compose(const Sample& s) {
+    // A device may answer anything; the wire format carries only finite tilts from -1 to 1.
+    const auto tilt = [&](int positive, int negative) {
+        const float v = s.value[positive] - s.value[negative];
+        return !std::isfinite(v) ? 0.0f : v > 1 ? 1.0f : v < -1 ? -1.0f : v;
+    };
+    Command c;
+    c.moveX = tilt(Right, Left); c.moveY = tilt(Down, Up); c.shootX = tilt(ShootRight, ShootLeft); c.shootY = tilt(ShootDown, ShootUp);
+    for (std::uint32_t bit = 0; bit < kButtonCount; ++bit) if (Captured(kButtons[bit]) && s.value[kButtons[bit]] > 0.5f) c.buttons |= 1u << bit;
+    return c;
+}
+bool Neutral(const Command& c) { return c.moveX == 0 && c.moveY == 0 && c.shootX == 0 && c.shootY == 0 && !c.buttons; }
 bool Gate::Receive(const Command& c, std::uint64_t now) {
     if (!Valid(c) || !Fresh(c, now) || c.session != session_ || c.sequence <= sequence_) return false;
     sequence_ = c.sequence; return true;

@@ -1,6 +1,9 @@
 """Two players of the host's run on the replica. The host publishes every player with its controller index: the first is
 driven by the HOST keyboard, the second by client commands over UDP. The replica, which created its own second player the
-same way, shows both. One shared first room, no door."""
+same way, shows both. One shared first room, no door.
+
+With --loop the commands are not scripted: keys are pressed in the client's own window, its input module captures them, and
+the client sees its player move only because the host simulated it and sent the world back."""
 import argparse
 import datetime
 import importlib.util
@@ -39,6 +42,13 @@ DURATION = 7500
 EXPECTED = [("first walks left", 1000, 1900, 0, 0, -1), ("second walks right", 1000, 1900, 1, 0, 1),
             ("second walks up", 2600, 3300, 1, 1, -1), ("first stays", 2600, 3300, 0, 1, 0),
             ("first walks right", 5200, 6100, 0, 0, 1), ("second walks left", 5200, 6100, 1, 0, -1)]
+# The closed loop (--loop): every key is pressed in the CLIENT's window and reaches the host only as commands captured by the
+# client module. Nobody is at the host's keyboard, so the host's own player never moves.
+LOOP_KEYS = [(1000, "D", True), (1700, "D", False), (2600, "W", True), (3100, "W", False), (3800, RIGHT, True), (4400, RIGHT, False),
+             (5200, "A", True), (5900, "A", False)]
+LOOP_EXPECTED = [("second walks right", 1000, 1900, 1, 0, 1), ("first stays", 1000, 1900, 0, 0, 0),
+                 ("second walks up", 2600, 3300, 1, 1, -1), ("second walks left", 5200, 6100, 1, 0, -1),
+                 ("first still stays", 5200, 6100, 0, 0, 0)]
 
 
 def team(process):
@@ -96,7 +106,8 @@ def run(args):
         return
     here = Path(__file__).resolve().parent; root = here.parent
     binaries = args.binary_directory or (here if (here / "installation.json").is_file() else root / "Binaries/authority-build/Release")
-    names = dict(source="IsaacAuthorityCoopSource.dll", replica="IsaacAuthorityCoopReplica.dll", host="IsaacAuthorityInput.dll")
+    names = dict(source="IsaacAuthorityCoopSource.dll", replica="IsaacAuthorityCoopReplica.dll", host="IsaacAuthorityInput.dll",
+                 client="IsaacAuthorityInputClient.dll")
     if (binaries / "installation.json").is_file():
         names.update(json.loads((binaries / "installation.json").read_text(encoding="utf-8")).get("modules", {}))
     attach = binaries / "IsaacAuthorityAttach.exe"
@@ -106,7 +117,10 @@ def run(args):
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
     before = set(logs.glob("coop-*.jsonl")) | set(logs.glob("input-*.jsonl"))
     processes, started, failures, transmitted, joined, ends = {}, [], [], [], {}, {}
-    control = None; start_ms = None; sent_commands = 0
+    control = None; start_ms = None; sent_commands = 0; pressed_ms = {}
+    # The keyboard belongs to the focused game. In the closed loop that is the client; otherwise it is the host.
+    keyboard_pid, keyboard_role = (args.replica_pid, "CLIENT") if args.loop else (args.source_pid, "HOST")
+    script_keys, expected = (LOOP_KEYS, LOOP_EXPECTED) if args.loop else (KEYS, EXPECTED)
 
     def invoke(action, pid, dll):
         result = subprocess.run([str(attach), action, str(pid), str(dll)], capture_output=True, text=True, timeout=20)
@@ -114,13 +128,15 @@ def run(args):
             raise RuntimeError(f"{action} PID {pid}: {result.stdout} {result.stderr}")
 
     try:
-        # The HOST joins last and keeps the focus: it pauses whenever another window has it.
-        for role, pid in (("replica", args.replica_pid), ("host", args.source_pid)):
+        # The game with the keyboard joins last and keeps the focus; a game that pauses on focus loss must be that one.
+        order = (("host", args.source_pid), ("replica", args.replica_pid)) if args.loop else (("replica", args.replica_pid), ("host", args.source_pid))
+        for role, pid in order:
             joined[role] = join(pid, role.upper(), args.controller, invoke, binaries / names["host"], directory)
         replica = reader.WindowsProcess(args.replica_pid); processes[args.replica_pid] = replica
         source = reader.WindowsProcess(args.source_pid); processes[args.source_pid] = source
-        control = pair.HostWindow(args.source_pid)
-        rooms.wait_running(source, "HOST", control); rooms.wait_running(replica, "REPLICA")
+        control = pair.HostWindow(keyboard_pid)
+        rooms.wait_running(processes[keyboard_pid], keyboard_role, control)
+        rooms.wait_running(replica if keyboard_pid == args.source_pid else source, "the game without the keyboard")
         invoke("input", args.source_pid, binaries / names["host"]); started.append(("input-stop", args.source_pid, binaries / names["host"]))
         client = json.loads((directory / f"input-host-{args.source_pid}.json").read_text())
         invoke("world", args.source_pid, binaries / names["source"]); started.append(("world-stop", args.source_pid, binaries / names["source"]))
@@ -128,16 +144,29 @@ def run(args):
         tears.wait_frame(source, source_endpoint)
         invoke("world", args.replica_pid, binaries / names["replica"]); started.append(("world-stop", args.replica_pid, binaries / names["replica"]))
         endpoint = json.loads((directory / f"coop-replica-{args.replica_pid}.json").read_text())
+        captured = None
+        if args.loop:
+            invoke("input", args.replica_pid, binaries / names["client"]); started.append(("input-stop", args.replica_pid, binaries / names["client"]))
+            captured = json.loads((directory / f"input-client-{args.replica_pid}.json").read_text())
         address, client_address = ("127.0.0.1", endpoint["port"]), ("127.0.0.1", client["port"])
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
-            start_ms = pair.uptime_ms(); keys = list(KEYS); previous, last_valid, last_command = None, start_ms, 0
+            start_ms = pair.uptime_ms(); keys = list(script_keys); previous, last_valid, last_command = None, start_ms, 0
             while True:
                 now = pair.uptime_ms(); control.require_focus()
                 if now - start_ms >= DURATION:
                     break
                 while keys and now - start_ms >= keys[0][0]:
                     _, key, down = keys.pop(0); control.key(key, down)
-                if now - last_command >= 10:
+                    if down:
+                        pressed_ms.setdefault(key, pair.uptime_ms())
+                if args.loop:
+                    # The only way from the client's keyboard to the host: what the client module captured, carried as is.
+                    # The transport, not the client, says which of the host's controllers this client drives.
+                    sample = commands.read_slot(replica.read, captured, now)
+                    if sample is not None and sample[0]["sequence"] != last_command:
+                        last_command = sample[0]["sequence"]; sent_commands += 1
+                        udp.sendto(commands.route(sample[1], client["session"], args.controller), client_address)
+                elif now - last_command >= 10:
                     _, move, shoot = [row for row in CLIENT if row[0] <= now - start_ms][-1]
                     sent_commands += 1; last_command = now
                     udp.sendto(commands.encode(client["session"], sent_commands, now, args.controller, move, shoot), client_address)
@@ -189,7 +218,9 @@ def run(args):
             reports[records[0]["role"]] = records
     summary = dict(utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), sourcePid=args.source_pid, replicaPid=args.replica_pid,
                    scope="standard-tears-rooms-enemies-players", realRoomTransition=False, runSeed=report["hostSeed"], room=report["room"],
-                   clientController=args.controller, secondPlayer=joined, keysPressedForSecondPlayer=0, commandsSent=sent_commands,
+                   mode="closed-loop" if args.loop else "scripted-client", keyboardIn=keyboard_role,
+                   clientController=args.controller, secondPlayer=joined, commandsSent=sent_commands,
+                   **({} if args.loop else dict(keysPressedForSecondPlayer=0)),
                    transmitted=len(transmitted), reports=copied, failures=failures, passed=False)
     if not failures:
         try:
@@ -202,8 +233,12 @@ def run(args):
                 raise RuntimeError("Host observation failed")
             if (host_footer["players"], footer["players"]) != (2, 2):
                 raise RuntimeError("A module did not see two players")
-            if any(not f["slotRestored"] or f["networkErrors"] for f in inputs) or inputs[-1]["accepted"] < sent_commands * 0.9:
+            drive = [f for f in inputs if f["role"] == "input-host"][-1]
+            capture = [f for f in inputs if f["role"] == "input-client"]
+            if any(not f["slotRestored"] or f["networkErrors"] for f in inputs) or drive["accepted"] < sent_commands * 0.9:
                 raise RuntimeError("The input module failed or did not receive the client's commands")
+            if args.loop and (len(capture) != 1 or capture[0]["samples"] < 300 or not capture[0]["activeSamples"]):
+                raise RuntimeError(f"The client module did not capture the keyboard: {capture}")
             sent = {(f["epoch"], f["sequence"]): f for f in transmitted}
             host_frames = {(r["epoch"], r["sequence"]): r for r in host_records if r["type"] == "frame"}
             applied = [r for r in target if r["type"] == "frame" and r["action"] == 1]
@@ -223,12 +258,13 @@ def run(args):
                         copies.add((frame["epoch"], entity["id"]))
                         born[min((0, 1), key=lambda i: (listed[i]["body"][0] - entity["body"][0]) ** 2 +
                                  (listed[i]["body"][1] - entity["body"][1]) ** 2)].add(entity["id"])
-            if len(applied) < 200 or not born[0] or not born[1]:
-                raise RuntimeError(f"Too few applied frames ({len(applied)}) or a player whose tears never reached the replica")
+            # In the closed loop nobody touches the host's keyboard: only the client's player fires.
+            if len(applied) < 200 or not born[1] or bool(born[0]) == args.loop:
+                raise RuntimeError(f"Too few applied frames ({len(applied)}) or unexpected tears: first player {len(born[0])}, second {len(born[1])}")
             if footer["created"] != len(copies) or footer["removed"] + footer["vanished"] != footer["created"]:
                 raise RuntimeError("Unexpected respawn or unremoved entity")
             moved = {}
-            for name, begin, end, player, axis, sign in EXPECTED:
+            for name, begin, end, player, axis, sign in expected:
                 rows = [world.players(f)[player]["body"] for f in applied if begin <= f["observedMs"] - start_ms <= end]
                 if len(rows) < 10:
                     raise RuntimeError(f"Too few frames applied while the {name}")
@@ -245,9 +281,17 @@ def run(args):
                            playerUpdatesHeld=footer["playerHolds"], rejected=footer["rejected"],
                            hostUpdateOrderSurprises=host_footer["updateOrderSurprises"],
                            replicaUpdateOrderSurprises=footer["updateOrderSurprises"],
-                           commandsAccepted=inputs[-1]["accepted"], playerDistanceAtEnd=[round(d, 3) for d in apart],
+                           commandsAccepted=drive["accepted"], playerDistanceAtEnd=[round(d, 3) for d in apart],
                            allStatesMatchFloat32=True, slotsRestored=True)
-        except (RuntimeError, KeyError, IndexError, TypeError) as error:
+            if args.loop:
+                # From the key going down in the client's window to the client's player moving: on the host, then on the client's screen.
+                pressed = pressed_ms[script_keys[0][1]]
+                def reaction(records):
+                    return min(r["observedMs"] for r in records if r["observedMs"] >= pressed and abs(world.players(r)[1]["body"][2]) > 0.01) - pressed
+                summary.update(keysPressedOnHost=0, capturedSamples=capture[0]["samples"], capturedActiveSamples=capture[0]["activeSamples"],
+                               localAnswersWithheld=capture[0]["withheld"], keyToHostPlayerMovesMs=reaction(host_frames.values()),
+                               keyToClientSeesItMs=reaction(applied))
+        except (RuntimeError, KeyError, IndexError, TypeError, ValueError) as error:
             failures.append(str(error))
     with (output / f"coop-{stamp}.sent.jsonl").open("x", encoding="utf-8") as file:
         for frame in transmitted:
@@ -265,6 +309,9 @@ if __name__ == "__main__":
     parser.add_argument("--source-pid", type=int)
     parser.add_argument("--replica-pid", type=int)
     parser.add_argument("--controller", type=int, default=1, help="free controller index that joins as the second player")
+    parser.add_argument("--loop", action="store_true",
+                        help="closed loop: keys go to the game of --replica-pid (the client, focused) and drive the second player of "
+                             "--source-pid (the host, which must keep running without focus)")
     parser.add_argument("--check", action="store_true", help="only report whether both games share the run seed and room")
     parser.add_argument("--restart-runs", action="store_true", help="first hold R in both games to restart their seeded runs")
     parser.add_argument("--binary-directory", type=Path)

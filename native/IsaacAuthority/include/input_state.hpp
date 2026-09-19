@@ -39,4 +39,12 @@ private:
     std::uint32_t sequence_ = 0;
 };
 bool Fresh(const Command& command, std::uint64_t now);
+// The client side. What the local device answers for the actions of play becomes one command; menu buttons and the
+// co-op join stay local, so a client's Enter key never confirms anything in the host's game.
+constexpr int kCaptured[] = {Left, Right, Up, Down, ShootLeft, ShootRight, ShootUp, ShootDown, Bomb, Item, PillCard, Drop};
+bool Captured(int action);
+struct Sample { float value[kActions] = {}; };
+// Axes and buttons only; the caller names the session, sequence, time and controller.
+Command Compose(const Sample& sample);
+bool Neutral(const Command& command);
 }

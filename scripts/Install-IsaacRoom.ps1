@@ -10,8 +10,9 @@ $bin = Join-Path $root 'Binaries\authority-build\Release'
 # Npc: the same adapter built with enemy correction; installed beside the verified Room package, not over it.
 $component = 'IsaacAuthority' + $Stage
 # Input: the host-side module that lets received client commands drive one controller of the host's game.
-# Coop: the world adapter for every player of a co-op run, with the input module that creates and drives the second one.
-$release = @{Room=@('0.5.0-experimental','standard-tears-rooms');Npc=@('0.6.0-experimental','standard-tears-rooms-enemies');Input=@('0.7.0-experimental','client-input-on-host');Coop=@('0.8.0-experimental','standard-tears-rooms-enemies-players')}[$Stage]
+# Coop: the world adapter for every player of a co-op run, the input module that creates and drives the second one on the
+# host, and its client side that captures the client's keyboard: together the closed loop.
+$release = @{Room=@('0.5.0-experimental','standard-tears-rooms');Npc=@('0.6.0-experimental','standard-tears-rooms-enemies');Input=@('0.7.0-experimental','client-input-on-host');Coop=@('0.9.0-experimental','standard-tears-rooms-enemies-players-closed-loop')}[$Stage]
 $target = Join-Path (Split-Path -Parent $GameExecutable) (Join-Path 'IsaacAuthority' $Stage)
 $manifestPath = Join-Path $target 'installation.json'
 if (Test-Path -LiteralPath $target) {
@@ -19,7 +20,7 @@ if (Test-Path -LiteralPath $target) {
     if ((Get-Content -Raw -Encoding UTF8 -LiteralPath $manifestPath | ConvertFrom-Json).component -ne $component) { throw 'Different component owns destination.' }
 }
 $modules = if ($Stage -eq 'Input') { [ordered]@{host=$component} } else { [ordered]@{source=($component + 'Source');replica=($component + 'Replica')} }
-if ($Stage -eq 'Coop') { $modules['host'] = 'IsaacAuthorityInput' }
+if ($Stage -eq 'Coop') { $modules['host'] = 'IsaacAuthorityInput'; $modules['client'] = 'IsaacAuthorityInputClient' }
 # The injector refuses a file name that a game already loaded from another folder, and the Input package installs the
 # same input module: this package's copy carries the package's name.
 $installedBase = [ordered]@{}
@@ -50,13 +51,14 @@ foreach ($stale in @(@($modules.Values) + @($installedBase.Values) | Select-Obje
     try { Remove-Item -LiteralPath $stale.FullName -Force -ErrorAction Stop } catch { Write-Verbose "Still loaded by a running game: $($stale.Name)" }
 }
 # World modules and the input module answer to different contracts.
-$world = @($installed.Keys | Where-Object { $_ -ne 'host' } | ForEach-Object { Join-Path $target $installed[$_] })
+$world = @($installed.Keys | Where-Object { $_ -notin 'host','client' } | ForEach-Object { Join-Path $target $installed[$_] })
 if ($world.Count) {
     & (Join-Path $bin 'world_tests.exe') $world
     if ($LASTEXITCODE -ne 0) { throw 'Installed world module contract failed.' }
 }
-if ($installed.Contains('host')) {
-    & (Join-Path $bin 'input_tests.exe') (Join-Path $target $installed['host'])
+$inputs = @($installed.Keys | Where-Object { $_ -in 'host','client' } | ForEach-Object { Join-Path $target $installed[$_] })
+if ($inputs.Count) {
+    & (Join-Path $bin 'input_tests.exe') $inputs
     if ($LASTEXITCODE -ne 0) { throw 'Installed input module contract failed.' }
 }
 if ((Get-FileHash -LiteralPath $GameExecutable -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Game executable changed.' }
@@ -65,7 +67,7 @@ $verified = @()
 foreach ($path in @($VerifiedSummary | Where-Object { $_ })) {
     $summary = Get-Content -Raw -Encoding UTF8 -LiteralPath $path | ConvertFrom-Json
     if (-not $summary.passed -or $summary.failures.Count) { throw "Not a passed live test: $path" }
-    $verified += [ordered]@{summary=(Split-Path -Leaf $path);sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant();route=$summary.route;utc=$summary.utc}
+    $verified += [ordered]@{summary=(Split-Path -Leaf $path);sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant();route=$summary.route;mode=$summary.mode;utc=$summary.utc}
 }
 $manifest = [ordered]@{component=$component;version=$release[0];scope=$release[1];installedUtc=[DateTime]::UtcNow.ToString('o');gameSha256=$expected;autoStart=$false;liveTestVerified=($verified.Count -gt 0);liveTests=$verified;modules=$installed;files=$entries}
 [IO.File]::WriteAllText($manifestPath,($manifest|ConvertTo-Json -Depth 6),[Text.UTF8Encoding]::new($false))

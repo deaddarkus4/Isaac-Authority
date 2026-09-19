@@ -1,20 +1,29 @@
 // Host side of client input: commands received over loopback UDP replace what the game reads from one controller,
 // so the host's own movement and firing code simulates that player. No game code is patched: one slot of the
 // input manager's vtable is exchanged, like the entity update slots of the other adapters.
+// Client side (ISAAC_INPUT_CLIENT), the same slot read the other way: the module asks the client's own device what it
+// answers for the actions of play, publishes that as a command for the host, and withholds it from the local game.
 #include <winsock2.h>
 #include <windows.h>
 #include "input_state.hpp"
 #include "profile.hpp"
 #include "vtable_slot.hpp"
 #include <bcrypt.h>
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
 #include <filesystem>
 #include <sstream>
 
 namespace {
 using namespace authority;
 using namespace authority::input;
+#ifdef ISAAC_INPUT_CLIENT
+constexpr bool kClient = true;
+#else
+constexpr bool kClient = false;
+#endif
 // InputManager at RVA 0x857b18; slot 29 is WithDevice(controller, reader, in, out, deviceId), thiscall, ret 0x14.
 // Readers: action value (float to out, returns value != 0), action pressed, action triggered (both return bool).
 constexpr std::uintptr_t kManager = 0x857b18, kManagerTable = 0x782950, kWithDevice = 0x620fb0;
@@ -45,13 +54,65 @@ HANDLE worker = nullptr, report = INVALID_HANDLE_VALUE;
 bool winsock = false;
 unsigned short port = 0;
 struct Guard { Guard() { AcquireSRWLockExclusive(&lifecycle); } ~Guard() { ReleaseSRWLockExclusive(&lifecycle); } };
+// The client's latest command, read from outside like the world slot: an odd generation means "being written".
+struct alignas(8) PublishedCommand {
+    std::uint32_t magic = 0x31534e49, version = 1;
+    volatile LONG generation = 0;
+    std::uint32_t alive = 0, bytes = 0, reserved = 0;
+    std::uint64_t session = 0;
+    std::array<std::uint8_t, kBytes> packet{};
+};
+static_assert(sizeof(PublishedCommand) == 88 && offsetof(PublishedCommand, packet) == 32);
+PublishedCommand published;
+// The keyboard is controller 0. Sampling a little faster than the game's 60 Hz input never skips a frame of it.
+constexpr int kLocalController = 0;
+constexpr std::uint64_t kSampleMs = 8;
+std::atomic<DWORD> owner{0};
+std::uint64_t lastSampleMs = 0;
+std::uint32_t captureSequence = 0;
+std::atomic<unsigned> samples{0}, activeSamples{0}, withheld{0};
+
+// Ask the client's own device, on the game's thread and through the game's own reader, what it answers right now.
+void Capture(void* self) {
+    const auto now = GetTickCount64();
+    if (now - lastSampleMs < kSampleMs) return;
+    lastSampleMs = now;
+    Sample sample;
+    for (const auto action : kCaptured) {
+        int asked = action; float value = 0;
+        if (original(self, kLocalController, reinterpret_cast<void*>(base + kReadValue), &asked, &value, nullptr)) sample.value[action] = value;
+    }
+    auto command = Compose(sample);
+    command.session = session; command.sequence = ++captureSequence; command.timeMs = now; command.controller = kLocalController;
+    std::uint8_t bytes[kBytes];
+    if (!Encode(command, bytes)) { ++errors; return; }
+    InterlockedIncrement(&published.generation);
+    std::copy(bytes, bytes + kBytes, published.packet.begin()); published.bytes = kBytes; published.alive = 1;
+    InterlockedIncrement(&published.generation);
+    ++samples;
+    if (!Neutral(command)) ++activeSamples;
+}
+void InvalidatePublication() { InterlockedIncrement(&published.generation); published.alive = 0; InterlockedIncrement(&published.generation); }
 
 int __fastcall OnInput(void* self, void*, int controller, void* reader, void* in, void* out, int* device) {
     active.fetch_add(1);
     int result = 0; bool injected = false;
     const auto kind = reinterpret_cast<std::uintptr_t>(reader);
-    if (running.load(std::memory_order_acquire) && in &&
-        (kind == base + kReadValue || kind == base + kReadPressed || kind == base + kReadTriggered)) {
+    const bool known = in && (kind == base + kReadValue || kind == base + kReadPressed || kind == base + kReadTriggered);
+    if (kClient) {
+        if (running.load(std::memory_order_acquire) && GetTickCount64() <= deadline) {
+            DWORD nobody = 0; owner.compare_exchange_strong(nobody, GetCurrentThreadId());
+            if (owner.load() == GetCurrentThreadId()) {
+                Capture(self);
+                // This keyboard plays on the host. Its answers for the actions of play are withheld here, so it cannot
+                // steer a local player as well; menus, pause and restart stay local.
+                if (known && controller == kLocalController && Captured(*static_cast<const int*>(in))) {
+                    if (kind == base + kReadValue && out) *static_cast<float*>(out) = 0;
+                    injected = true; ++withheld;
+                }
+            }
+        }
+    } else if (running.load(std::memory_order_acquire) && known) {
         const int asked = *static_cast<const int*>(in), reads = kind == base + kReadValue ? 0 : kind == base + kReadPressed ? 1 : 2;
         if (controller >= -1 && controller < kControllers - 1 && asked >= 0 && asked < kPolledActions) ++polls[controller + 1][reads][asked];
         AcquireSRWLockExclusive(&state);
@@ -150,33 +211,43 @@ extern "C" DWORD WINAPI IsaacAuthorityInputStart(void*) noexcept {
         LARGE_INTEGER frequency{}; QueryPerformanceFrequency(&frequency); ticksPerFrame = frequency.QuadPart * 12 / 1000;
         values = presses = triggers = passedThrough = accepted = rejected = errors = 0;
         for (auto& controller : polls) for (auto& reader : controller) for (auto& count : reader) count = 0;
-        WSADATA data{}; const auto started = WSAStartup(MAKEWORD(2, 2), &data);
-        if (started) return static_cast<DWORD>(started);
-        winsock = true; udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-        sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        u_long nonblocking = 1; int size = sizeof(address);
-        if (udp == INVALID_SOCKET || bind(udp, reinterpret_cast<sockaddr*>(&address), sizeof(address)) ||
-            ioctlsocket(udp, FIONBIO, &nonblocking) || getsockname(udp, reinterpret_cast<sockaddr*>(&address), &size)) {
-            failure = static_cast<DWORD>(WSAGetLastError()); throw std::runtime_error("Cannot open input socket");
+        samples = activeSamples = withheld = 0; owner = 0; lastSampleMs = 0; captureSequence = 0; port = 0;
+        published = PublishedCommand{}; published.session = session;
+        // The client opens no socket: its command is published in a slot and carried to the host from outside.
+        if (!kClient) {
+            WSADATA data{}; const auto started = WSAStartup(MAKEWORD(2, 2), &data);
+            if (started) return static_cast<DWORD>(started);
+            winsock = true; udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            u_long nonblocking = 1; int size = sizeof(address);
+            if (udp == INVALID_SOCKET || bind(udp, reinterpret_cast<sockaddr*>(&address), sizeof(address)) ||
+                ioctlsocket(udp, FIONBIO, &nonblocking) || getsockname(udp, reinterpret_cast<sockaddr*>(&address), &size)) {
+                failure = static_cast<DWORD>(WSAGetLastError()); throw std::runtime_error("Cannot open input socket");
+            }
+            port = ntohs(address.sin_port);
         }
-        port = ntohs(address.sin_port); deadline = GetTickCount64() + kDurationMs;
+        deadline = GetTickCount64() + kDurationMs;
         wchar_t local[32768]{}; const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", local, 32768);
         if (!n || n >= 32768) throw std::runtime_error("LOCALAPPDATA unavailable");
         const auto directory = std::filesystem::path(local) / L"IsaacAuthority"; std::filesystem::create_directories(directory / L"logs");
-        const auto unique = L"input-host-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(session);
+        const std::wstring role = kClient ? L"input-client-" : L"input-host-";
+        const auto unique = role + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(session);
         report = CreateFileW((directory / L"logs" / (unique + L".jsonl")).c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (report == INVALID_HANDLE_VALUE) throw std::runtime_error("Cannot create input log");
         running.store(true, std::memory_order_release);
-        worker = CreateThread(nullptr, 0, &Receive, nullptr, 0, nullptr);
-        if (!worker) { failure = GetLastError(); throw std::runtime_error("Cannot start input receiver"); }
+        if (!kClient) {
+            worker = CreateThread(nullptr, 0, &Receive, nullptr, 0, nullptr);
+            if (!worker) { failure = GetLastError(); throw std::runtime_error("Cannot start input receiver"); }
+        }
         failure = ExchangeSlot(slot, reinterpret_cast<void*>(original), reinterpret_cast<void*>(&OnInput));
         installed = *slot == reinterpret_cast<void*>(&OnInput);
         if (failure) throw std::runtime_error("Cannot hook input manager");
         std::ostringstream descriptor;
-        descriptor << "{\"pid\":" << GetCurrentProcessId() << ",\"role\":\"input-host\",\"session\":\"" << session
-            << "\",\"deadlineMs\":" << deadline << ",\"port\":" << port << "}\n";
+        descriptor << "{\"pid\":" << GetCurrentProcessId() << ",\"role\":\"" << (kClient ? "input-client" : "input-host") << "\",\"session\":\"" << session
+            << "\",\"deadlineMs\":" << deadline << ",\"port\":" << port << ",\"address\":" << reinterpret_cast<std::uintptr_t>(&published)
+            << ",\"bytes\":" << sizeof(published) << "}\n";
         const auto temp = directory / (unique + L".tmp");
-        const auto ready = directory / (L"input-host-" + std::to_wstring(GetCurrentProcessId()) + L".json");
+        const auto ready = directory / (role + std::to_wstring(GetCurrentProcessId()) + L".json");
         failure = ERROR_WRITE_FAULT;
         if (!WriteText(temp, descriptor.str()) || !MoveFileExW(temp.c_str(), ready.c_str(), MOVEFILE_REPLACE_EXISTING)) throw std::runtime_error("Cannot publish input endpoint");
         return ERROR_SUCCESS;
@@ -191,8 +262,11 @@ extern "C" DWORD WINAPI IsaacAuthorityInputStop(void*) noexcept {
     if (report == INVALID_HANDLE_VALUE) return ERROR_NOT_READY;
     running = false; CloseNetwork();
     if (!Restore()) return ERROR_BUSY;
+    InvalidatePublication();
     std::ostringstream out;
-    out << "{\"type\":\"stop\",\"role\":\"input-host\",\"accepted\":" << accepted.load() << ",\"rejected\":" << rejected.load()
+    out << "{\"type\":\"stop\",\"role\":\"" << (kClient ? "input-client" : "input-host") << "\",\"samples\":" << samples.load()
+        << ",\"activeSamples\":" << activeSamples.load() << ",\"withheld\":" << withheld.load()
+        << ",\"accepted\":" << accepted.load() << ",\"rejected\":" << rejected.load()
         << ",\"networkErrors\":" << errors.load() << ",\"valueReads\":" << values.load() << ",\"pressedReads\":" << presses.load()
         << ",\"triggeredReads\":" << triggers.load() << ",\"passedThrough\":" << passedThrough.load()
         << ",\"controller\":" << latest.controller << ",\"lastSequence\":" << latest.sequence << ",\"polls\":[";

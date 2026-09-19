@@ -19,6 +19,49 @@ def encode(session, sequence, time_ms, controller=0, move=(0.0, 0.0), shoot=(0.0
     return COMMAND.pack(0x31504E49, 1, int(session), sequence, controller, time_ms, *axes, mask, 0)
 
 
+SLOT = struct.Struct("<6IQ")
+SLOT_BYTES = SLOT.size + COMMAND.size
+
+
+def read_slot(read, descriptor, now):
+    """The client module's latest captured command, or None while it is being written, absent or stale."""
+    address = descriptor["address"]
+    if descriptor.get("bytes") != SLOT_BYTES:
+        raise ValueError("Command slot size is not one this reader knows")
+    first = struct.unpack("<I", read(address + 8, 4))[0]
+    if first & 1:
+        return None
+    blob = read(address, SLOT_BYTES)
+    last = struct.unpack("<I", read(address + 8, 4))[0]
+    magic, version, generation, alive, count, reserved, session = SLOT.unpack_from(blob)
+    if first != last or generation != last:
+        return None
+    if magic != 0x31534E49 or version != 1 or session != int(descriptor["session"]) or reserved:
+        raise ValueError("Command slot attachment mismatch")
+    if not alive:
+        return None
+    if count != COMMAND.size:
+        raise ValueError("Command slot payload size is invalid")
+    packet = blob[SLOT.size:]
+    command = decode(packet)
+    if command["session"] != session:
+        raise ValueError("Command slot session mismatch")
+    if command["timeMs"] > now or now - command["timeMs"] > 250:
+        return None
+    return command, packet
+
+
+def route(packet, session, controller):
+    """What the transport does to a client's command: the host's session, and the controller the host gave that client.
+    The client does not choose whose player it drives."""
+    if not 0 < int(session) < 2**64 or not 0 <= controller <= 7:
+        raise ValueError("Invalid route")
+    routed = bytearray(packet)
+    struct.pack_into("<Q", routed, 8, int(session)); struct.pack_into("<i", routed, 20, controller)
+    decode(bytes(routed))
+    return bytes(routed)
+
+
 def decode(packet):
     if len(packet) != COMMAND.size:
         raise ValueError("Wrong command size")
