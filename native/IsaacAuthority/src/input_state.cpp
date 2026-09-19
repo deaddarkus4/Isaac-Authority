@@ -74,6 +74,51 @@ Command Compose(const Sample& s) {
     return c;
 }
 bool Neutral(const Command& c) { return c.moveX == 0 && c.moveY == 0 && c.shootX == 0 && c.shootY == 0 && !c.buttons; }
+void Playout::Reset(std::uint64_t session) { *this = Playout{}; session_ = session; }
+void Playout::Drop(std::uint32_t sequence) {
+    auto& present = present_[sequence % kPlayoutWindow];
+    if (present && slots_[sequence % kPlayoutWindow].sequence == sequence) { present = false; --buffered_; }
+}
+void Playout::Stop() {
+    for (auto& present : present_) present = false;
+    buffered_ = 0; running_ = false; silent_ = 0;
+}
+bool Playout::Receive(const Command& c, std::uint64_t now) {
+    if (!Valid(c) || !Fresh(c, now) || c.session != session_) return false;
+    if (!running_ && !buffered_) next_ = newest_ = c.sequence; // the first command of a run
+    if (c.sequence < next_) {
+        // Its step has been played already; before the run starts an older command only moves the start back.
+        if (running_ || newest_ - c.sequence >= kPlayoutWindow) { ++late; return false; }
+        next_ = c.sequence;
+    }
+    if (c.sequence - next_ >= kPlayoutWindow) { Stop(); next_ = newest_ = c.sequence; } // far ahead: the rest is history
+    auto& slot = slots_[c.sequence % kPlayoutWindow]; auto& present = present_[c.sequence % kPlayoutWindow];
+    if (present && slot.sequence == c.sequence) return false;
+    if (!present) ++buffered_;
+    slot = c; present = true;
+    if (c.sequence > newest_) newest_ = c.sequence;
+    return true;
+}
+bool Playout::Step(Command& out) {
+    if (!running_) {
+        if (buffered_ < kPlayoutTarget) return false;
+        running_ = true; silent_ = 0; ++starts;
+    }
+    // Far behind the newest arrival: nobody waits for the steps in between.
+    if (newest_ > next_ && newest_ - next_ > kPlayoutTarget + kPlayoutSlack) {
+        for (const auto to = newest_ - kPlayoutTarget; next_ < to; ++next_) { Drop(next_); ++skipped; }
+    }
+    const auto at = next_ % kPlayoutWindow;
+    if (present_[at] && slots_[at].sequence == next_) { last_ = slots_[at]; silent_ = 0; }
+    else if (newest_ > next_) ++substituted; // lost or late, the client is alive: the player keeps doing what it did
+    else {
+        ++starved;
+        if (++silent_ > kPlayoutSilence) { Stop(); return false; } // a silent client is a neutral client
+    }
+    Drop(next_);
+    last_.sequence = next_; played_ = next_++; out = last_;
+    return true;
+}
 bool Gate::Receive(const Command& c, std::uint64_t now) {
     if (!Valid(c) || !Fresh(c, now) || c.session != session_ || c.sequence <= sequence_) return false;
     sequence_ = c.sequence; return true;

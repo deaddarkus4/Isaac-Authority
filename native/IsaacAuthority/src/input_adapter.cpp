@@ -32,6 +32,14 @@ constexpr bool kPredict = true;
 constexpr bool kPredict = false;
 #endif
 constexpr int kOwnController = 1;
+// Stepped: commands and steps of the driven player are one to one. The game reads the value of every axis action exactly
+// once per update of a player, so the read of "left" marks the step: there the host plays the next command of its playout
+// buffer, and there a predicting client captures the command of that step.
+#ifdef ISAAC_INPUT_STEPPED
+constexpr bool kStepped = true;
+#else
+constexpr bool kStepped = false;
+#endif
 // InputManager at RVA 0x857b18; slot 29 is WithDevice(controller, reader, in, out, deviceId), thiscall, ret 0x14.
 // Readers: action value (float to out, returns value != 0), action pressed, action triggered (both return bool).
 constexpr std::uintptr_t kManager = 0x857b18, kManagerTable = 0x782950, kWithDevice = 0x620fb0;
@@ -83,14 +91,37 @@ std::atomic<unsigned> samples{0}, activeSamples{0}, withheld{0};
 // on the host to acknowledge it in the snapshot, on a predicting client to label its own history.
 std::atomic<std::int32_t> consumedController{0};
 std::atomic<std::uint32_t> consumedSequence{0};
+// Stepped host: the playout buffer owns `latest` while the driven player is being stepped. A controller without a
+// player (a client that is still joining) is never stepped and keeps reading the newest command. Guarded by state.
+Playout playout;
+std::int32_t drivenController = -1; // whose commands arrive
+std::uint64_t steppedAtMs = 0;
+constexpr std::uint64_t kSteppingMs = 250;
 
 // Answer for the driven controller from the latest command. A silent client is a neutral client: without a fresh
 // command nothing is injected and the caller decides.
+// The command the game reads from now on; a button that goes down opens its "just pressed" edge. State lock held.
+void Adopt(const Command& next) {
+    for (int action = 0; action < kActions; ++action)
+        if (Known(action) && Pressed(next, action) && !(have && Pressed(latest, action))) pendingEdge[action] = true;
+    latest = next; have = true;
+}
 bool Inject(int controller, std::uintptr_t kind, const void* in, void* out, int& result) {
     bool injected = false;
     AcquireSRWLockExclusive(&state);
+    const int action = *static_cast<const int*>(in);
+    if (kStepped) {
+        if (!kClient) {
+            // A player reads this controller's movement, so it is stepped and never reads the newest command directly:
+            // play the next command of the buffer, exactly one per step. With nothing to play, because the buffer is
+            // still filling or the client went silent, the player is nobody's for this step.
+            if (controller == drivenController && kind == base + kReadValue && action == Left) {
+                Command played; steppedAtMs = GetTickCount64();
+                if (playout.Step(played)) { played.timeMs = steppedAtMs; Adopt(played); } else have = false;
+            }
+        }
+    }
     if (have && controller == latest.controller && Fresh(latest, GetTickCount64())) {
-        const int action = *static_cast<const int*>(in);
         if (Known(action)) {
             injected = true;
             if (kind == base + kReadValue) {
@@ -112,9 +143,10 @@ bool Inject(int controller, std::uintptr_t kind, const void* in, void* out, int&
 }
 
 // Ask the client's own device, on the game's thread and through the game's own reader, what it answers right now.
-void Capture(void* self) {
+// On a timer for a plain client; for a stepped one, once per step of its own player, whenever that step comes.
+void Capture(void* self, bool step) {
     const auto now = GetTickCount64();
-    if (now - lastSampleMs < kSampleMs) return;
+    if (!step && now - lastSampleMs < kSampleMs) return;
     lastSampleMs = now;
     Sample sample;
     for (const auto action : kCaptured) {
@@ -149,7 +181,14 @@ int __fastcall OnInput(void* self, void*, int controller, void* reader, void* in
         if (running.load(std::memory_order_acquire) && GetTickCount64() <= deadline) {
             DWORD nobody = 0; owner.compare_exchange_strong(nobody, GetCurrentThreadId());
             if (owner.load() == GetCurrentThreadId()) {
-                Capture(self);
+                if (kStepped) {
+                    // One command per step of the own player, captured where its game reads that step's movement. With
+                    // no own player stepping, a held one for instance, this is a plain client on a timer.
+                    const auto now = GetTickCount64();
+                    const bool step = known && controller == kOwnController && kind == base + kReadValue && *static_cast<const int*>(in) == Left;
+                    if (step) { Capture(self, true); steppedAtMs = now; }
+                    else if (now - steppedAtMs > kSteppingMs) Capture(self, false);
+                } else Capture(self, false);
                 // This keyboard plays on the host. Its answers for the actions of play are withheld here, so it cannot
                 // steer a local player as well; menus, pause and restart stay local.
                 if (known && controller == kLocalController && Captured(*static_cast<const int*>(in))) {
@@ -190,13 +229,22 @@ DWORD WINAPI Receive(void*) {
             }
             Command command;
             if (from.sin_family != AF_INET || from.sin_addr.s_addr != htonl(INADDR_LOOPBACK) ||
-                !Decode(bytes, static_cast<std::size_t>(n), command) || !gate.Receive(command, GetTickCount64())) { ++rejected; continue; }
+                !Decode(bytes, static_cast<std::size_t>(n), command)) { ++rejected; continue; }
+            const auto now = GetTickCount64(); bool taken = false;
             AcquireSRWLockExclusive(&state);
-            for (int action = 0; action < kActions; ++action)
-                if (Known(action) && Pressed(command, action) && !(have && Pressed(latest, action))) pendingEdge[action] = true;
-            latest = command; have = true;
+            if (kStepped) {
+                taken = playout.Receive(command, now);
+                if (taken) drivenController = command.controller;
+                // A controller nobody steps, a joining client without a player yet, keeps reading the newest command.
+                const bool direct = now - steppedAtMs > kSteppingMs && command.session == session && Fresh(command, now) &&
+                    (!have || command.sequence > latest.sequence);
+                if (direct) { Adopt(command); taken = true; }
+            } else {
+                taken = gate.Receive(command, now);
+                if (taken) Adopt(command);
+            }
             ReleaseSRWLockExclusive(&state);
-            ++accepted;
+            if (taken) ++accepted; else ++rejected;
         }
         Sleep(1);
     }
@@ -248,7 +296,7 @@ extern "C" DWORD WINAPI IsaacAuthorityInputStart(void*) noexcept {
         values = presses = triggers = passedThrough = accepted = rejected = errors = 0;
         for (auto& controller : polls) for (auto& reader : controller) for (auto& count : reader) count = 0;
         samples = activeSamples = withheld = 0; owner = 0; lastSampleMs = 0; captureSequence = 0; port = 0;
-        consumedController = 0; consumedSequence = 0;
+        consumedController = 0; consumedSequence = 0; playout.Reset(session); steppedAtMs = 0; drivenController = -1;
         published = PublishedCommand{}; published.session = session;
         // The client opens no socket: its command is published in a slot and carried to the host from outside.
         if (!kClient) {
@@ -304,6 +352,8 @@ extern "C" DWORD WINAPI IsaacAuthorityInputStop(void*) noexcept {
     out << "{\"type\":\"stop\",\"role\":\"" << (kClient ? "input-client" : "input-host") << "\",\"samples\":" << samples.load()
         << ",\"activeSamples\":" << activeSamples.load() << ",\"withheld\":" << withheld.load()
         << ",\"predicts\":" << (kPredict ? "true" : "false") << ",\"consumedSequence\":" << consumedSequence.load()
+        << ",\"stepped\":" << (kStepped ? "true" : "false") << ",\"playoutStarts\":" << playout.starts << ",\"playoutSubstituted\":" << playout.substituted
+        << ",\"playoutStarved\":" << playout.starved << ",\"playoutSkipped\":" << playout.skipped << ",\"playoutLate\":" << playout.late
         << ",\"accepted\":" << accepted.load() << ",\"rejected\":" << rejected.load()
         << ",\"networkErrors\":" << errors.load() << ",\"valueReads\":" << values.load() << ",\"pressedReads\":" << presses.load()
         << ",\"triggeredReads\":" << triggers.load() << ",\"passedThrough\":" << passedThrough.load()

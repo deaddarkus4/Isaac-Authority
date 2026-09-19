@@ -12,7 +12,7 @@ $component = 'IsaacAuthority' + $Stage
 # Input: the host-side module that lets received client commands drive one controller of the host's game.
 # Coop: the world adapter for every player of a co-op run, the input module that creates and drives the second one on the
 # host, and its client side that captures the client's keyboard: together the closed loop.
-$release = @{Room=@('0.5.0-experimental','standard-tears-rooms');Npc=@('0.6.0-experimental','standard-tears-rooms-enemies');Input=@('0.7.0-experimental','client-input-on-host');Coop=@('0.10.0-experimental','standard-tears-rooms-enemies-players-closed-loop-prediction')}[$Stage]
+$release = @{Room=@('0.5.0-experimental','standard-tears-rooms');Npc=@('0.6.0-experimental','standard-tears-rooms-enemies');Input=@('0.7.0-experimental','client-input-on-host');Coop=@('0.11.0-experimental','standard-tears-rooms-enemies-players-closed-loop-prediction-stepped-input')}[$Stage]
 $target = Join-Path (Split-Path -Parent $GameExecutable) (Join-Path 'IsaacAuthority' $Stage)
 $manifestPath = Join-Path $target 'installation.json'
 if (Test-Path -LiteralPath $target) {
@@ -26,8 +26,10 @@ if ($Stage -eq 'Coop') {
     # client input module that walks that player with the command it sends.
     $modules['predictSource'] = 'IsaacAuthorityPredictSource'; $modules['predictReplica'] = 'IsaacAuthorityPredictReplica'
     $modules['predictClient'] = 'IsaacAuthorityInputPredict'
+    # Stepped input: one command per step of the client's player, played out of a small buffer on the host.
+    $modules['steppedHost'] = 'IsaacAuthorityInputSteppedHost'; $modules['steppedClient'] = 'IsaacAuthorityInputSteppedClient'
 }
-$inputRoles = 'host','client','predictClient'
+$inputRoles = 'host','client','predictClient','steppedHost','steppedClient'
 # The injector refuses a file name that a game already loaded from another folder, and the Input package installs the
 # same input module: this package's copy carries the package's name.
 $installedBase = [ordered]@{}
@@ -35,7 +37,7 @@ foreach ($role in $modules.Keys) { $installedBase[$role] = if ($modules[$role].S
 $files = @($modules.Values | ForEach-Object { Join-Path $bin ($_ + '.dll') })
 $files += Join-Path $bin 'IsaacAuthorityAttach.exe'
 if ($modules.Contains('host')) { $files += @('Test-IsaacInput.py','isaac_input.py' | ForEach-Object { Join-Path $PSScriptRoot $_ }) }
-if ($Stage -eq 'Coop') { $files += Join-Path $PSScriptRoot 'Test-IsaacCoop.py' }
+if ($Stage -eq 'Coop') { $files += @('Test-IsaacCoop.py','isaac_link.py' | ForEach-Object { Join-Path $PSScriptRoot $_ }) }
 $files += @('Test-IsaacRoom.py','isaac_level.py','Test-IsaacWorld.py','isaac_world.py','Test-IsaacGamePair.py','Read-IsaacState.py' | ForEach-Object { Join-Path $PSScriptRoot $_ })
 foreach ($file in $files) { if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing file: $file" } }
 New-Item -ItemType Directory -Path $target -Force | Out-Null

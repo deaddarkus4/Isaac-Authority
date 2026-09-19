@@ -64,6 +64,14 @@
     "publishedSlot": "88 bytes: magic 0x31534e49, version, generation (odd while written), alive, bytes, reserved, session u64, INP1 packet",
     "transport": "outside the module: the relay sets the host's session and the controller the host assigned to this client"
   },
+  "steppedInput": {
+    "stepBoundary": "the game reads the value of every axis action (0-7) exactly once per update of a player: 461 reads per action over 458 updates; the value read of action 0 (left) marks the step",
+    "host": "IsaacAuthorityInputSteppedHost (ISAAC_INPUT_STEPPED): input::Playout hands out exactly one command per step, in sequence order, four steps behind the newest arrival; a missing command is played as a repeat and its step still counts; fifteen starved steps make the player nobody's; a controller without a player is never stepped and reads the newest command",
+    "client": "IsaacAuthorityInputSteppedClient (ISAAC_INPUT_PREDICT + ISAAC_INPUT_STEPPED): one command captured per step of the own player, on that step's movement read",
+    "why": "reading the newest command made the host spend several steps on one command and then jump over several; reconciliation by acknowledged command then corrected errors that were not there",
+    "liveOnImpairedPath": "100 ms delay, 80 ms jitter, 15 % loss each way: network shifts 0 instead of 10, error after the same command at most 8.75 instead of 20.6, all delivered commands usable instead of 63 %",
+    "report": "docs/j460-impaired-network-test.md"
+  },
   "coopJoinHandlerRva": "0x5bac40",
   "coopJoin": {
     "joinAction": 19,

@@ -61,6 +61,42 @@ void Capture() {
     std::uint8_t bytes[kBytes]{}; s = {}; s.value[Left] = 1; c = Compose(s); c.session = 5; c.sequence = 9; c.timeMs = 1000; Command out;
     Check(Encode(c, bytes) && Decode(bytes, kBytes, out) && out.moveX == -1 && out.controller == 0, "a captured command travels as INP1");
 }
+// A command that says "walk right at (n mod 100)/100": the value shows which command a step really played.
+Command Numbered(std::uint32_t n) { Command c; c.session = 77; c.sequence = n; c.timeMs = 1000; c.controller = 1; c.moveX = (n % 100) / 100.0f; return c; }
+void Steps() {
+    Playout p; p.Reset(77); Command out;
+    Check(!p.Step(out) && !p.Running(), "nothing to play before any command");
+    for (std::uint32_t n = 1; n < kPlayoutTarget; ++n) Check(p.Receive(Numbered(n), 1000) && !p.Step(out), "the run starts only behind a small buffer");
+    Check(p.Receive(Numbered(kPlayoutTarget), 1000) && p.Step(out) && out.sequence == 1 && out.moveX == 0.01f && p.Played() == 1 && p.starts == 1,
+        "then exactly one command per step, from the first");
+    // Arrivals out of order and in a burst are played in order, one per step.
+    for (std::uint32_t n : {7u, 5u, 6u, 8u}) Check(p.Receive(Numbered(n), 1000), "a reordered burst is kept");
+    for (std::uint32_t n = 2; n <= 8; ++n) Check(p.Step(out) && out.sequence == n && out.moveX == n / 100.0f && p.Played() == n, "in sequence order whatever the arrival order");
+    Check(!p.substituted && !p.starved && !p.late, "nothing was missing so far");
+    Check(!p.Receive(Numbered(8), 1000) && p.late == 1, "a command whose step was played is late");
+    // Command 10 is lost: its step repeats command 9 and still counts, so step numbers stay step counts.
+    p.Receive(Numbered(9), 1000); p.Receive(Numbered(11), 1000); p.Receive(Numbered(12), 1000);
+    Check(p.Step(out) && out.sequence == 9, "nine");
+    Check(p.Step(out) && out.sequence == 10 && out.moveX == 0.09f && p.substituted == 1, "a missing command is played as a repeat of the previous one");
+    Check(!p.Receive(Numbered(10), 1000) && p.late == 2, "and its late arrival is dropped");
+    Check(p.Step(out) && out.sequence == 11 && out.moveX == 0.11f && p.Step(out) && out.sequence == 12, "the run goes on");
+    // Nothing newer has arrived: the player keeps doing what it did for a while, then belongs to nobody.
+    for (std::uint32_t n = 13; n < 13 + kPlayoutSilence; ++n) Check(p.Step(out) && out.sequence == n && out.moveX == 0.12f, "a starved step repeats the last command");
+    Check(p.starved == kPlayoutSilence && !p.Step(out) && !p.Running() && p.Played() == 12 + kPlayoutSilence, "a silent client is a neutral client");
+    Check(!p.Step(out), "and stays neutral");
+    for (std::uint32_t n = 100; n < 100 + kPlayoutTarget; ++n) p.Receive(Numbered(n), 1000);
+    Check(p.Step(out) && out.sequence == 100 && p.starts == 2, "commands coming back start a new run where they are");
+    // The host fell far behind the arrivals (a stall): it does not replay history.
+    for (std::uint32_t n = 101; n <= 130; ++n) p.Receive(Numbered(n), 1000);
+    Check(p.Step(out) && out.sequence == 130 - kPlayoutTarget && p.skipped == 130 - kPlayoutTarget - 101, "far behind the newest arrival, the steps in between are skipped");
+    Playout q; q.Reset(77);
+    Check(!q.Receive(Numbered(1), 1300) && !q.Receive(Numbered(0), 1000), "stale and invalid commands never enter");
+    auto foreign = Numbered(1); foreign.session = 78; Check(!q.Receive(foreign, 1000), "foreign session");
+    Check(q.Receive(Numbered(5), 1000) && !q.Receive(Numbered(5), 1000), "a duplicate is not a second command");
+    Check(q.Receive(Numbered(3), 1000) && q.Receive(Numbered(4), 1000) && q.Receive(Numbered(6), 1000) && q.Step(out) && out.sequence == 3,
+        "before the run starts an older command moves the start back");
+    Check(q.Receive(Numbered(1000), 1000) && !q.Running() && !q.Step(out), "a jump far ahead forgets the rest and buffers again");
+}
 void Contract(const wchar_t* path) {
     HMODULE dll = LoadLibraryW(path); Check(dll != nullptr, "load input adapter");
     using Export = DWORD(WINAPI*)(void*);
@@ -73,8 +109,8 @@ void Contract(const wchar_t* path) {
 }
 int wmain(int argc, wchar_t** argv) {
     try {
-        Wire(); Actions(); Freshness(); Capture();
+        Wire(); Actions(); Freshness(); Capture(); Steps();
         for (int i = 1; i < argc; ++i) Contract(argv[i]);
-        std::cout << "PASS input wire, action mapping, freshness, client capture, module contracts\n"; return 0;
+        std::cout << "PASS input wire, action mapping, freshness, client capture, playout, module contracts\n"; return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

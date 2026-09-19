@@ -16,6 +16,7 @@ import struct
 import subprocess
 import time
 import isaac_input as commands
+import isaac_link as link
 import isaac_world as world
 
 
@@ -108,7 +109,8 @@ def run(args):
     binaries = args.binary_directory or (here if (here / "installation.json").is_file() else root / "Binaries/authority-build/Release")
     names = dict(source="IsaacAuthorityCoopSource.dll", replica="IsaacAuthorityCoopReplica.dll", host="IsaacAuthorityInput.dll",
                  client="IsaacAuthorityInputClient.dll", predictSource="IsaacAuthorityPredictSource.dll",
-                 predictReplica="IsaacAuthorityPredictReplica.dll", predictClient="IsaacAuthorityInputPredict.dll")
+                 predictReplica="IsaacAuthorityPredictReplica.dll", predictClient="IsaacAuthorityInputPredict.dll",
+                 steppedHost="IsaacAuthorityInputSteppedHost.dll", steppedClient="IsaacAuthorityInputSteppedClient.dll")
     if (binaries / "installation.json").is_file():
         names.update(json.loads((binaries / "installation.json").read_text(encoding="utf-8")).get("modules", {}))
     attach = binaries / "IsaacAuthorityAttach.exe"
@@ -121,9 +123,15 @@ def run(args):
     stage = "predict" if args.predict else "coop"
     source_dll, replica_dll, client_dll = (binaries / names[role] for role in (
         ("predictSource", "predictReplica", "predictClient") if args.predict else ("source", "replica", "client")))
+    # Stepped: the host plays one command per step out of a buffer and the client captures one per step of its own player.
+    # Joining still goes through the plain host module: a controller without a player is never stepped.
+    drive_dll = binaries / names["steppedHost" if args.stepped else "host"]
+    if args.stepped:
+        client_dll = binaries / names["steppedClient"]
     before = set(logs.glob(stage + "-*.jsonl")) | set(logs.glob("input-*.jsonl"))
     processes, started, failures, transmitted, joined, ends = {}, [], [], [], {}, {}
-    control = None; start_ms = None; sent_commands = 0; pressed_ms = {}
+    control = None; start_ms = None; sent_commands = 0; pressed_ms = {}; network = {}
+    impaired = bool(args.delay_ms or args.jitter_ms or args.loss)
     # The keyboard belongs to the focused game. In the closed loop that is the client; otherwise it is the host.
     keyboard_pid, keyboard_role = (args.replica_pid, "CLIENT") if args.loop else (args.source_pid, "HOST")
     script_keys, expected = (LOOP_KEYS, LOOP_EXPECTED) if args.loop else (KEYS, EXPECTED)
@@ -143,7 +151,7 @@ def run(args):
         control = pair.HostWindow(keyboard_pid)
         rooms.wait_running(processes[keyboard_pid], keyboard_role, control)
         rooms.wait_running(replica if keyboard_pid == args.source_pid else source, "the game without the keyboard")
-        invoke("input", args.source_pid, binaries / names["host"]); started.append(("input-stop", args.source_pid, binaries / names["host"]))
+        invoke("input", args.source_pid, drive_dll); started.append(("input-stop", args.source_pid, drive_dll))
         client = json.loads((directory / f"input-host-{args.source_pid}.json").read_text())
         invoke("world", args.source_pid, source_dll); started.append(("world-stop", args.source_pid, source_dll))
         source_endpoint = json.loads((directory / f"{stage}-source-{args.source_pid}.json").read_text())
@@ -156,7 +164,13 @@ def run(args):
             captured = json.loads((directory / f"input-client-{args.replica_pid}.json").read_text())
         address, client_address = ("127.0.0.1", endpoint["port"]), ("127.0.0.1", client["port"])
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+            # The network between the two games, one impaired path each way. A snapshot counts as transmitted when it
+            # leaves the path, not when the host offers it.
+            uplink = link.Link(lambda packet, _: udp.sendto(packet, client_address), args.delay_ms, args.jitter_ms, args.loss, args.network_seed)
+            downlink = link.Link(lambda packet, frame: (udp.sendto(packet, address), transmitted.append(frame)),
+                                 args.delay_ms, args.jitter_ms, args.loss, args.network_seed + 1)
             start_ms = pair.uptime_ms(); keys = list(script_keys); previous, last_valid, last_command = None, start_ms, 0
+            command_sequence = 0
             while True:
                 now = pair.uptime_ms(); control.require_focus()
                 if now - start_ms >= DURATION:
@@ -170,12 +184,12 @@ def run(args):
                     # The transport, not the client, says which of the host's controllers this client drives.
                     sample = commands.read_slot(replica.read, captured, now)
                     if sample is not None and sample[0]["sequence"] != last_command:
-                        last_command = sample[0]["sequence"]; sent_commands += 1
-                        udp.sendto(commands.route(sample[1], client["session"], args.controller), client_address)
+                        last_command = sample[0]["sequence"]
+                        uplink.send(commands.route(sample[1], client["session"], args.controller), now)
                 elif now - last_command >= 10:
                     _, move, shoot = [row for row in CLIENT if row[0] <= now - start_ms][-1]
-                    sent_commands += 1; last_command = now
-                    udp.sendto(commands.encode(client["session"], sent_commands, now, args.controller, move, shoot), client_address)
+                    command_sequence += 1; last_command = now
+                    uplink.send(commands.encode(client["session"], command_sequence, now, args.controller, move, shoot), now)
                 state = world.read_slot(source.read, source_endpoint, now)
                 if state is not None:
                     frame, data = state; last_valid = now
@@ -183,10 +197,13 @@ def run(args):
                     if key != previous:
                         previous = key
                         packet = bytearray(data); struct.pack_into("<Q", packet, 8, int(endpoint["session"]))
-                        udp.sendto(packet, address); transmitted.append(frame)
+                        downlink.send(bytes(packet), now, frame)
                 elif now - last_valid > 1000:
                     raise RuntimeError("Source stopped publishing world frames")
+                uplink.flush(now); downlink.flush(now)
                 time.sleep(0.005)
+            sent_commands = uplink.delivered
+            network = dict(seed=args.network_seed, clientToHost=uplink.report(), hostToClient=downlink.report())
         # Both games stand still now and the replica is still held: read them from outside before anything is stopped.
         ends = dict(host=team(source), replica=team(replica))
     except BaseException as error:
@@ -224,8 +241,8 @@ def run(args):
             reports[records[0]["role"]] = records
     summary = dict(utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), sourcePid=args.source_pid, replicaPid=args.replica_pid,
                    scope="standard-tears-rooms-enemies-players", realRoomTransition=False, runSeed=report["hostSeed"], room=report["room"],
-                   mode="closed-loop-predicted" if args.predict else "closed-loop" if args.loop else "scripted-client", keyboardIn=keyboard_role,
-                   clientController=args.controller, secondPlayer=joined, commandsSent=sent_commands,
+                   mode="closed-loop-predicted-stepped" if args.stepped else "closed-loop-predicted" if args.predict else "closed-loop" if args.loop else "scripted-client", keyboardIn=keyboard_role,
+                   clientController=args.controller, secondPlayer=joined, commandsSent=sent_commands, impairedNetwork=impaired, network=network,
                    **({} if args.loop else dict(keysPressedForSecondPlayer=0)),
                    transmitted=len(transmitted), reports=copied, failures=failures, passed=False)
     if not failures:
@@ -241,7 +258,7 @@ def run(args):
                 raise RuntimeError("A module did not see two players")
             drive = [f for f in inputs if f["role"] == "input-host"][-1]
             capture = [f for f in inputs if f["role"] == "input-client"]
-            if any(not f["slotRestored"] or f["networkErrors"] for f in inputs) or drive["accepted"] < sent_commands * 0.9:
+            if any(not f["slotRestored"] or f["networkErrors"] for f in inputs) or drive["accepted"] < sent_commands * (0.15 if args.jitter_ms else 0.9):
                 raise RuntimeError("The input module failed or did not receive the client's commands")
             if args.loop and (len(capture) != 1 or capture[0]["samples"] < 300 or not capture[0]["activeSamples"]):
                 raise RuntimeError(f"The client module did not capture the keyboard: {capture}")
@@ -265,7 +282,9 @@ def run(args):
                         born[min((0, 1), key=lambda i: (listed[i]["body"][0] - entity["body"][0]) ** 2 +
                                  (listed[i]["body"][1] - entity["body"][1]) ** 2)].add(entity["id"])
             # In the closed loop nobody touches the host's keyboard: only the client's player fires.
-            if len(applied) < 200 or not born[1] or bool(born[0]) == args.loop:
+            # An impaired path loses snapshots, and of two that arrive out of order or together only the newer is applied.
+            enough = 100 if impaired else 200
+            if len(applied) < enough or not born[1] or bool(born[0]) == args.loop:
                 raise RuntimeError(f"Too few applied frames ({len(applied)}) or unexpected tears: first player {len(born[0])}, second {len(born[1])}")
             if footer["created"] != len(copies) or footer["removed"] + footer["vanished"] != footer["created"]:
                 raise RuntimeError("Unexpected respawn or unremoved entity")
@@ -281,7 +300,7 @@ def run(args):
                      for a, b in zip(ends["host"], ends["replica"])]
             if len(apart) != 2 or max(apart) > 0.5:
                 raise RuntimeError(f"The games disagree on where the players stand at the end: {apart}")
-            summary.update(passed=True, applied=len(applied), playersPerFrame=2, movedOnReplica=moved,
+            summary.update(applied=len(applied), playersPerFrame=2, movedOnReplica=moved,
                            tearsOfFirstPlayer=len(born[0]), tearsOfSecondPlayer=len(born[1]), created=footer["created"],
                            removed=footer["removed"], vanished=footer["vanished"], remaining=footer["remaining"],
                            playerUpdatesHeld=footer["playerHolds"], rejected=footer["rejected"],
@@ -303,9 +322,9 @@ def run(args):
                 own = [r["own"] for r in applied if "own" in r]
                 matched = sorted(o["error"] for o in own if o["matched"])
                 acks = [world.players(r)[1]["ack"] for r in applied]
-                if footer["ownIndex"] != 1 or len(own) != len(applied) or len(matched) < 200 or footer["predictRemembered"] < 300:
+                if footer["ownIndex"] != 1 or len(own) != len(applied) or len(matched) < enough or footer["predictRemembered"] < 300:
                     raise RuntimeError(f"The replica did not predict its own player: {len(matched)} matched of {len(own)}")
-                if sum(a > 0 for a in acks) < 200 or any(b < a for a, b in zip(acks, acks[1:])) or not capture[0]["predicts"]:
+                if sum(a > 0 for a in acks) < enough or any(b < a for a, b in zip(acks, acks[1:])) or not capture[0]["predicts"]:
                     raise RuntimeError("The host did not acknowledge consumed commands in order, or the client module does not predict")
                 if footer["predictSnaps"] or matched[-1] > 48:
                     raise RuntimeError(f"Prediction left the host by {matched[-1]} or was teleported {footer['predictSnaps']} times")
@@ -324,8 +343,15 @@ def run(args):
                                predictionErrorP95=round(matched[int(len(matched) * 0.95)], 3), predictionErrorMax=round(matched[-1], 3),
                                mendsSettled=footer["predictSettles"], mendsShifted=footer["predictShifts"], mendsSnapped=footer["predictSnaps"],
                                acknowledgedFrames=sum(a > 0 for a in acks), ownUpdatesRemembered=footer["predictRemembered"])
+            if args.stepped:
+                if not drive["stepped"] or not capture[0]["stepped"] or not drive["playoutStarts"]:
+                    raise RuntimeError("The stepped input modules did not step")
+                summary.update(playout=dict(starts=drive["playoutStarts"], substituted=drive["playoutSubstituted"], starved=drive["playoutStarved"],
+                                            skipped=drive["playoutSkipped"], late=drive["playoutLate"]))
         except (RuntimeError, KeyError, IndexError, TypeError, ValueError) as error:
             failures.append(str(error))
+    # Decided once, after the last check: a later check that fails must never leave an earlier "passed" standing.
+    summary["passed"] = not failures
     with (output / f"{stage}-{stamp}.sent.jsonl").open("x", encoding="utf-8") as file:
         for frame in transmitted:
             file.write(json.dumps(frame) + "\n")
@@ -342,6 +368,12 @@ if __name__ == "__main__":
     parser.add_argument("--source-pid", type=int)
     parser.add_argument("--replica-pid", type=int)
     parser.add_argument("--controller", type=int, default=1, help="free controller index that joins as the second player")
+    parser.add_argument("--delay-ms", type=int, default=0, help="one-way delay of the path between the games, each direction")
+    parser.add_argument("--jitter-ms", type=int, default=0, help="extra uniform delay per packet; reorders packets")
+    parser.add_argument("--loss", type=float, default=0.0, help="percent of packets lost, each direction")
+    parser.add_argument("--network-seed", type=int, default=1, help="seed of the path's random losses and jitter")
+    parser.add_argument("--stepped", action="store_true",
+                        help="with --predict: one command per step of the client's player on both sides (playout buffer on the host)")
     parser.add_argument("--predict", action="store_true",
                         help="closed loop with prediction: the client walks its own player at once and the host mends it (implies --loop)")
     parser.add_argument("--loop", action="store_true",
@@ -352,6 +384,7 @@ if __name__ == "__main__":
     parser.add_argument("--binary-directory", type=Path)
     parser.add_argument("--output-directory", type=Path)
     options = parser.parse_args()
+    options.predict = options.predict or options.stepped
     options.loop = options.loop or options.predict
     if options.predict and options.controller != 1:
         parser.error("the prediction modules know the client's own player as controller 1")

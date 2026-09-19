@@ -47,4 +47,32 @@ struct Sample { float value[kActions] = {}; };
 // Axes and buttons only; the caller names the session, sequence, time and controller.
 Command Compose(const Sample& sample);
 bool Neutral(const Command& command);
+
+// Commands arrive late, in bursts, out of order or not at all, while the game steps at its own steady pace. If the host
+// simply read the newest command, it would spend several steps on one command and then jump over several: "after
+// command N" would stop meaning a number of steps, and a predicting client would be corrected for errors that are not
+// there. The playout buffer hands the game exactly one command per step of the driven player, in sequence order and a
+// few steps behind the newest arrival. A command that is missing when its step comes is played as a repeat of the
+// previous one and the step still counts; its late arrival is dropped.
+constexpr std::uint32_t kPlayoutTarget = 4, kPlayoutSlack = 6, kPlayoutWindow = 64, kPlayoutSilence = 15;
+class Playout {
+public:
+    void Reset(std::uint64_t session);
+    bool Receive(const Command& command, std::uint64_t now);
+    // Once per step of the driven player. False: nothing to play, the player is nobody's for now.
+    bool Step(Command& out);
+    // Sequence of the step last played: what a snapshot taken now acknowledges.
+    std::uint32_t Played() const { return played_; }
+    bool Running() const { return running_; }
+    unsigned substituted = 0, starved = 0, skipped = 0, late = 0, starts = 0;
+private:
+    void Drop(std::uint32_t sequence);
+    void Stop();
+    std::uint64_t session_ = 0;
+    Command slots_[kPlayoutWindow];
+    bool present_[kPlayoutWindow] = {};
+    Command last_;
+    std::uint32_t next_ = 0, newest_ = 0, played_ = 0, buffered_ = 0, silent_ = 0;
+    bool running_ = false;
+};
 }
