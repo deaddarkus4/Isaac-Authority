@@ -1,0 +1,4 @@
+LIBRARY IsaacAuthorityNpcReplica
+EXPORTS
+    IsaacAuthorityWorldStart=_IsaacAuthorityWorldStart@4
+    IsaacAuthorityWorldStop=_IsaacAuthorityWorldStop@4

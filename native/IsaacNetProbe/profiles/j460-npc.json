@@ -1,6 +1,6 @@
 {
   "gameSha256": "3bdfc8bae0dc7e334b76009d0ad45dfbb16ee5f00c06ffbc3a0094e34d44616b",
-  "scope": "entity-and-npc-fields-read-only",
+  "scope": "entity-and-npc-fields",
   "source": "Lua property registration in RVA 0x466960: PUSH writable; PUSH field offset; PUSH name. Accessor functions for properties bound through getters.",
   "vtablesRva": {
     "player": "0x76bdd0",
@@ -55,8 +55,19 @@
     "sameRosterInBothGamesByInitSeed": true,
     "stateFrameI1I2V1V2CooldownObservedNonZero": false,
     "npcUpdateSlotVerifiedStatically": true,
-    "npcUpdateHookedInLiveGame": false,
-    "anyFieldWrittenInLiveGame": false,
-    "report": "docs/j460-enemies-research.md"
+    "npcUpdateHookedInLiveGame": true,
+    "anyFieldWrittenInLiveGame": true,
+    "report": "docs/j460-enemy-correction-test.md",
+    "fieldsWrittenInLiveGame": [
+      "position",
+      "velocity",
+      "targetPosition",
+      "hitPoints",
+      "state",
+      "visible",
+      "gridCollisionClass",
+      "entityCollisionClass"
+    ],
+    "observationReport": "docs/j460-enemies-research.md"
   }
 }

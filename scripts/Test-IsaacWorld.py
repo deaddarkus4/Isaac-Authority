@@ -91,8 +91,11 @@ def fixture(executable):
                     frame["entities"][0]["body"][0] += 8
                 elif sequence == 3:
                     frame["entities"].append(tear(2, 100, frame["player"]))
+                    # Version 2 as encoded here must be accepted by the native decoder; a rejection changes the counts.
+                    frame["npcs"] = [dict(type=244, variant=0, subtype=0, seed=2078110152, body=[80, 160, 0.5, -0.25],
+                                          target=[80, 160], hp=[7.5, 10], state=8, flags=[1, 5, 4])]
                 elif sequence == 4:
-                    frame["entities"].pop(0)
+                    frame["entities"].pop(0); frame.pop("npcs")
                 else:
                     frame["entities"] = []
                 data = world.encode(frame)

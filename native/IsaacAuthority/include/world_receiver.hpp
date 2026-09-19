@@ -32,5 +32,5 @@ struct alignas(8) Published {
     std::uint64_t session = 0;
     std::array<std::uint8_t, kMaxBytes> packet{};
 };
-static_assert(sizeof(Published) == 1024 && offsetof(Published, packet) == 32);
+static_assert(sizeof(Published) == 3072 && offsetof(Published, packet) == 32);
 }

@@ -138,20 +138,21 @@ def run(args):
     _, move, shoot = level.DOORS[direction]
 
     here = Path(__file__).resolve().parent; root = here.parent
-    binaries = args.binary_directory or (here if (here / "IsaacAuthorityRoomReplica.dll").is_file()
+    stage = args.stage; prefix = "IsaacAuthority" + stage.capitalize()
+    binaries = args.binary_directory or (here if (here / "installation.json").is_file()
                                         else root / "Binaries/authority-build/Release")
     attach = binaries / "IsaacAuthorityAttach.exe"
-    names = dict(source="IsaacAuthorityRoomSource.dll", replica="IsaacAuthorityRoomReplica.dll")
+    names = dict(source=prefix + "Source.dll", replica=prefix + "Replica.dll")
     if (binaries / "installation.json").is_file():
         # Installed modules carry a content hash in their name so a new build can load beside an old one.
         names.update(json.loads((binaries / "installation.json").read_text(encoding="utf-8")).get("modules", {}))
     replica_dll, source_dll = binaries / names["replica"], binaries / names["source"]
     directory = Path(os.environ["LOCALAPPDATA"]) / "IsaacAuthority"
     logs = directory / "logs"
-    output = args.output_directory or (root / "Binaries/diagnostics/room" if (root / "native").is_dir() else directory / "verified-room")
+    output = args.output_directory or (root / "Binaries/diagnostics" / stage if (root / "native").is_dir() else directory / ("verified-" + stage))
     output.mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
-    before = set(logs.glob("room-*.jsonl"))
+    before = set(logs.glob(stage + "-*.jsonl"))
     processes, started, failures, transmitted = {}, [], [], []
     control = None; left_ms = None; final_rooms = {}; withheld = 0; census = {}
 
@@ -176,10 +177,10 @@ def run(args):
         control = pair.HostWindow(args.source_pid)
         wait_running(source, "HOST", control); wait_running(replica, "REPLICA")
         invoke("world", args.source_pid, source_dll); started.append((args.source_pid, source_dll))
-        source_endpoint = json.loads((directory / f"room-source-{args.source_pid}.json").read_text())
+        source_endpoint = json.loads((directory / f"{stage}-source-{args.source_pid}.json").read_text())
         tears.wait_frame(source, source_endpoint)
         invoke("world", args.replica_pid, replica_dll); started.append((args.replica_pid, replica_dll))
-        endpoint = json.loads((directory / f"room-replica-{args.replica_pid}.json").read_text())
+        endpoint = json.loads((directory / f"{stage}-replica-{args.replica_pid}.json").read_text())
         address = ("127.0.0.1", endpoint["port"])
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
             start_ms = pair.uptime_ms()
@@ -265,7 +266,7 @@ def run(args):
                 failures.append(f"Restoration readback: {error}")
             process.close()
     reports, copied = {}, []
-    for file in sorted(set(logs.glob("room-*.jsonl")) - before):
+    for file in sorted(set(logs.glob(stage + "-*.jsonl")) - before):
         target = output / file.name
         if target.exists():
             raise RuntimeError("Report already exists")
@@ -273,7 +274,7 @@ def run(args):
         records = [json.loads(line) for line in target.read_text().splitlines()]
         reports[records[0]["role"]] = records
     summary = dict(utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), sourcePid=args.source_pid,
-                   replicaPid=args.replica_pid, scope="standard-tears-rooms", realRoomTransition=True,
+                   replicaPid=args.replica_pid, scope="standard-tears-rooms-enemies" if stage == "npc" else "standard-tears-rooms", realRoomTransition=True,
                    runSeed=report["hostSeed"], route=args.route, direction=direction, fromRoom=report["room"], toRoom=destination["grid"],
                    divergentRoomsFromDifferentSaves=report["divergentRooms"],
                    transmitted=len(transmitted), reports=copied, failures=failures, passed=False)
@@ -303,6 +304,7 @@ def run(args):
             host_frames = {(r["epoch"], r["sequence"]): r for r in host_records if r["type"] == "frame"}
             applied = [r for r in frames if r["action"] == 1]
             copies = {"before": set(), "after": set()}; counts = {"before": 0, "after": 0}
+            enemies = dict(host=0, matched=0, frames=0, complete=0)
             for frame in applied:
                 key = (frame["epoch"], frame["sequence"])
                 if key not in sent or not tears.equal_frame(sent[key], frame):
@@ -313,6 +315,13 @@ def run(args):
                 if (frame["room"][2] == destination["grid"]) != (side == "after"):
                     raise RuntimeError("A snapshot was applied in the wrong room")
                 counts[side] += 1
+                hosted = {(n["type"], n["variant"], n["subtype"], n["seed"]): n for n in host_frames[key].get("npcs", [])}
+                for npc in frame.get("npcs", []):
+                    identity = (npc["type"], npc["variant"], npc["subtype"], npc["seed"])
+                    if identity not in hosted or not world.same_npc(hosted[identity], npc):
+                        raise RuntimeError("A corrected enemy differs from the host's enemy of the same identity")
+                enemies["host"] = max(enemies["host"], len(hosted)); enemies["matched"] = max(enemies["matched"], len(frame.get("npcs", [])))
+                enemies["frames"] += bool(hosted); enemies["complete"] += bool(hosted) and len(hosted) == len(frame.get("npcs", []))
                 copies[side].update((frame["epoch"], entity["id"]) for entity in frame["entities"])
             if min(counts.values()) < 20 or not copies["before"] or not copies["after"]:
                 raise RuntimeError("Tear replication was not observed on both sides of the door")
@@ -324,6 +333,24 @@ def run(args):
                     raise RuntimeError(f"{role} did not finish in the destination room")
             if any(level.differences(initial[role], final_rooms[role]) for role in final_rooms):
                 raise RuntimeError("A level layout changed during the transition")
+            if stage == "npc":
+                if footer["lastFault"] or host_records[-1]["lastFault"] or footer["playerShielded"]:
+                    raise RuntimeError("Enemy capture fault or the replica player was left without collisions")
+                if not enemies["matched"] or not footer["npcCorrections"] or not footer["npcUpdates"]:
+                    raise RuntimeError("No enemy of the host was matched and corrected on the replica")
+                # External reads of both games at the end: corrected enemies must sit where the host has them.
+                ends = {role: {(e["type"], e["variant"], e["subtype"], e["seed"]): e for e in rows if e["vtableRva"] == level.NPC_VTABLE_RVA}
+                        for role, rows in census.get("end", {}).items() if isinstance(rows, list)}
+                shared = set(ends.get("host", {})) & set(ends.get("replica", {}))
+                apart = [((ends["host"][k]["position"][0] - ends["replica"][k]["position"][0]) ** 2 +
+                          (ends["host"][k]["position"][1] - ends["replica"][k]["position"][1]) ** 2) ** 0.5 for k in shared]
+                summary.update(enemiesOnHost=enemies["host"], enemiesMatched=enemies["matched"], enemyFrames=enemies["frames"],
+                               enemyFramesFullyMatched=enemies["complete"], npcCorrections=footer["npcCorrections"],
+                               npcOwnUpdates=footer["npcUpdates"], npcStateDriftUpdates=footer["npcStateDrift"],
+                               npcVisibleDriftUpdates=footer["npcVisibleDrift"], npcDriftMax=footer["npcDriftMax"],
+                               npcDriftMean=footer["npcDriftMean"], npcUnmatched=footer["npcUnmatched"], npcOrphans=footer["npcOrphans"],
+                               enemiesComparedAtEnd=len(shared), enemyDistanceAtEndMax=max(apart) if apart else None,
+                               enemyStatesEqualAtEnd=sum(ends["host"][k]["npc"]["state"] == ends["replica"][k]["npc"]["state"] for k in shared))
             host_gap = [r["observedMs"] for r in host_frames.values()]
             summary.update(passed=True, appliedBefore=counts["before"], appliedAfter=counts["after"],
                            tearsBefore=len(copies["before"]), tearsAfter=len(copies["after"]),
@@ -335,13 +362,13 @@ def run(args):
         except (RuntimeError, KeyError, IndexError, TypeError) as error:
             failures.append(str(error))
     if census:
-        with (output / f"room-{stamp}.entities.json").open("x", encoding="utf-8") as file:
+        with (output / f"{stage}-{stamp}.entities.json").open("x", encoding="utf-8") as file:
             json.dump(census, file, indent=1)
-    trace = output / f"room-{stamp}.sent.jsonl"
+    trace = output / f"{stage}-{stamp}.sent.jsonl"
     with trace.open("x", encoding="utf-8") as file:
         for frame in transmitted:
             file.write(json.dumps(frame) + "\n")
-    summary_path = output / f"room-{stamp}.summary.json"
+    summary_path = output / f"{stage}-{stamp}.summary.json"
     with summary_path.open("x", encoding="utf-8") as file:
         json.dump(summary, file, indent=2)
     print(json.dumps(dict(summary=str(summary_path), **summary)))
@@ -355,6 +382,7 @@ if __name__ == "__main__":
     parser.add_argument("--replica-pid", type=int)
     parser.add_argument("--check", action="store_true", help="only report whether both games share the run seed and room")
     parser.add_argument("--restart-runs", action="store_true", help="first hold R in both games to restart their seeded runs")
+    parser.add_argument("--stage", choices=("room", "npc"), default="room", help="npc: modules that also correct the room's enemies")
     parser.add_argument("--direction", choices=sorted(level.DOORS))
     parser.add_argument("--route", choices=("door", "request"), default="door",
                         help="door: the replica is carried through by its own game; request: snapshots near the door are lost")

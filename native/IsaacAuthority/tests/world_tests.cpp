@@ -1,4 +1,5 @@
 #include "world_receiver.hpp"
+#include <algorithm>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -78,6 +79,31 @@ void Rooms() {
     to.index = 85; to.shape = 4; Check(Direction(from, to) == -1, "large rooms are entered without a guessed door");
     to.shape = 1; to.dimension = 1; Check(Direction(from, to) == -1, "dimensions are not adjacent");
 }
+void Enemies() {
+    auto f = Example(); Packet tearsOnly, packet; Frame out;
+    Check(Encode(f, tearsOnly) && tearsOnly.size == kHeader + kRecord && tearsOnly.bytes[4] == 1, "a frame without enemies stays version 1");
+    f.npcCount = 2;
+    f.npcs[0] = {244, 0, 0, 2078110152u, {{80, 160}, {0, 0}}, {80, 160}, 10, 10, 8, 1, 5, 4};
+    f.npcs[1] = {244, 0, 0, 2403336305u, {{560, 160}, {0.5f, -0.25f}}, {0, 0}, 7.5f, 10, 4, 0, 5, 0};
+    Check(Encode(f, packet) && packet.size == kHeader + kRecord + 2 * kNpcRecord && packet.bytes[4] == 2, "enemy section makes version 2");
+    Check(std::equal(tearsOnly.bytes.begin() + 8, tearsOnly.bytes.begin() + 88, packet.bytes.begin() + 8), "header and tear layout unchanged");
+    Check(Decode(packet.bytes.data(), packet.size, out) && out.npcCount == 2 && out.count == 1 && out.entities[0].id == 1 &&
+        SameNpc(out.npcs[1], f.npcs[1]) && out.npcs[1].hitPoints == 7.5f && out.npcs[1].state == 4 && !out.npcs[1].visible &&
+        out.npcs[1].body.velocity.y == -0.25f && out.npcs[0].entityCollision == 4 && out.npcs[0].target.y == 160, "enemy wire roundtrip");
+    for (std::size_t n = 0; n < packet.size; ++n) Check(!Decode(packet.bytes.data(), n, out), "reject truncated enemy section");
+    auto bad = packet; bad.bytes[4] = 1; Check(!Decode(bad.bytes.data(), bad.size, out), "version 1 cannot carry enemies");
+    bad = packet; bad.bytes[88] = 3; Check(!Decode(bad.bytes.data(), bad.size, out), "enemy count must match the size");
+    bad = tearsOnly; bad.bytes[4] = 2; Check(!Decode(bad.bytes.data(), bad.size, out), "version 2 needs an enemy section");
+    auto g = f; g.npcs[1].seed = g.npcs[0].seed; Check(!Valid(g), "duplicate enemy identity");
+    g = f; g.npcs[0].type = 2; Check(!Valid(g), "a tear is not an enemy");
+    g = f; g.npcs[0].type = 1000; Check(!Valid(g), "effects are local cosmetics");
+    g = f; g.npcs[0].seed = 0; Check(!Valid(g), "enemy identity needs a seed");
+    g = f; g.npcs[0].hitPoints = std::numeric_limits<float>::infinity(); Check(!Valid(g), "non-finite hit points");
+    g = f; g.npcs[0].visible = 2; Check(!Valid(g), "visibility is a flag");
+    g = f; g.npcCount = static_cast<std::uint32_t>(kMaxNpcs + 1); Check(!Encode(g, packet), "reject oversized enemy roster without truncation");
+    g = f; g.npcs[1].variant = 1; Check(!SameNpc(g.npcs[1], f.npcs[1]) && SameNpc(g.npcs[0], f.npcs[0]), "identity is type, variant, subtype and seed");
+    Gate gate(123); Check(gate.Receive(f, 1000) == Decision::Accept, "enemy frames pass the same gate");
+}
 void Contract(const wchar_t* path) {
     HMODULE dll = LoadLibraryW(path); Check(dll != nullptr, "load world adapter");
     using Export = DWORD(WINAPI*)(void*);
@@ -111,8 +137,8 @@ int Fixture() {
 int wmain(int argc, wchar_t** argv) {
     try {
         if (argc == 2 && std::wstring(argv[1]) == L"--fixture") return Fixture();
-        Protocol(); Lifecycle(); Rooms();
+        Protocol(); Lifecycle(); Rooms(); Enemies();
         for (int i = 1; i < argc; ++i) Contract(argv[i]);
-        std::cout << "PASS world wire, stable identities, lifetimes, epochs, room routing, module contracts\n"; return 0;
+        std::cout << "PASS world wire, stable identities, lifetimes, epochs, room routing, enemy section, module contracts\n"; return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

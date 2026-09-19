@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param([string]$GameExecutable, [string[]]$VerifiedSummary)
+param([string]$GameExecutable, [string[]]$VerifiedSummary, [ValidateSet('Room','Npc')][string]$Stage = 'Room')
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'IsaacPaths.ps1')
 $GameExecutable = Resolve-IsaacExecutable -GameExecutable $GameExecutable
@@ -7,13 +7,16 @@ $expected = '3bdfc8bae0dc7e334b76009d0ad45dfbb16ee5f00c06ffbc3a0094e34d44616b'
 if ((Get-FileHash -LiteralPath $GameExecutable -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Original J460 required.' }
 $root = Split-Path -Parent $PSScriptRoot
 $bin = Join-Path $root 'Binaries\authority-build\Release'
-$target = Join-Path (Split-Path -Parent $GameExecutable) 'IsaacAuthority\Room'
+# Npc: the same adapter built with enemy correction; installed beside the verified Room package, not over it.
+$component = 'IsaacAuthority' + $Stage
+$release = @{Room=@('0.5.0-experimental','standard-tears-rooms');Npc=@('0.6.0-experimental','standard-tears-rooms-enemies')}[$Stage]
+$target = Join-Path (Split-Path -Parent $GameExecutable) (Join-Path 'IsaacAuthority' $Stage)
 $manifestPath = Join-Path $target 'installation.json'
 if (Test-Path -LiteralPath $target) {
     if (-not (Test-Path -LiteralPath $manifestPath)) { throw 'Unknown destination folder.' }
-    if ((Get-Content -Raw -Encoding UTF8 -LiteralPath $manifestPath | ConvertFrom-Json).component -ne 'IsaacAuthorityRoom') { throw 'Different component owns destination.' }
+    if ((Get-Content -Raw -Encoding UTF8 -LiteralPath $manifestPath | ConvertFrom-Json).component -ne $component) { throw 'Different component owns destination.' }
 }
-$modules = [ordered]@{source='IsaacAuthorityRoomSource';replica='IsaacAuthorityRoomReplica'}
+$modules = [ordered]@{source=($component + 'Source');replica=($component + 'Replica')}
 $files = @($modules.Values | ForEach-Object { Join-Path $bin ($_ + '.dll') })
 $files += Join-Path $bin 'IsaacAuthorityAttach.exe'
 $files += @('Test-IsaacRoom.py','isaac_level.py','Test-IsaacWorld.py','isaac_world.py','Test-IsaacGamePair.py','Read-IsaacState.py' | ForEach-Object { Join-Path $PSScriptRoot $_ })
@@ -34,7 +37,7 @@ foreach ($file in $files) {
     if ((Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash -ne $hash) { throw 'Installed file hash mismatch.' }
     $entries += [ordered]@{name=$name;sha256=$hash.ToLowerInvariant()}
 }
-foreach ($stale in @(Get-ChildItem -LiteralPath $target -Filter 'IsaacAuthorityRoom*.dll' | Where-Object { $_.Name -notin $installed.Values })) {
+foreach ($stale in @(Get-ChildItem -LiteralPath $target -Filter ($component + '*.dll') | Where-Object { $_.Name -notin $installed.Values })) {
     try { Remove-Item -LiteralPath $stale.FullName -Force -ErrorAction Stop } catch { Write-Verbose "Still loaded by a running game: $($stale.Name)" }
 }
 & (Join-Path $bin 'world_tests.exe') (Join-Path $target $installed.source) (Join-Path $target $installed.replica)
@@ -47,6 +50,6 @@ foreach ($path in @($VerifiedSummary | Where-Object { $_ })) {
     if (-not $summary.passed -or $summary.failures.Count) { throw "Not a passed live test: $path" }
     $verified += [ordered]@{summary=(Split-Path -Leaf $path);sha256=(Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant();route=$summary.route;utc=$summary.utc}
 }
-$manifest = [ordered]@{component='IsaacAuthorityRoom';version='0.5.0-experimental';scope='standard-tears-rooms';installedUtc=[DateTime]::UtcNow.ToString('o');gameSha256=$expected;autoStart=$false;liveTestVerified=($verified.Count -gt 0);liveTests=$verified;modules=$installed;files=$entries}
+$manifest = [ordered]@{component=$component;version=$release[0];scope=$release[1];installedUtc=[DateTime]::UtcNow.ToString('o');gameSha256=$expected;autoStart=$false;liveTestVerified=($verified.Count -gt 0);liveTests=$verified;modules=$installed;files=$entries}
 [IO.File]::WriteAllText($manifestPath,($manifest|ConvertTo-Json -Depth 6),[Text.UTF8Encoding]::new($false))
 Write-Output ('Installed: '+$target)

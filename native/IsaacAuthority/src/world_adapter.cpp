@@ -22,7 +22,14 @@ constexpr bool kRooms = true;
 #else
 constexpr bool kRooms = false;
 #endif
+#ifdef ISAAC_WORLD_NPCS
+constexpr bool kNpcs = true;
+#else
+constexpr bool kNpcs = false;
+#endif
 constexpr std::uintptr_t kPlayerTable = 0x76bdd0, kPlayerUpdate = 0x382af0;
+// Entity_NPC shares the entity vtable layout: slot 3 is Update.
+constexpr std::uintptr_t kNpcTable = 0x767468, kNpcUpdate = 0x2c4b30;
 constexpr std::uintptr_t kTearTable = 0x764eac, kTearUpdate = 0x2670f0, kRemove = 0x2acb00, kSpawn = 0x28b20;
 // Game::StartRoomTransition only latches a request in RoomTransition (Game+0x1b83c); the game loads the room later.
 constexpr std::uintptr_t kTransition = 0x2fd7c0, kTransitionUnwind = 0x6fc200, kRoomTransition = 0x1b83c;
@@ -34,10 +41,11 @@ using Transition = void(__thiscall*)(void*, int, int, unsigned, void*, int);
 std::uintptr_t base = 0, target = 0;
 std::uint32_t targetSeed = 0;
 RoomKey localRoom;
-Update originalPlayer = nullptr, originalTear = nullptr;
+Update originalPlayer = nullptr, originalTear = nullptr, originalNpc = nullptr;
 void** playerSlot = nullptr;
 void** tearSlot = nullptr;
-bool playerInstalled = false, tearInstalled = false;
+void** npcSlot = nullptr;
+bool playerInstalled = false, tearInstalled = false, npcInstalled = false;
 std::atomic<bool> running{false}, stopRequested{false}, cleaned{false};
 std::atomic<unsigned> active{0};
 std::atomic<DWORD> owner{0};
@@ -57,6 +65,14 @@ std::uint64_t travelDeadline = 0;
 unsigned transitions = 0, arrivals = 0, levelMismatches = 0, localFailures = 0, selfMoves = 0, vanished = 0, settled = 0;
 std::uint32_t departedEpoch = 0;
 std::uint64_t relocatedAt = 0;
+// Enemies of the replica's own room that the host also has; corrected after each of their own updates.
+struct Adopted { std::uintptr_t address = 0; Npc state; };
+std::array<Adopted, kMaxNpcs> adopted{};
+unsigned npcCorrections = 0, npcUpdates = 0, npcStateDrift = 0, npcVisibleDrift = 0, npcUnmatched = 0, npcOrphans = 0, lastFault = 0;
+float npcDriftMax = 0;
+double npcDriftSum = 0;
+std::uint32_t playerCollision = 0;
+bool playerShielded = false;
 struct Tracked { std::uintptr_t address = 0; std::uint32_t localIndex = 0; Entity state; };
 std::array<Tracked, kMaxEntities> tracked{};
 struct Record { std::uint64_t now = 0; DWORD thread = 0; unsigned created = 0, removed = 0, action = 0; Frame frame; };
@@ -108,6 +124,34 @@ bool Tear(std::uintptr_t address, Entity& e, std::uint32_t* index = nullptr) {
         (!index || Read(address + 0x20, *index)) && ReadBody(address, e.body) && Read(address + 0x410, e.height) &&
         Read(address + 0x414, e.fallingSpeed) && Read(address + 0x418, e.fallingAccel) && Read(address + 0x420, e.scale);
 }
+bool ReadNpc(std::uintptr_t address, Npc& n) {
+    unsigned char exists = 0, dead = 0, visible = 0; std::uintptr_t table = 0;
+    if (!Read(address, table) || table != base + kNpcTable || !Read(address + 0x172, exists) || !exists ||
+        !Read(address + 0x173, dead) || dead || !Read(address + 0x171, visible)) return false;
+    n.visible = visible ? 1u : 0u;
+    return Read(address + 0x28, n.type) && Read(address + 0x2c, n.variant) && Read(address + 0x30, n.subtype) &&
+        Read(address + 0x3ec, n.seed) && ReadBody(address, n.body) && Read(address + 0x334, n.target) &&
+        Read(address + 0x380, n.hitPoints) && Read(address + 0x384, n.maxHitPoints) && Read(address + 0xb64, n.state) &&
+        Read(address + 0x184, n.gridCollision) && Read(address + 0x188, n.entityCollision);
+}
+bool WriteNpc(std::uintptr_t address, const Npc& n) {
+    __try {
+        *reinterpret_cast<Vec*>(address + 0x33c) = n.body.position; *reinterpret_cast<Vec*>(address + 0x360) = n.body.velocity;
+        *reinterpret_cast<Vec*>(address + 0x334) = n.target; *reinterpret_cast<float*>(address + 0x380) = n.hitPoints;
+        *reinterpret_cast<std::int32_t*>(address + 0xb64) = n.state; *reinterpret_cast<unsigned char*>(address + 0x171) = n.visible ? 1 : 0;
+        *reinterpret_cast<std::uint32_t*>(address + 0x184) = n.gridCollision; *reinterpret_cast<std::uint32_t*>(address + 0x188) = n.entityCollision;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// The replica's enemies fight their own simulation; its held player must not take their hits.
+bool Shield(bool on) {
+    __try {
+        auto& collision = *reinterpret_cast<std::uint32_t*>(target + 0x188);
+        if (on) { if (!playerShielded) { playerCollision = collision; playerShielded = true; } collision = 0; }
+        else if (playerShielded) { collision = playerCollision; playerShielded = false; }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 bool WriteBody(std::uintptr_t address, const Body& body) {
     __try { *reinterpret_cast<Vec*>(address + 0x33c) = body.position; *reinterpret_cast<Vec*>(address + 0x360) = body.velocity; return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -143,6 +187,8 @@ bool RemoveTear(Tracked& t) {
 bool Clear() {
     bool ok = true;
     for (auto& entry : tracked) if (!RemoveTear(entry)) ok = false;
+    adopted = {};
+    if (playerShielded && !Shield(false)) ok = false;
     haveFrame = false;
     if (!ok) ++faults;
     return ok;
@@ -181,20 +227,54 @@ bool BeginTravel(std::uintptr_t game, const Frame& frame) {
 bool Capture(std::uintptr_t room, Frame& frame) {
     std::array<std::uintptr_t, 4096> pointers{}; unsigned count = 0;
     std::array<Identity, kMaxEntities> identities{}; std::array<std::uint32_t, kMaxEntities> assigned{};
-    if (!List(room, pointers, count) || !ReadBody(target, frame.player)) return false;
+    // lastFault: 1 list or player, 2 entity or tear read, 3 too many tears, 4 enemy read, 5 too many enemies,
+    // 6 network ids, 7 value outside the wire format.
+    if (!List(room, pointers, count) || !ReadBody(target, frame.player)) { lastFault = 1; return false; }
     for (unsigned i = 0; i < count; ++i) {
-        std::uint32_t type = 0; unsigned char exists = 0, dead = 0;
-        if (!Read(pointers[i] + 0x28, type) || !Read(pointers[i] + 0x172, exists) || !Read(pointers[i] + 0x173, dead)) return false;
-        if (type != 2 || !exists || dead) continue;
-        if (frame.count == kMaxEntities) return false; // Never publish a truncated roster as a full snapshot.
+        std::uint32_t type = 0; unsigned char exists = 0, dead = 0; std::uintptr_t table = 0;
+        if (!Read(pointers[i], table) || !Read(pointers[i] + 0x28, type) || !Read(pointers[i] + 0x172, exists) ||
+            !Read(pointers[i] + 0x173, dead)) { lastFault = 2; return false; }
+        if (!exists || dead) continue;
+        if (kNpcs) {
+            if (table == base + kNpcTable) {
+                if (frame.npcCount == kMaxNpcs) { lastFault = 5; return false; } // Never publish a truncated roster.
+                if (!ReadNpc(pointers[i], frame.npcs[frame.npcCount])) { lastFault = 4; return false; }
+                ++frame.npcCount; continue;
+            }
+        }
+        if (type != 2) continue;
+        if (frame.count == kMaxEntities) { lastFault = 3; return false; } // Never publish a truncated roster as a full snapshot.
         auto& entity = frame.entities[frame.count]; auto& identity = identities[frame.count];
         identity.address = static_cast<std::uint32_t>(pointers[i]);
-        if (!Tear(pointers[i], entity, &identity.index)) return false;
+        if (!Tear(pointers[i], entity, &identity.index)) { lastFault = 2; return false; }
         identity.seed = entity.seed; ++frame.count;
     }
-    if (!ids.Assign(identities.data(), frame.count, assigned.data())) return false;
+    if (!ids.Assign(identities.data(), frame.count, assigned.data())) { lastFault = 6; return false; }
     for (unsigned i = 0; i < frame.count; ++i) frame.entities[i].id = assigned[i];
-    return Valid(frame);
+    if (!Valid(frame)) { lastFault = 7; return false; }
+    return true;
+}
+// Match the host's enemies to the replica's own by identity and bring those to the host's state. The readback
+// lists only matched enemies, so an unmatched one can never pass for an applied one.
+bool Adopt(std::uintptr_t game, const Frame& frame, Frame& readback) {
+    std::array<std::uintptr_t, 4096> pointers{}; unsigned count = 0; std::uintptr_t room = 0;
+    std::array<bool, kMaxNpcs> matched{};
+    if (!Read(game + 0x18300, room) || !List(room, pointers, count)) return false;
+    adopted = {}; readback.npcCount = 0;
+    for (unsigned p = 0; p < count; ++p) {
+        Npc local;
+        if (!ReadNpc(pointers[p], local)) continue;
+        bool found = false;
+        for (unsigned i = 0; i < frame.npcCount && !found; ++i) if (!matched[i] && SameNpc(frame.npcs[i], local)) {
+            found = matched[i] = true; adopted[i] = {pointers[p], frame.npcs[i]};
+            Npc actual;
+            if (!WriteNpc(pointers[p], frame.npcs[i]) || !ReadNpc(pointers[p], actual)) return false;
+            ++npcCorrections; readback.npcs[readback.npcCount++] = actual;
+        }
+        if (!found) ++npcOrphans;
+    }
+    for (unsigned i = 0; i < frame.npcCount; ++i) if (!matched[i]) ++npcUnmatched;
+    return true;
 }
 bool Apply(std::uintptr_t game, const Frame& frame, Frame& readback) {
     Delta delta;
@@ -224,10 +304,11 @@ bool Apply(std::uintptr_t game, const Frame& frame, Frame& readback) {
         match->state = entity; actual.id = entity.id; readback.entities[i] = actual;
     }
     if (!WriteBody(target, frame.player) || !ReadBody(target, readback.player)) return false;
+    if (kNpcs) { if (!Adopt(game, frame, readback) || !Shield(true)) return false; }
     lastFrame = frame; haveFrame = true; return true;
 }
 bool HeldReadback(Frame& frame) {
-    frame = lastFrame;
+    frame = lastFrame; frame.npcCount = 0; // Held enemies keep their last host state; only tears are read back here.
     if (!ReadBody(target, frame.player)) return false;
     for (unsigned i = 0; i < frame.count; ++i) {
         bool found = false;
@@ -254,6 +335,27 @@ void __fastcall OnTear(void* object, void*) {
         }
     }
     if (!hold) originalTear(object);
+    active.fetch_sub(1, std::memory_order_release);
+}
+void __fastcall OnNpc(void* object, void*) {
+    active.fetch_add(1);
+    originalNpc(object);
+    if (running.load(std::memory_order_acquire) && owner.load() == GetCurrentThreadId() && haveFrame) {
+        const auto address = reinterpret_cast<std::uintptr_t>(object);
+        for (const auto& entry : adopted) if (entry.address == address) {
+            Npc local;
+            // How far one update of the replica's own AI moved this enemy away from the host's last word.
+            if (ReadNpc(address, local) && SameNpc(local, entry.state)) {
+                const auto dx = local.body.position.x - entry.state.body.position.x, dy = local.body.position.y - entry.state.body.position.y;
+                const auto drift = std::sqrt(dx * dx + dy * dy);
+                ++npcUpdates; npcDriftSum += drift; npcDriftMax = (std::max)(npcDriftMax, drift);
+                if (local.state != entry.state.state) ++npcStateDrift;
+                if (local.visible != entry.state.visible) ++npcVisibleDrift;
+                if (WriteNpc(address, entry.state)) ++npcCorrections; else ++faults;
+            }
+            break;
+        }
+    }
     active.fetch_sub(1, std::memory_order_release);
 }
 void __fastcall OnPlayer(void* object, void*) {
@@ -312,8 +414,11 @@ void __fastcall OnPlayer(void* object, void*) {
             auto reached = travelFrame; reached.room = key; reached.count = 0; RecordFrame(reached, 4);
         } else if (GetTickCount64() > travelDeadline) { ++faults; Clear(); InvalidatePublication(); running = false; cleaned = true; }
     } else {
-        if (haveFrame) { if (!WriteBody(target, lastFrame.player)) ++faults; ++playerHolds; }
-        else originalPlayer(object);
+        if (haveFrame) {
+            if (!WriteBody(target, lastFrame.player)) ++faults;
+            if (kNpcs) { if (!Shield(true)) ++faults; }
+            ++playerHolds;
+        } else originalPlayer(object);
         Frame frame;
         if (!receiver.Take(frame) || !Fresh(frame, GetTickCount64())) {
             Frame readback;
@@ -357,6 +462,14 @@ void FrameJson(std::ostringstream& out, const Frame& f) {
             << ",\"subtype\":" << e.subtype << ",\"body\":"; BodyJson(out, e.body);
         out << ",\"tear\":[" << e.height << ',' << e.fallingSpeed << ',' << e.fallingAccel << ',' << e.scale << "]}";
     }
+    out << "],\"npcs\":[";
+    for (unsigned i = 0; i < f.npcCount; ++i) {
+        const auto& n = f.npcs[i]; if (i) out << ',';
+        out << "{\"type\":" << n.type << ",\"variant\":" << n.variant << ",\"subtype\":" << n.subtype << ",\"seed\":" << n.seed << ",\"body\":";
+        BodyJson(out, n.body);
+        out << ",\"target\":[" << n.target.x << ',' << n.target.y << "],\"hp\":[" << n.hitPoints << ',' << n.maxHitPoints
+            << "],\"state\":" << n.state << ",\"flags\":[" << n.visible << ',' << n.gridCollision << ',' << n.entityCollision << "]}";
+    }
     out << ']';
 }
 std::filesystem::path Directory() {
@@ -372,9 +485,14 @@ bool WriteFileText(const std::filesystem::path& path, const std::string& text) {
 }
 bool Restore() {
     bool ok = true;
+    if (npcInstalled) {
+        ok = ExchangeSlot(npcSlot, reinterpret_cast<void*>(&OnNpc), reinterpret_cast<void*>(originalNpc)) == 0;
+        if (ok) npcInstalled = false;
+    }
     if (tearInstalled) {
-        ok = ExchangeSlot(tearSlot, reinterpret_cast<void*>(&OnTear), reinterpret_cast<void*>(originalTear)) == 0;
-        if (ok) tearInstalled = false;
+        const bool restored = ExchangeSlot(tearSlot, reinterpret_cast<void*>(&OnTear), reinterpret_cast<void*>(originalTear)) == 0;
+        if (restored) tearInstalled = false;
+        ok = ok && restored;
     }
     if (playerInstalled) {
         const bool restored = ExchangeSlot(playerSlot, reinterpret_cast<void*>(&OnPlayer), reinterpret_cast<void*>(originalPlayer)) == 0;
@@ -409,6 +527,12 @@ extern "C" DWORD WINAPI IsaacAuthorityWorldStart(void*) noexcept {
             !Read(reinterpret_cast<std::uintptr_t>(tearSlot), tearFunction) || tearFunction != base + kTearUpdate ||
             !Read(base + kTearTable + 40, removeFunction) || removeFunction != base + kRemove ||
             !Read(base + kSpawn, spawnPrefix) || spawnPrefix != expectedSpawn) return ERROR_REVISION_MISMATCH;
+        if constexpr (kNpcs) {
+            std::uintptr_t npcFunction = 0;
+            npcSlot = reinterpret_cast<void**>(base + kNpcTable + 12);
+            if (!Read(reinterpret_cast<std::uintptr_t>(npcSlot), npcFunction) || npcFunction != base + kNpcUpdate) return ERROR_REVISION_MISMATCH;
+            originalNpc = reinterpret_cast<Update>(npcFunction);
+        }
         if constexpr (kRooms && !kSource) {
             // push ebp; mov ebp,esp; push -1; push <relocated unwind table>
             std::array<unsigned char, 6> transitionPrefix{}; std::uintptr_t unwind = 0;
@@ -431,15 +555,22 @@ extern "C" DWORD WINAPI IsaacAuthorityWorldStart(void*) noexcept {
         sourceSequence = 0; sourceEpoch = 1; created = removed = faults = contextChanges = tearHolds = playerHolds = frameCount = dropped = 0;
         traveling = false; travelFrame = {}; travelDeadline = 0; transitions = arrivals = levelMismatches = localFailures = 0;
         selfMoves = vanished = settled = 0; departedEpoch = 0; relocatedAt = 0;
+        adopted = {}; npcCorrections = npcUpdates = npcStateDrift = npcVisibleDrift = npcUnmatched = npcOrphans = lastFault = 0;
+        npcDriftMax = 0; npcDriftSum = 0; playerCollision = 0; playerShielded = false;
         stopRequested = false; cleaned = false; owner = 0;
         published = Published{}; published.session = session;
         const auto directory = Directory(); std::filesystem::create_directories(directory / L"logs");
-        const std::wstring role = std::wstring(kRooms ? L"room-" : L"world-") + (kSource ? L"source-" : L"replica-");
+        const std::wstring role = std::wstring(kNpcs ? L"npc-" : kRooms ? L"room-" : L"world-") + (kSource ? L"source-" : L"replica-");
         const auto unique = role + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(session);
         const auto log = directory / L"logs" / (unique + L".jsonl");
         report = CreateFileW(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (report == INVALID_HANDLE_VALUE) throw std::runtime_error("Cannot create world log");
         running.store(true, std::memory_order_release);
+        if constexpr (kNpcs && !kSource) {
+            failure = ExchangeSlot(npcSlot, reinterpret_cast<void*>(originalNpc), reinterpret_cast<void*>(&OnNpc));
+            npcInstalled = *npcSlot == reinterpret_cast<void*>(&OnNpc);
+            if (failure) throw std::runtime_error("Cannot hook enemy update");
+        }
         if (!kSource) {
             failure = ExchangeSlot(tearSlot, reinterpret_cast<void*>(originalTear), reinterpret_cast<void*>(&OnTear));
             tearInstalled = *tearSlot == reinterpret_cast<void*>(&OnTear);
@@ -480,7 +611,7 @@ extern "C" DWORD WINAPI IsaacAuthorityWorldStop(void*) noexcept {
     try {
         std::ostringstream out; out.precision(9);
         out << "{\"type\":\"start\",\"role\":\"" << (kSource ? "source" : "replica") << "\",\"scope\":\""
-            << (kRooms ? "standard-tears-rooms" : "standard-tears") << "\",\"worldSnapshot\":false}\n";
+            << (kNpcs ? "standard-tears-rooms-enemies" : kRooms ? "standard-tears-rooms" : "standard-tears") << "\",\"worldSnapshot\":false}\n";
         for (unsigned i = 0; i < frameCount; ++i) {
             const auto& r = records[i];
             out << "{\"type\":\"frame\",\"observedMs\":" << r.now << ",\"thread\":" << r.thread << ",\"created\":" << r.created << ",\"removed\":" << r.removed << ",\"action\":" << r.action << ',';
@@ -492,7 +623,10 @@ extern "C" DWORD WINAPI IsaacAuthorityWorldStop(void*) noexcept {
             << ",\"tearHolds\":" << tearHolds << ",\"playerHolds\":" << playerHolds << ",\"dropped\":" << dropped
             << ",\"transitions\":" << transitions << ",\"arrivals\":" << arrivals << ",\"levelMismatches\":" << levelMismatches
             << ",\"traveling\":" << (traveling ? "true" : "false") << ",\"selfMoves\":" << selfMoves << ",\"vanished\":" << vanished
-            << ",\"settled\":" << settled
+            << ",\"settled\":" << settled << ",\"npcCorrections\":" << npcCorrections << ",\"npcUpdates\":" << npcUpdates
+            << ",\"npcStateDrift\":" << npcStateDrift << ",\"npcVisibleDrift\":" << npcVisibleDrift << ",\"npcDriftMax\":" << npcDriftMax
+            << ",\"npcDriftMean\":" << (npcUpdates ? npcDriftSum / npcUpdates : 0.0) << ",\"npcUnmatched\":" << npcUnmatched
+            << ",\"npcOrphans\":" << npcOrphans << ",\"playerShielded\":" << (playerShielded ? "true" : "false") << ",\"lastFault\":" << lastFault
             << ",\"slotsRestored\":true,\"accepted\":" << receiver.accepted.load() << ",\"rejected\":" << receiver.rejected.load()
             << ",\"replaced\":" << receiver.replaced.load() << ",\"networkErrors\":" << receiver.errors.load() << "}\n";
         const auto text = out.str(); DWORD written = 0;

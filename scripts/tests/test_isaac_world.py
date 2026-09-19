@@ -48,6 +48,40 @@ class WorldTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             world.encode(frame)
 
+    def test_enemy_section_is_version_two(self):
+        frame = self.frame()
+        tears_only = world.encode(frame)
+        frame["npcs"] = [dict(type=244, variant=0, subtype=0, seed=2078110152, body=[80, 160, 0, 0], target=[80, 160],
+                              hp=[10, 10], state=8, flags=[1, 5, 4]),
+                         dict(type=244, variant=0, subtype=0, seed=2403336305, body=[560, 160, 0.5, -0.25], target=[0, 0],
+                              hp=[7.5, 10], state=4, flags=[0, 5, 0])]
+        packet = world.encode(frame)
+        self.assertEqual((tears_only[4], packet[4], len(packet)), (1, 2, len(tears_only) + 2 * world.NPC.size))
+        self.assertEqual(tears_only[8:88], packet[8:88])
+        self.assertEqual(world.decode(packet), frame)
+        self.assertNotIn("npcs", world.decode(tears_only))
+        self.assertTrue(world.same_npc(world.decode(packet)["npcs"][1], frame["npcs"][1]))
+        for length in range(len(packet)):
+            with self.assertRaises(ValueError):
+                world.decode(packet[:length])
+        for offset, value in ((4, 1), (88, 3), (92, 1)):
+            bad = bytearray(packet); bad[offset] = value
+            with self.assertRaises(ValueError):
+                world.decode(bad)
+        bad = bytearray(tears_only); bad[4] = 2
+        with self.assertRaises(ValueError):
+            world.decode(bad)
+        for change in (dict(seed=2078110152), dict(type=2), dict(type=1000), dict(hp=[float("inf"), 10]), dict(flags=[2, 0, 0])):
+            broken = self.frame(); broken["npcs"] = [dict(npc) for npc in frame["npcs"]]
+            broken["npcs"][1].update(change)
+            with self.assertRaises(ValueError):
+                world.encode(broken)
+        crowded = self.frame()
+        crowded["npcs"] = [dict(frame["npcs"][0], seed=seed) for seed in range(1, world.MAX_NPCS + 2)]
+        with self.assertRaises(ValueError):
+            world.encode(crowded)
+        self.assertEqual((world.MAX_BYTES, world.SLOT_BYTES), (3040, 3072))
+
     def test_slot_generation_session_and_freshness(self):
         packet = world.encode(self.frame())
         blob = world.SLOT.pack(0x31525357, 1, 2, 1, len(packet), 0, 123) + packet + bytes(world.MAX_BYTES - len(packet))
