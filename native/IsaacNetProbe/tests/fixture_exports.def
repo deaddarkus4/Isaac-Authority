@@ -1,0 +1,4 @@
+LIBRARY ProbeRecorderFixture
+EXPORTS
+    FixtureStart=_FixtureStart@4
+    FixtureStop=_FixtureStop@4

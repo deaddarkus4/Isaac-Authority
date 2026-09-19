@@ -1,0 +1,67 @@
+{
+  "gameSha256": "3bdfc8bae0dc7e334b76009d0ad45dfbb16ee5f00c06ffbc3a0094e34d44616b",
+  "scope": "room-transition-between-ordinary-rooms",
+  "gamePointerRva": "0x871678",
+  "startRoomTransitionRva": "0x2fd7c0",
+  "startRoomTransitionPrefix": "558bec6aff68",
+  "startRoomTransitionUnwindRva": "0x6fc200",
+  "startRoomTransitionAbi": "thiscall Game, five stack arguments (roomIndex, direction, animation, player, dimension), ret 0x14",
+  "roomTransitionCoreRva": "0x42ee40",
+  "gameChangeRoomRva": "0x2fe2f0",
+  "levelChangeRoomRva": "0x33fc80",
+  "gameOffsets": {
+    "roomTransition": "0x1b83c",
+    "roomTransitionMode": "0x1b83c",
+    "roomTransitionTargetIndex": "0x1b850",
+    "roomTransitionDirection": "0x1b84c",
+    "roomTransitionDimension": "0x1b854",
+    "roomTransitionAnimation": "0x1b858",
+    "frameCount": "0x264f8",
+    "pauseOrDeathMenu": "0x1d520",
+    "currentRoomIndex": "0x18304",
+    "currentDimension": "0x1830c",
+    "roomCount": "0x182cc",
+    "roomDescriptors": "0x14",
+    "roomDescriptorStride": "0xb8",
+    "roomLookupTable": "0x17adc",
+    "seeds": "0x1bb84",
+    "startSeed": "0x1bb88",
+    "console": "0x68d78"
+  },
+  "roomDescriptorOffsets": {
+    "gridIndex": "0x0",
+    "dimension": "0xc",
+    "config": "0x10",
+    "visits": "0x40",
+    "spawnSeed": "0x5c"
+  },
+  "roomConfigOffsets": {
+    "type": "0x8",
+    "variant": "0xc",
+    "subtype": "0x10",
+    "shape": "0x48"
+  },
+  "seedText": {
+    "parseRva": "0x5eb6b0",
+    "setStartSeedRva": "0x5eb880",
+    "alphabetRva": "0x780d30",
+    "alphabet": "ABCDEFGHJKLMNPQRSTWXYZ01234V6789",
+    "xor": "0x0fef7ffd"
+  },
+  "staticCandidates": {
+    "consoleRunCommandRva": "0x28cdc0",
+    "consoleRunCommandNote": "thiscall Console (Game+0x68d78), arguments (const std::string&, std::string* output, Entity_Player*); never called by this project",
+    "consoleCommandRegistrationRva": "0x286da0"
+  },
+  "validation": {
+    "seedTextMatchesGameLog": true,
+    "levelLayoutReadFromLiveGames": true,
+    "hostDoorTransitionObservedBySource": true,
+    "replicaCarriedThroughByItsOwnDoor": true,
+    "startRoomTransitionCalledInLiveGame": true,
+    "requestedRoomTransitionObserved": true,
+    "returnTransitionObserved": false,
+    "largeRoomOrTeleportObserved": false,
+    "report": "docs/j460-room-transition.md"
+  }
+}

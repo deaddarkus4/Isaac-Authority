@@ -1,0 +1,40 @@
+{
+  "gameSha256": "3bdfc8bae0dc7e334b76009d0ad45dfbb16ee5f00c06ffbc3a0094e34d44616b",
+  "pointerBytes": 4,
+  "imageBaseRelative": true,
+  "gamePointerRva": "0x871678",
+  "managerPointerRva": "0x87169c",
+  "gamePlayerVectorBeginOffset": "0x1baa8",
+  "gamePlayerVectorEndOffset": "0x1baac",
+  "gameRoomPointerOffset": "0x18300",
+  "managerNetworkFrameOffset": "0x4b3e4",
+  "entity": {
+    "indexOffset": "0x20",
+    "typeOffset": "0x28",
+    "variantOffset": "0x2c",
+    "subtypeOffset": "0x30",
+    "positionOffset": "0x33c",
+    "velocityOffset": "0x360"
+  },
+  "roomHistory": {
+    "recordsOffset": "0x1310",
+    "startOffset": "0x1610",
+    "countOffset": "0x1614",
+    "capacity": 32,
+    "recordBytes": 24,
+    "entityRecordBytes": 56
+  },
+  "getPlayerRva": "0x17870",
+  "getPlayerPrefix": "558bec5156578bf98b97acba01008bc28bb7a8ba0100",
+  "framestateDumpRva": "0x4fe3a0",
+  "framestateDiffRva": "0x4ffc70",
+  "validation": {
+    "readOnlyLiveSamplingObserved": true,
+    "liveGameToUdpObserverObserved": true,
+    "crossCheck": "278/290 direct player samples exactly matched pre/post history float32 values within nearby frames in bridge-20260918-182854-db40b789.jsonl",
+    "atomicSnapshotValidated": false,
+    "writeValidated": false,
+    "gameThreadHookValidated": false,
+    "hooksEnabled": false
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "gameSha256": "3bdfc8bae0dc7e334b76009d0ad45dfbb16ee5f00c06ffbc3a0094e34d44616b",
+  "scope": "standard-tears-in-empty-start-room",
+  "gamePointerRva": "0x871678",
+  "roomPointerOffset": "0x18300",
+  "roomEntityListOffset": "0x1258",
+  "entityListDataOffset": 4,
+  "entityListCountOffset": 12,
+  "spawnWrapperRva": "0x28b20",
+  "spawnWrapperPrefix": "558bec83e4f86a00",
+  "spawnAbi": "thiscall, seven stack arguments, ret 0x1c",
+  "tearVtableRva": "0x764eac",
+  "tearUpdateRva": "0x2670f0",
+  "entityRemoveRva": "0x2acb00",
+  "tearStateOffsets": {
+    "height": "0x410",
+    "fallingSpeed": "0x414",
+    "fallingAccel": "0x418",
+    "scale": "0x420"
+  },
+  "validation": {
+    "nativeSpawnUpdateRemoveObserved": true,
+    "realHostTearReplicationObserved": true,
+    "syntheticRoomEpochTeardownObserved": true,
+    "actualRoomTransitionObserved": false,
+    "fullWorldSnapshotValidated": false,
+    "report": "docs/j460-world-tears-test.md"
+  }
+}

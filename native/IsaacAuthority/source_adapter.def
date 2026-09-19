@@ -1,0 +1,6 @@
+LIBRARY IsaacAuthoritySource
+EXPORTS
+    IsaacAuthorityStart=_IsaacAuthorityStart@4
+    IsaacAuthorityCorrectOnce=_IsaacAuthorityCorrectOnce@4
+    IsaacAuthorityStop=_IsaacAuthorityStop@4
+    IsaacAuthoritySourceStart=_IsaacAuthoritySourceStart@4

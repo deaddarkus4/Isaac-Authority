@@ -1,0 +1,213 @@
+{
+  "gameSha256": "3bdfc8bae0dc7e334b76009d0ad45dfbb16ee5f00c06ffbc3a0094e34d44616b",
+  "ghidraVersion": "12.1.3",
+  "fullAnalysisCompleted": false,
+  "analysisLimitSeconds": 300,
+  "targetedExportCompleted": true,
+  "loggerAnalysisCorrection": {
+    "rva": "0x6112c0",
+    "noReturn": false,
+    "callingConvention": "provisional_cdecl_varargs"
+  },
+  "functions": [
+    {
+      "name": "FUN_00902950",
+      "candidateRole": "input_broadcast",
+      "entryRva": "0x502950",
+      "entryVaAtPreferredBase": "0x902950",
+      "fileOffset": "0x501d50",
+      "first32Bytes": "538bdc83ec0883e4f883c404558b6b04896c24048bec6aff685584b00064a100",
+      "decompiled": true,
+      "evidence": [
+        {
+          "needle": "NetInputDevice::broadcast_frame_input",
+          "referenceVa": "009029a1"
+        }
+      ],
+      "runtimeValidated": false,
+      "hooksEnabled": false
+    },
+    {
+      "name": "FUN_00902010",
+      "candidateRole": "input_message_processing",
+      "entryRva": "0x502010",
+      "entryVaAtPreferredBase": "0x902010",
+      "fileOffset": "0x501410",
+      "first32Bytes": "558bec6aff68f583b00064a1000000005083ec5c535657a1b493bf0033c5508d",
+      "decompiled": true,
+      "evidence": [
+        {
+          "needle": "NetInputDevice::ProcessInputMessage",
+          "referenceVa": "00902448"
+        },
+        {
+          "needle": "NetInputDevice::ProcessInputMessage",
+          "referenceVa": "009023cb"
+        },
+        {
+          "needle": "NetInputDevice::ProcessInputMessage",
+          "referenceVa": "009023b0"
+        }
+      ],
+      "runtimeValidated": false,
+      "hooksEnabled": false
+    },
+    {
+      "name": "FUN_008fd900",
+      "candidateRole": "desync_state_machine",
+      "entryRva": "0x4fd900",
+      "entryVaAtPreferredBase": "0x8fd900",
+      "fileOffset": "0x4fcd00",
+      "first32Bytes": "538bdc83ec0883e4f883c404558b6b04896c24048bec6aff68457fb00064a100",
+      "decompiled": true,
+      "evidence": [
+        {
+          "needle": "NetDesyncHandler::process_desync_confirm_message",
+          "referenceVa": "008fdac9"
+        },
+        {
+          "needle": "NetDesyncHandler::process_desync_confirm_message",
+          "referenceVa": "008fda90"
+        }
+      ],
+      "runtimeValidated": false,
+      "hooksEnabled": false
+    },
+    {
+      "name": "FUN_008ffaf0",
+      "candidateRole": "recovery_start",
+      "entryRva": "0x4ffaf0",
+      "entryVaAtPreferredBase": "0x8ffaf0",
+      "fileOffset": "0x4feef0",
+      "first32Bytes": "558bec6aff681d81b00064a1000000005083ec14535657a1b493bf0033c5508d",
+      "decompiled": true,
+      "evidence": [
+        {
+          "needle": "NetDesyncHandler::process_desync_recovery_start_message",
+          "referenceVa": "008ffc22"
+        }
+      ],
+      "runtimeValidated": false,
+      "hooksEnabled": false
+    },
+    {
+      "name": "FUN_00771d30",
+      "candidateRole": "trinket_addition",
+      "entryRva": "0x371d30",
+      "entryVaAtPreferredBase": "0x771d30",
+      "fileOffset": "0x371130",
+      "first32Bytes": "558bec6aff680df1af0064a1000000005083ec24a1b493bf0033c58945f05356",
+      "decompiled": true,
+      "evidence": [
+        {
+          "needle": "Adding trinket",
+          "referenceVa": "00771e41"
+        }
+      ],
+      "runtimeValidated": false,
+      "hooksEnabled": false
+    },
+    {
+      "name": "FUN_0075e1d0",
+      "candidateRole": "queued_item_flush",
+      "entryRva": "0x35e1d0",
+      "entryVaAtPreferredBase": "0x75e1d0",
+      "fileOffset": "0x35d5d0",
+      "first32Bytes": "558bec83ec245356578bf983bfc4170000000f84260100006890acb6006a01e8",
+      "decompiled": true,
+      "evidence": [
+        {
+          "needle": "item queue flush",
+          "referenceVa": "0075e1e8"
+        }
+      ],
+      "runtimeValidated": false,
+      "hooksEnabled": false
+    },
+    {
+      "name": "FUN_00924d10",
+      "candidateRole": "options_write",
+      "entryRva": "0x524d10",
+      "entryVaAtPreferredBase": "0x924d10",
+      "fileOffset": "0x524110",
+      "first32Bytes": "558bec83e4c081ec34010000a1b493bf0033c489842430010000a19c16c70053",
+      "decompiled": true,
+      "evidence": [
+        {
+          "needle": "OnlineInputDelay=%d",
+          "referenceVa": "009255b2"
+        }
+      ],
+      "runtimeValidated": false,
+      "hooksEnabled": false
+    },
+    {
+      "name": "IsaacLog_J460_candidate",
+      "candidateRole": "logging",
+      "entryRva": "0x6112c0",
+      "entryVaAtPreferredBase": "0xa112c0",
+      "fileOffset": "0x6106c0",
+      "first32Bytes": "558bec6aff683d09b10064a1000000005083ec08535657a1b493bf0033c5508d",
+      "decompiled": true,
+      "evidence": [
+        {
+          "needle": "trinket_path_followup",
+          "referenceVa": ""
+        }
+      ],
+      "runtimeValidated": false,
+      "hooksEnabled": false
+    },
+    {
+      "name": "FUN_007ad860",
+      "candidateRole": "trinket_effect_application",
+      "entryRva": "0x3ad860",
+      "entryVaAtPreferredBase": "0x7ad860",
+      "fileOffset": "0x3acc60",
+      "first32Bytes": "558bec83e4f85153568bf157837e2c000f85ba0100008b4508bb000000008bf8",
+      "decompiled": true,
+      "evidence": [
+        {
+          "needle": "trinket_path_followup",
+          "referenceVa": ""
+        }
+      ],
+      "runtimeValidated": false,
+      "hooksEnabled": false
+    },
+    {
+      "name": "FUN_007584b0",
+      "candidateRole": "related_player_notification",
+      "entryRva": "0x3584b0",
+      "entryVaAtPreferredBase": "0x7584b0",
+      "fileOffset": "0x3578b0",
+      "first32Bytes": "558bec515356578b3d7816c70033db8b87acba01008db7a8ba01002b06c1f802",
+      "decompiled": true,
+      "evidence": [
+        {
+          "needle": "trinket_path_followup",
+          "referenceVa": ""
+        }
+      ],
+      "runtimeValidated": false,
+      "hooksEnabled": false
+    },
+    {
+      "name": "FUN_007afc20",
+      "candidateRole": "post_queue_followup",
+      "entryRva": "0x3afc20",
+      "entryVaAtPreferredBase": "0x7afc20",
+      "fileOffset": "0x3af020",
+      "first32Bytes": "558bec83e4f883ec3432d253568bf15783be44130000007f1683be4c13000000",
+      "decompiled": true,
+      "evidence": [
+        {
+          "needle": "trinket_path_followup",
+          "referenceVa": ""
+        }
+      ],
+      "runtimeValidated": false,
+      "hooksEnabled": false
+    }
+  ]
+}

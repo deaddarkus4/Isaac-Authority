@@ -1,0 +1,5 @@
+LIBRARY IsaacNetProbe
+EXPORTS
+    IsaacProbeInspect
+    IsaacProbeStart=_IsaacProbeStart@4
+    IsaacProbeStop=_IsaacProbeStop@4
