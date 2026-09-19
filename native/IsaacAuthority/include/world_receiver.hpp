@@ -32,5 +32,6 @@ struct alignas(8) Published {
     std::uint64_t session = 0;
     std::array<std::uint8_t, kMaxBytes> packet{};
 };
-static_assert(sizeof(Published) == 3072 && offsetof(Published, packet) == 32);
+// The endpoint descriptor states this size: modules built before the player section publish 3072 bytes.
+static_assert(sizeof(Published) == 3168 && offsetof(Published, packet) == 32);
 }

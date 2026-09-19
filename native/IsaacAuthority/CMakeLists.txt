@@ -68,6 +68,13 @@ if(WIN32)
     add_library(IsaacAuthorityNpcReplica SHARED src/world_adapter.cpp npc_replica.def)
     target_compile_definitions(IsaacAuthorityNpcReplica PRIVATE ISAAC_WORLD_ROOMS ISAAC_WORLD_NPCS)
     target_link_libraries(IsaacAuthorityNpcReplica PRIVATE authority_game_support world_receiver)
+    # Rooms, enemies and every player of a co-op run: the snapshot lists all players with their controller.
+    add_library(IsaacAuthorityCoopSource SHARED src/world_adapter.cpp coop_source.def)
+    target_compile_definitions(IsaacAuthorityCoopSource PRIVATE ISAAC_WORLD_SOURCE ISAAC_WORLD_ROOMS ISAAC_WORLD_NPCS ISAAC_WORLD_PLAYERS)
+    target_link_libraries(IsaacAuthorityCoopSource PRIVATE authority_game_support world_receiver)
+    add_library(IsaacAuthorityCoopReplica SHARED src/world_adapter.cpp coop_replica.def)
+    target_compile_definitions(IsaacAuthorityCoopReplica PRIVATE ISAAC_WORLD_ROOMS ISAAC_WORLD_NPCS ISAAC_WORLD_PLAYERS)
+    target_link_libraries(IsaacAuthorityCoopReplica PRIVATE authority_game_support world_receiver)
     # Client input on the host: received commands replace what the game reads from one controller.
     add_library(input_core STATIC src/input_state.cpp)
     target_include_directories(input_core PUBLIC include)
@@ -78,7 +85,7 @@ if(WIN32)
     add_executable(world_tests tests/world_tests.cpp)
     target_link_libraries(world_tests PRIVATE world_receiver)
 endif()
-foreach(target authority_core snapshot_bridge snapshot_receiver snapshot_tests world_core world_receiver world_tests IsaacAuthorityWorldSource IsaacAuthorityWorldReplica IsaacAuthorityRoomSource IsaacAuthorityRoomReplica IsaacAuthorityNpcSource IsaacAuthorityNpcReplica input_core IsaacAuthorityInput input_tests authority_tests IsaacAuthorityLab authority_game_support IsaacAuthorityGame IsaacAuthoritySource IsaacAuthorityNetwork IsaacAuthorityReplica IsaacAuthorityAttach IsaacAuthorityLaunch game_adapter_tests)
+foreach(target authority_core snapshot_bridge snapshot_receiver snapshot_tests world_core world_receiver world_tests IsaacAuthorityWorldSource IsaacAuthorityWorldReplica IsaacAuthorityRoomSource IsaacAuthorityRoomReplica IsaacAuthorityNpcSource IsaacAuthorityNpcReplica IsaacAuthorityCoopSource IsaacAuthorityCoopReplica input_core IsaacAuthorityInput input_tests authority_tests IsaacAuthorityLab authority_game_support IsaacAuthorityGame IsaacAuthoritySource IsaacAuthorityNetwork IsaacAuthorityReplica IsaacAuthorityAttach IsaacAuthorityLaunch game_adapter_tests)
     if(TARGET ${target} AND MSVC)
         target_compile_options(${target} PRIVATE /W4 /WX /permissive- /utf-8)
     endif()
@@ -100,7 +107,8 @@ if(WIN32)
     set_tests_properties(snapshot_receiver snapshot_two_processes PROPERTIES TIMEOUT 12)
     add_test(NAME world_protocol_lifecycle COMMAND world_tests $<TARGET_FILE:IsaacAuthorityWorldSource> $<TARGET_FILE:IsaacAuthorityWorldReplica>
         $<TARGET_FILE:IsaacAuthorityRoomSource> $<TARGET_FILE:IsaacAuthorityRoomReplica>
-        $<TARGET_FILE:IsaacAuthorityNpcSource> $<TARGET_FILE:IsaacAuthorityNpcReplica>)
+        $<TARGET_FILE:IsaacAuthorityNpcSource> $<TARGET_FILE:IsaacAuthorityNpcReplica>
+        $<TARGET_FILE:IsaacAuthorityCoopSource> $<TARGET_FILE:IsaacAuthorityCoopReplica>)
     add_test(NAME input_commands COMMAND input_tests $<TARGET_FILE:IsaacAuthorityInput>)
     add_test(NAME world_two_processes COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../scripts/Test-IsaacWorld.py --fixture $<TARGET_FILE:world_tests>)

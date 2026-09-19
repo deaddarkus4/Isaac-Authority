@@ -59,7 +59,7 @@ def wait_frame(process, endpoint, sequence=None, timeout=1.5):
 def equal_frame(expected, actual):
     if expected["epoch"] != actual["epoch"] or expected["room"] != actual["room"]:
         return False
-    if struct.pack("<4f", *expected["player"]) != struct.pack("<4f", *actual["player"]):
+    if struct.pack("<4f", *expected["player"]) != struct.pack("<4f", *actual["player"]) or not world.same_players(expected, actual):
         return False
     a = {entity["id"]: entity for entity in expected["entities"]}
     b = {entity["id"]: entity for entity in actual["entities"]}

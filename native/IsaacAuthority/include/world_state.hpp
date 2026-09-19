@@ -4,8 +4,8 @@
 #include <cstdint>
 
 namespace authority::world {
-constexpr std::size_t kMaxEntities = 16, kMaxNpcs = 32, kHeader = 96, kRecord = 56, kNpcRecord = 64,
-    kMaxBytes = kHeader + kMaxEntities * kRecord + kMaxNpcs * kNpcRecord;
+constexpr std::size_t kMaxEntities = 16, kMaxNpcs = 32, kMaxPlayers = 4, kHeader = 96, kRecord = 56, kNpcRecord = 64,
+    kPlayerRecord = 24, kMaxBytes = kHeader + kMaxEntities * kRecord + kMaxNpcs * kNpcRecord + kMaxPlayers * kPlayerRecord;
 constexpr std::uint64_t kMaxAgeMs = 250, kDurationMs = 30000;
 struct RoomKey {
     std::uint32_t stage = 0, stageType = 0, index = 0, dimension = 0;
@@ -32,6 +32,9 @@ struct Npc {
     std::uint32_t visible = 0, gridCollision = 0, entityCollision = 0;
 };
 bool SameNpc(const Npc& a, const Npc& b);
+// A player of the host's game. Players join in the same order in both games, so the place in the list is the
+// identity; the controller index says whose input drives this player on the host (two may share one controller).
+struct Player { std::uint32_t controller = 0; Body body; };
 struct Frame;
 // Death is the host's decision: true when its previous snapshot of this room generation listed the enemy and the
 // next one no longer does. An enemy the host never listed is not the replica's to kill.
@@ -40,7 +43,8 @@ struct Frame {
     std::uint64_t session = 0, timeMs = 0;
     std::uint32_t epoch = 1, sequence = 0;
     RoomKey room;
-    Body player;
+    std::uint32_t playerCount = 1;
+    std::array<Player, kMaxPlayers> players{};
     std::uint32_t count = 0;
     std::array<Entity, kMaxEntities> entities{};
     std::uint32_t npcCount = 0;

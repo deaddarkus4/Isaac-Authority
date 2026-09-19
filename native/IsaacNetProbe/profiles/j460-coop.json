@@ -1,0 +1,52 @@
+{
+  "gameSha256": "3bdfc8bae0dc7e334b76009d0ad45dfbb16ee5f00c06ffbc3a0094e34d44616b",
+  "scope": "all-players-of-a-coop-run-in-the-world-snapshot",
+  "playerListVector": "Game+0x1baa8 (begin) / +0x1baac (end), 4-byte pointers, join order; REPENTOGON names it PlayerManager._playerList",
+  "playerControllerIndexOffset": "0x1618",
+  "playerIdentity": "place in the player list; two players may share a controller, so the controller index only says whose input drives the player on the host",
+  "updateOrder": "the game updates players in list order: 0 surprises on host and replica over 450 steps",
+  "leadingUpdate": {
+    "source": "captures after the update of the last listed player",
+    "replica": "applies the snapshot with the update of the first listed player; the others are held in the body of the last snapshot"
+  },
+  "wire": {
+    "version": 3,
+    "playerCountField": "header +92, 1..4, zero in versions 1 and 2",
+    "playerRecordBytes": 24,
+    "playerRecord": "controller u32 (0..7), position x/y and velocity x/y as float32, reserved u32 = 0",
+    "section": "last, after the enemy section; its first record repeats the header's body bit for bit",
+    "spelling": "one player on controller 0 is written only as version 1 or 2; version 3 otherwise",
+    "publishedSlotBytes": 3168,
+    "legacyPublishedSlotBytes": 3072
+  },
+  "modules": {
+    "source": "IsaacAuthorityCoopSource",
+    "replica": "IsaacAuthorityCoopReplica",
+    "compileFlags": ["ISAAC_WORLD_ROOMS", "ISAAC_WORLD_NPCS", "ISAAC_WORLD_PLAYERS"],
+    "secondPlayerCreation": "the input module presses join (19) and menuConfirm (14) for a free controller in both games"
+  },
+  "validation": {
+    "liveTwoGames": true,
+    "framesAppliedOfTransmitted": "450 of 450",
+    "allStatesMatchFloat32": true,
+    "secondPlayerDrivenByClientCommands": true,
+    "commandsAcceptedOfSent": "480 of 480",
+    "tearsOfBothPlayersReplicated": true,
+    "playerDistanceAtEnd": [0.0, 0.0],
+    "slotsRestored": true,
+    "roomTransitionWithTwoPlayers": false,
+    "enemiesWithTwoPlayers": false,
+    "joinRequiresExistingSecondDevice": true,
+    "report": "docs/j460-coop-players-test.md",
+    "summary": "coop-20260919-230429-841746"
+  },
+  "candidatesFromRepentogonSignatures": {
+    "note": "found by byte signature in the J460 image, exactly one match each; none has been called or otherwise verified",
+    "PlayerManager::SpawnCoPlayer2(int playerType)": "0x5b9cd0",
+    "PlayerManager::SpawnCoPlayerBaby(int babyID)": "0x5b98e0",
+    "PlayerManager::Update": "0x5bb5d0",
+    "PlayerManager::IsCoopPlay": "0x5bf990",
+    "Game::IsPaused": "0x2fd350",
+    "report": "docs/repentogon-reference.md"
+  }
+}

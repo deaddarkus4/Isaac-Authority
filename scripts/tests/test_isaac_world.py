@@ -80,7 +80,56 @@ class WorldTests(unittest.TestCase):
         crowded["npcs"] = [dict(frame["npcs"][0], seed=seed) for seed in range(1, world.MAX_NPCS + 2)]
         with self.assertRaises(ValueError):
             world.encode(crowded)
-        self.assertEqual((world.MAX_BYTES, world.SLOT_BYTES), (3040, 3072))
+        self.assertEqual((world.MAX_BYTES, world.SLOT_BYTES, world.LEGACY_SLOT_BYTES), (3136, 3168, 3072))
+
+    def test_player_section_is_version_three(self):
+        frame = self.frame()
+        alone = world.encode(frame)
+        self.assertEqual(world.players(frame), [dict(controller=0, body=[320, 280, 0, 0])])
+        frame["players"] = [dict(controller=0, body=[320, 280, 0, 0]), dict(controller=1, body=[200, 300, -4.5, 0.25])]
+        packet = world.encode(frame)
+        self.assertEqual((alone[4], alone[92], packet[4], packet[92], len(packet)), (1, 0, 3, 2, len(alone) + 2 * world.PLAYER.size))
+        self.assertEqual((alone[8:92], alone[96:]), (packet[8:92], packet[96:len(alone)]))
+        self.assertEqual(world.decode(packet), frame)
+        self.assertNotIn("players", world.decode(alone))
+        for length in range(len(packet)):
+            with self.assertRaises(ValueError):
+                world.decode(packet[:length])
+        # version without a section, wrong count, no section, reserved field, header against first record, controller
+        for offset, value in ((4, 1), (92, 3), (92, 0), (len(packet) - 4, 1), (68, packet[68] ^ 1), (len(packet) - world.PLAYER.size, 8)):
+            bad = bytearray(packet); bad[offset] = value
+            with self.assertRaises(ValueError):
+                world.decode(bad)
+        enemies = dict(frame, npcs=[dict(type=244, variant=0, subtype=0, seed=2078110152, body=[80, 160, 0, 0], target=[80, 160],
+                                         hp=[10, 10], state=8, flags=[1, 5, 4])])
+        packet = world.encode(enemies)
+        self.assertEqual((packet[4], len(packet)), (3, len(alone) + world.NPC.size + 2 * world.PLAYER.size))
+        self.assertEqual(world.decode(packet), enemies)
+        lone = dict(self.frame(), players=[dict(controller=1, body=[320, 280, 0, 0])])
+        self.assertEqual(world.decode(world.encode(lone)), lone)
+        for listed in ([dict(controller=0, body=[320, 280, 0, 0])], [], [dict(controller=1, body=[321, 280, 0, 0])],
+                       [dict(controller=0, body=[320, 280, 0, 0])] * 5,
+                       [dict(controller=0, body=[320, 280, 0, 0]), dict(controller=1, body=[float("nan"), 0, 0, 0])]):
+            with self.assertRaises(ValueError):
+                world.encode(dict(self.frame(), players=listed))
+        shared = dict(self.frame(), players=[dict(controller=0, body=[320, 280, 0, 0])] * 2)
+        self.assertEqual(world.decode(world.encode(shared)), shared)
+        moved = dict(frame, players=[frame["players"][0], dict(controller=1, body=[201, 300, -4.5, 0.25])])
+        self.assertTrue(world.same_players(frame, world.decode(world.encode(frame))))
+        self.assertFalse(world.same_players(frame, moved))
+        self.assertFalse(world.same_players(frame, self.frame()))
+
+    def test_slot_of_an_older_module(self):
+        packet = world.encode(self.frame())
+        blob = world.SLOT.pack(0x31525357, 1, 2, 1, len(packet), 0, 123) + packet
+        sizes = []
+        def read(address, size):
+            sizes.append(size)
+            return blob[8:12] if size == 4 else blob + bytes(size - len(blob))
+        self.assertEqual(world.read_slot(read, dict(address=0x10000, session="123", bytes=3072), 1000)[0], self.frame())
+        self.assertEqual(max(sizes), 3072)
+        with self.assertRaises(ValueError):
+            world.read_slot(read, dict(address=0x10000, session="123", bytes=4096), 1000)
 
     def test_slot_generation_session_and_freshness(self):
         packet = world.encode(self.frame())

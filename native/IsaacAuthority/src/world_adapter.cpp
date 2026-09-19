@@ -27,7 +27,14 @@ constexpr bool kNpcs = true;
 #else
 constexpr bool kNpcs = false;
 #endif
+#ifdef ISAAC_WORLD_PLAYERS
+constexpr bool kPlayers = true;
+#else
+constexpr bool kPlayers = false;
+#endif
 constexpr std::uintptr_t kPlayerTable = 0x76bdd0, kPlayerUpdate = 0x382af0;
+// Entity_Player::ControllerIndex: whose input drives this player.
+constexpr std::uintptr_t kController = 0x1618;
 // Entity_NPC shares the entity vtable layout: slot 3 is Update.
 constexpr std::uintptr_t kNpcTable = 0x767468, kNpcUpdate = 0x2c4b30;
 // What Lua's entity:Kill() runs: builds an empty damage source and calls the virtual Kill (slot 9).
@@ -36,11 +43,15 @@ constexpr std::uintptr_t kTearTable = 0x764eac, kTearUpdate = 0x2670f0, kRemove 
 // Game::StartRoomTransition only latches a request in RoomTransition (Game+0x1b83c); the game loads the room later.
 constexpr std::uintptr_t kTransition = 0x2fd7c0, kTransitionUnwind = 0x6fc200, kRoomTransition = 0x1b83c;
 constexpr std::uint64_t kTravelMs = 5000, kSettleMs = 1500;
-constexpr unsigned kLocalGrace = 90, kFade = 1;
+// Updates, not steps: every player of a co-op run spends the grace of an unreadable room.
+constexpr unsigned kLocalGrace = kPlayers ? 90 * kMaxPlayers : 90, kFade = 1;
 using Update = void(__thiscall*)(void*);
 using Spawn = void*(__thiscall*)(void*, unsigned, unsigned, const Vec&, const Vec&, void*, unsigned, unsigned);
 using Transition = void(__thiscall*)(void*, int, int, unsigned, void*, int);
+// Every player of the run in list order; target is the first of them.
+struct Team { std::array<std::uintptr_t, kMaxPlayers> players{}; unsigned count = 0; };
 std::uintptr_t base = 0, target = 0;
+Team team;
 std::uint32_t targetSeed = 0;
 RoomKey localRoom;
 Update originalPlayer = nullptr, originalTear = nullptr, originalNpc = nullptr;
@@ -73,8 +84,11 @@ std::array<Adopted, kMaxNpcs> adopted{};
 unsigned npcKilled = 0, npcKillUnconfirmed = 0, npcCorrections = 0, npcUpdates = 0, npcStateDrift = 0, npcVisibleDrift = 0, npcUnmatched = 0, npcOrphans = 0, lastFault = 0;
 float npcDriftMax = 0;
 double npcDriftSum = 0;
-std::uint32_t playerCollision = 0;
+std::array<std::uint32_t, kMaxPlayers> playerCollision{};
 bool playerShielded = false;
+// Which player the game updated last, and how often the list order was not the update order.
+int lastUpdated = -1;
+unsigned orderSurprises = 0, rosterMismatches = 0;
 struct Tracked { std::uintptr_t address = 0; std::uint32_t localIndex = 0; Entity state; };
 std::array<Tracked, kMaxEntities> tracked{};
 struct Record { std::uint64_t now = 0; DWORD thread = 0; unsigned created = 0, removed = 0, action = 0; Frame frame; };
@@ -101,14 +115,29 @@ bool Describe(std::uintptr_t game, std::uint32_t index, std::uint32_t dimension,
     return Read(desc + 0x10, data) && Read(data + 8, key.type) && Read(data + 0xc, key.variant) && Read(data + 0x48, key.shape) &&
         Read(desc + 0x5c, key.spawnSeed) && Read(desc + 0x40, key.visits);
 }
-bool Local(std::uintptr_t& game, std::uintptr_t& room, std::uintptr_t& player, RoomKey& key) {
+bool Local(std::uintptr_t& game, std::uintptr_t& room, Team& found, RoomKey& key) {
     std::uintptr_t manager = 0, begin = 0, end = 0, netBegin = 0, netEnd = 0;
     std::uint32_t index = 0, dimension = 0;
-    return Read(base + 0x871678, game) && Read(base + 0x87169c, manager) &&
-        Read(manager + 0x4b3d8, netBegin) && Read(manager + 0x4b3dc, netEnd) && netBegin == netEnd &&
-        Read(game + 0x1baa8, begin) && Read(game + 0x1baac, end) && end - begin == 4 && Read(begin, player) &&
-        Read(game + 0x18300, room) && room >= 0x10000 && Read(game + 0x18304, index) && Read(game + 0x1830c, dimension) &&
+    if (!Read(base + 0x871678, game) || !Read(base + 0x87169c, manager) ||
+        !Read(manager + 0x4b3d8, netBegin) || !Read(manager + 0x4b3dc, netEnd) || netBegin != netEnd ||
+        !Read(game + 0x1baa8, begin) || !Read(game + 0x1baac, end) || end <= begin || (end - begin) % 4) return false;
+    // Only the modules built for several players accept a co-op run.
+    found = {}; found.count = static_cast<unsigned>((end - begin) / 4);
+    if (found.count > (kPlayers ? kMaxPlayers : 1)) return false;
+    for (unsigned i = 0; i < found.count; ++i) if (!Read(begin + i * 4, found.players[i])) return false;
+    return Read(game + 0x18300, room) && room >= 0x10000 && Read(game + 0x18304, index) && Read(game + 0x1830c, dimension) &&
         Describe(game, index, dimension, key);
+}
+bool SameTeam(const Team& a, const Team& b) { return a.count == b.count && a.players == b.players; }
+// Bodies of the whole team in list order. The source also says which controller drives each player.
+bool ReadPlayers(Frame& frame, bool controllers) {
+    frame.playerCount = team.count;
+    for (unsigned i = 0; i < team.count; ++i) {
+        std::int32_t controller = 0;
+        if (!ReadBody(team.players[i], frame.players[i].body) || (controllers && !Read(team.players[i] + kController, controller))) return false;
+        if (controllers) frame.players[i].controller = static_cast<std::uint32_t>(controller);
+    }
+    return true;
 }
 bool List(std::uintptr_t room, std::array<std::uintptr_t, 4096>& pointers, unsigned& count) {
     std::uintptr_t data = 0; unsigned capacity = 0;
@@ -149,13 +178,15 @@ bool KillNpc(std::uintptr_t address) {
     __try { reinterpret_cast<Update>(base + kKill)(reinterpret_cast<void*>(address)); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
-// The replica's enemies fight their own simulation; its held player must not take their hits.
+// The replica's enemies fight their own simulation; its held players must not take their hits.
 bool Shield(bool on) {
     __try {
-        auto& collision = *reinterpret_cast<std::uint32_t*>(target + 0x188);
-        if (on) { if (!playerShielded) { playerCollision = collision; playerShielded = true; } collision = 0; }
-        else if (playerShielded) { collision = playerCollision; playerShielded = false; }
-        return true;
+        for (unsigned i = 0; i < team.count; ++i) {
+            auto& collision = *reinterpret_cast<std::uint32_t*>(team.players[i] + 0x188);
+            if (on) { if (!playerShielded) playerCollision[i] = collision; collision = 0; }
+            else if (playerShielded) collision = playerCollision[i];
+        }
+        playerShielded = on; return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 bool WriteBody(std::uintptr_t address, const Body& body) {
@@ -235,7 +266,7 @@ bool Capture(std::uintptr_t room, Frame& frame) {
     std::array<Identity, kMaxEntities> identities{}; std::array<std::uint32_t, kMaxEntities> assigned{};
     // lastFault: 1 list or player, 2 entity or tear read, 3 too many tears, 4 enemy read, 5 too many enemies,
     // 6 network ids, 7 value outside the wire format.
-    if (!List(room, pointers, count) || !ReadBody(target, frame.player)) { lastFault = 1; return false; }
+    if (!List(room, pointers, count) || !ReadPlayers(frame, kPlayers)) { lastFault = 1; return false; }
     for (unsigned i = 0; i < count; ++i) {
         std::uint32_t type = 0; unsigned char exists = 0, dead = 0; std::uintptr_t table = 0;
         if (!Read(pointers[i], table) || !Read(pointers[i] + 0x28, type) || !Read(pointers[i] + 0x172, exists) ||
@@ -290,6 +321,8 @@ bool Adopt(std::uintptr_t game, const Frame& frame, Frame& readback) {
 }
 bool Apply(std::uintptr_t game, const Frame& frame, Frame& readback) {
     Delta delta;
+    // The host's players are this game's players one to one; a different number of them cannot be shown.
+    if (frame.playerCount != team.count) { ++rosterMismatches; return false; }
     if (!Plan(haveFrame ? lastFrame : Frame{}, frame, delta)) return false;
     for (auto& entry : tracked) if (entry.address) {
         bool found = false;
@@ -315,13 +348,14 @@ bool Apply(std::uintptr_t game, const Frame& frame, Frame& readback) {
             !Tear(match->address, actual)) return false;
         match->state = entity; actual.id = entity.id; readback.entities[i] = actual;
     }
-    if (!WriteBody(target, frame.player) || !ReadBody(target, readback.player)) return false;
+    for (unsigned i = 0; i < team.count; ++i) if (!WriteBody(team.players[i], frame.players[i].body)) return false;
+    if (!ReadPlayers(readback, false)) return false;
     if (kNpcs) { if (!Adopt(game, frame, readback) || !Shield(true)) return false; }
     lastFrame = frame; haveFrame = true; return true;
 }
 bool HeldReadback(Frame& frame) {
     frame = lastFrame; frame.npcCount = 0; // Held enemies keep their last host state; only tears are read back here.
-    if (!ReadBody(target, frame.player)) return false;
+    if (!ReadPlayers(frame, false)) return false;
     for (unsigned i = 0; i < frame.count; ++i) {
         bool found = false;
         for (const auto& entry : tracked) if (entry.address && entry.state.id == frame.entities[i].id) {
@@ -375,8 +409,26 @@ void __fastcall OnPlayer(void* object, void*) {
     if (!running.load(std::memory_order_acquire)) { originalPlayer(object); active.fetch_sub(1); return; }
     DWORD empty = 0; owner.compare_exchange_strong(empty, GetCurrentThreadId());
     if (owner.load() != GetCurrentThreadId()) { originalPlayer(object); active.fetch_sub(1); return; }
-    std::uintptr_t game = 0, room = 0, player = 0; RoomKey key; std::uint32_t seed = 0;
-    const bool local = Local(game, room, player, key) && player == reinterpret_cast<std::uintptr_t>(object) && Read(player + 0x3ec, seed);
+    const auto self = reinterpret_cast<std::uintptr_t>(object);
+    std::uintptr_t game = 0, room = 0; Team found; RoomKey key; std::uint32_t seed = 0; unsigned index = 0;
+    bool local = Local(game, room, found, key) && Read(found.players[0] + 0x3ec, seed);
+    if (local) { while (index < found.count && found.players[index] != self) ++index; local = index < found.count; }
+    if (kPlayers) {
+        if (local && found.count > 1) {
+            if (lastUpdated >= 0 && index != (static_cast<unsigned>(lastUpdated) + 1) % found.count) ++orderSurprises;
+            lastUpdated = static_cast<int>(index);
+            // One update per game step carries the step: the source captures after its last player, the replica
+            // applies with its first. The other players are only held, or left to the game.
+            if (index != (kSource ? found.count - 1 : 0)) {
+                const bool held = !kSource && haveFrame && !traveling && SameTeam(found, team);
+                if (held) {
+                    if (!WriteBody(self, lastFrame.players[index].body)) ++faults;
+                    ++playerHolds;
+                } else originalPlayer(object);
+                active.fetch_sub(1, std::memory_order_release); return;
+            }
+        }
+    }
     const bool expired = stopRequested.load() || GetTickCount64() > deadline;
     // A room being loaded may be unreadable for a few updates: publish nothing and let the game run.
     if (kRooms) {
@@ -389,7 +441,7 @@ void __fastcall OnPlayer(void* object, void*) {
     // Suppressing the player update does not disable doors: a player held in a doorway is carried through by the
     // replica's own game. That is a new place to follow the host from, not a foreign context.
     const bool relocated = kRooms && !kSource && elsewhere;
-    const bool contextMismatch = !local || (!kSource && (player != target || seed != targetSeed || (elsewhere && !relocated)));
+    const bool contextMismatch = !local || (!kSource && (!SameTeam(found, team) || seed != targetSeed || (elsewhere && !relocated)));
     if (contextMismatch || expired) {
         if (contextMismatch) ++contextChanges;
         if (!kSource) Clear();
@@ -397,11 +449,12 @@ void __fastcall OnPlayer(void* object, void*) {
         originalPlayer(object); active.fetch_sub(1); return;
     }
     if (kSource) {
-        if (player != target || seed != targetSeed || !SameRoom(key, localRoom)) {
-            ++sourceEpoch; ids.Reset(); localRoom = key; target = player; targetSeed = seed; ++contextChanges;
+        // A player who joined or left starts a new generation too: the roster is part of the context.
+        if (!SameTeam(found, team) || seed != targetSeed || !SameRoom(key, localRoom)) {
+            ++sourceEpoch; ids.Reset(); localRoom = key; team = found; target = found.players[0]; targetSeed = seed; ++contextChanges;
         }
         originalPlayer(object);
-        if (!Local(game, room, player, key) || player != target || !Read(player + 0x3ec, seed)) {
+        if (!Local(game, room, found, key) || !SameTeam(found, team) || !Read(target + 0x3ec, seed)) {
             InvalidatePublication(); active.fetch_sub(1); return;
         }
         if (seed != targetSeed || !SameRoom(key, localRoom)) {
@@ -427,7 +480,7 @@ void __fastcall OnPlayer(void* object, void*) {
         } else if (GetTickCount64() > travelDeadline) { ++faults; Clear(); InvalidatePublication(); running = false; cleaned = true; }
     } else {
         if (haveFrame) {
-            if (!WriteBody(target, lastFrame.player)) ++faults;
+            if (!WriteBody(target, lastFrame.players[0].body)) ++faults;
             if (kNpcs) { if (!Shield(true)) ++faults; }
             ++playerHolds;
         } else originalPlayer(object);
@@ -467,7 +520,16 @@ void FrameJson(std::ostringstream& out, const Frame& f) {
     out << "\"sequence\":" << f.sequence << ",\"epoch\":" << f.epoch << ",\"timeMs\":" << f.timeMs << ",\"room\":["
         << f.room.stage << ',' << f.room.stageType << ',' << f.room.index << ',' << f.room.dimension << ',' << f.room.type << ','
         << f.room.variant << ',' << f.room.shape << ',' << f.room.spawnSeed << ',' << f.room.visits << "],\"player\":";
-    BodyJson(out, f.player); out << ",\"entities\":[";
+    BodyJson(out, f.players[0].body);
+    // Listed exactly when the wire format lists them: more than one player, or a first player not on controller 0.
+    if (f.playerCount != 1 || f.players[0].controller) {
+        out << ",\"players\":[";
+        for (unsigned i = 0; i < f.playerCount; ++i) {
+            out << (i ? "," : "") << "{\"controller\":" << f.players[i].controller << ",\"body\":"; BodyJson(out, f.players[i].body); out << '}';
+        }
+        out << ']';
+    }
+    out << ",\"entities\":[";
     for (unsigned i = 0; i < f.count; ++i) {
         const auto& e = f.entities[i]; if (i) out << ',';
         out << "{\"id\":" << e.id << ",\"seed\":" << e.seed << ",\"type\":" << e.type << ",\"variant\":" << e.variant
@@ -526,8 +588,9 @@ extern "C" DWORD WINAPI IsaacAuthorityWorldStart(void*) noexcept {
         if (!GetModuleFileNameW(nullptr, image, 32768) || !isaac_probe::AnalyzeBytes(isaac_probe::ReadFile(image)).supported) return ERROR_BAD_EXE_FORMAT;
         base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
         std::uintptr_t game = 0, room = 0;
-        if (!Local(game, room, target, localRoom) || !Read(target + 0x3ec, targetSeed) ||
+        if (!Local(game, room, team, localRoom) || !Read(team.players[0] + 0x3ec, targetSeed) ||
             localRoom.type != 1 || localRoom.variant != 2 || localRoom.shape != 1) return ERROR_NOT_READY;
+        target = team.players[0];
         Frame initial; initial.session = 1; initial.sequence = 1; initial.room = localRoom; ids.Reset();
         if (!Capture(room, initial) || initial.count) return ERROR_NOT_READY;
         playerSlot = reinterpret_cast<void**>(base + kPlayerTable + 12);
@@ -574,11 +637,12 @@ extern "C" DWORD WINAPI IsaacAuthorityWorldStart(void*) noexcept {
         traveling = false; travelFrame = {}; travelDeadline = 0; transitions = arrivals = levelMismatches = localFailures = 0;
         selfMoves = vanished = settled = 0; departedEpoch = 0; relocatedAt = 0;
         adopted = {}; npcKilled = npcKillUnconfirmed = npcCorrections = npcUpdates = npcStateDrift = npcVisibleDrift = npcUnmatched = npcOrphans = lastFault = 0;
-        npcDriftMax = 0; npcDriftSum = 0; playerCollision = 0; playerShielded = false;
+        npcDriftMax = 0; npcDriftSum = 0; playerCollision = {}; playerShielded = false;
+        lastUpdated = -1; orderSurprises = rosterMismatches = 0;
         stopRequested = false; cleaned = false; owner = 0;
         published = Published{}; published.session = session;
         const auto directory = Directory(); std::filesystem::create_directories(directory / L"logs");
-        const std::wstring role = std::wstring(kNpcs ? L"npc-" : kRooms ? L"room-" : L"world-") + (kSource ? L"source-" : L"replica-");
+        const std::wstring role = std::wstring(kPlayers ? L"coop-" : kNpcs ? L"npc-" : kRooms ? L"room-" : L"world-") + (kSource ? L"source-" : L"replica-");
         const auto unique = role + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(session);
         const auto log = directory / L"logs" / (unique + L".jsonl");
         report = CreateFileW(log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -629,7 +693,8 @@ extern "C" DWORD WINAPI IsaacAuthorityWorldStop(void*) noexcept {
     try {
         std::ostringstream out; out.precision(9);
         out << "{\"type\":\"start\",\"role\":\"" << (kSource ? "source" : "replica") << "\",\"scope\":\""
-            << (kNpcs ? "standard-tears-rooms-enemies" : kRooms ? "standard-tears-rooms" : "standard-tears") << "\",\"worldSnapshot\":false}\n";
+            << (kPlayers ? "standard-tears-rooms-enemies-players" : kNpcs ? "standard-tears-rooms-enemies" : kRooms ? "standard-tears-rooms" : "standard-tears")
+            << "\",\"worldSnapshot\":false}\n";
         for (unsigned i = 0; i < frameCount; ++i) {
             const auto& r = records[i];
             out << "{\"type\":\"frame\",\"observedMs\":" << r.now << ",\"thread\":" << r.thread << ",\"created\":" << r.created << ",\"removed\":" << r.removed << ",\"action\":" << r.action << ',';
@@ -645,6 +710,7 @@ extern "C" DWORD WINAPI IsaacAuthorityWorldStop(void*) noexcept {
             << ",\"npcStateDrift\":" << npcStateDrift << ",\"npcVisibleDrift\":" << npcVisibleDrift << ",\"npcDriftMax\":" << npcDriftMax
             << ",\"npcDriftMean\":" << (npcUpdates ? npcDriftSum / npcUpdates : 0.0) << ",\"npcUnmatched\":" << npcUnmatched
             << ",\"npcOrphans\":" << npcOrphans << ",\"npcKilled\":" << npcKilled << ",\"npcKillUnconfirmed\":" << npcKillUnconfirmed << ",\"playerShielded\":" << (playerShielded ? "true" : "false") << ",\"lastFault\":" << lastFault
+            << ",\"players\":" << team.count << ",\"rosterMismatches\":" << rosterMismatches << ",\"updateOrderSurprises\":" << orderSurprises
             << ",\"slotsRestored\":true,\"accepted\":" << receiver.accepted.load() << ",\"rejected\":" << receiver.rejected.load()
             << ",\"replaced\":" << receiver.replaced.load() << ",\"networkErrors\":" << receiver.errors.load() << "}\n";
         const auto text = out.str(); DWORD written = 0;

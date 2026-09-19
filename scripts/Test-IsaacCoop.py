@@ -1,0 +1,272 @@
+"""Two players of the host's run on the replica. The host publishes every player with its controller index: the first is
+driven by the HOST keyboard, the second by client commands over UDP. The replica, which created its own second player the
+same way, shows both. One shared first room, no door."""
+import argparse
+import datetime
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import struct
+import subprocess
+import time
+import isaac_input as commands
+import isaac_world as world
+
+
+def module(name, filename):
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(filename))
+    result = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(result)
+    return result
+
+
+rooms = module("room_test", "Test-IsaacRoom.py")
+pair, reader, tears = rooms.pair, rooms.reader, rooms.tears
+CONTROLLER_INDEX = 0x1618
+SLOTS = ((0x76BDD0 + 12, 0x382AF0, "player update"), (0x764EAC + 12, 0x2670F0, "tear update"), (0x782950 + 29 * 4, 0x620FB0, "input manager"))
+UP, RIGHT = chr(0x26), chr(0x27)
+# The first player: (ms, key, down). It walks left while the second walks right, shoots up, walks back.
+KEYS = [(1000, "A", True), (1700, "A", False), (3400, UP, True), (4000, UP, False), (5200, "D", True), (5900, "D", False)]
+# The second player: (from ms, move, shoot) until the next row. The last row is rest, so both games end standing still.
+# A restarted run puts the players near the bottom wall of the first room, so the vertical walk goes up.
+CLIENT = [(0, (0, 0), (0, 0)), (1000, (1, 0), (0, 0)), (1700, (0, 0), (0, 0)), (2600, (0, -1), (0, 0)), (3100, (0, 0), (0, 0)),
+          (4200, (0, 0), (1, 0)), (4800, (0, 0), (0, 0)), (5200, (-1, 0), (0, 0)), (5900, (0, 0), (0, 0))]
+DURATION = 7500
+# What each player must have done on the host, from its own frames: (name, from ms, to ms, player, axis, sign or 0 for "stays").
+EXPECTED = [("first walks left", 1000, 1900, 0, 0, -1), ("second walks right", 1000, 1900, 1, 0, 1),
+            ("second walks up", 2600, 3300, 1, 1, -1), ("first stays", 2600, 3300, 0, 1, 0),
+            ("first walks right", 5200, 6100, 0, 0, 1), ("second walks left", 5200, 6100, 1, 0, -1)]
+
+
+def team(process):
+    """Players in list order with the controller index that drives each."""
+    return [dict(position=p["position"], velocity=p["velocity"],
+                 controller=struct.unpack("<i", process.read(int(p["address"], 16) + CONTROLLER_INDEX, 4))[0])
+            for p in reader.sample(process.read, process.base)["players"]]
+
+
+def join(pid, role, controller, invoke, dll, directory):
+    """The game creates the second player itself: a free controller presses the co-op join button and confirms the character."""
+    process = reader.WindowsProcess(pid)
+    try:
+        before = team(process)
+        if len(before) == 2 and before[1]["controller"] == controller:
+            return "present"
+        if len(before) != 1:
+            raise RuntimeError(f"{role} has {len(before)} players; restart its run")
+        control = pair.HostWindow(pid)  # focus only: the join is a menu of the focused game
+        rooms.wait_running(process, role, control)
+        invoke("input", pid, dll)
+        try:
+            endpoint = json.loads((directory / f"input-host-{pid}.json").read_text())
+            address, sequence = ("127.0.0.1", endpoint["port"]), 0
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+                for name, seconds in (("before", 0.5), ("join", 0.3), ("choice", 1.2), ("menuConfirm", 0.3), ("after", 2.0)):
+                    until = time.monotonic() + seconds
+                    while time.monotonic() < until:
+                        control.require_focus()
+                        sequence += 1
+                        udp.sendto(commands.encode(endpoint["session"], sequence, pair.uptime_ms(), controller, (0, 0), (0, 0),
+                                                   (name,) if name in commands.BUTTONS else ()), address)
+                        time.sleep(1 / 60)
+        finally:
+            invoke("input-stop", pid, dll)
+        after = team(process)
+        if len(after) != 2 or after[1]["controller"] != controller:
+            raise RuntimeError(f"{role} did not create a second player for controller {controller}: {after}")
+        return "joined"
+    finally:
+        process.close()
+
+
+def run(args):
+    if not args.source_pid or not args.replica_pid or args.source_pid == args.replica_pid:
+        raise RuntimeError("Specify different --source-pid and --replica-pid")
+    if args.restart_runs:
+        rooms.restart(args.replica_pid, "REPLICA"); rooms.restart(args.source_pid, "HOST")
+        time.sleep(2.0)
+    report, _ = rooms.check(args)
+    if args.check or report["problems"]:
+        print(json.dumps(report, indent=2))
+        if report["problems"]:
+            raise SystemExit("Start the REPLICA run with the HOST seed %s, both in the first room" % report["hostSeed"])
+        return
+    here = Path(__file__).resolve().parent; root = here.parent
+    binaries = args.binary_directory or (here if (here / "installation.json").is_file() else root / "Binaries/authority-build/Release")
+    names = dict(source="IsaacAuthorityCoopSource.dll", replica="IsaacAuthorityCoopReplica.dll", host="IsaacAuthorityInput.dll")
+    if (binaries / "installation.json").is_file():
+        names.update(json.loads((binaries / "installation.json").read_text(encoding="utf-8")).get("modules", {}))
+    attach = binaries / "IsaacAuthorityAttach.exe"
+    directory = Path(os.environ["LOCALAPPDATA"]) / "IsaacAuthority"; logs = directory / "logs"
+    output = args.output_directory or (root / "Binaries/diagnostics/coop" if (root / "native").is_dir() else directory / "verified-coop")
+    output.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+    before = set(logs.glob("coop-*.jsonl")) | set(logs.glob("input-*.jsonl"))
+    processes, started, failures, transmitted, joined, ends = {}, [], [], [], {}, {}
+    control = None; start_ms = None; sent_commands = 0
+
+    def invoke(action, pid, dll):
+        result = subprocess.run([str(attach), action, str(pid), str(dll)], capture_output=True, text=True, timeout=20)
+        if result.returncode:
+            raise RuntimeError(f"{action} PID {pid}: {result.stdout} {result.stderr}")
+
+    try:
+        # The HOST joins last and keeps the focus: it pauses whenever another window has it.
+        for role, pid in (("replica", args.replica_pid), ("host", args.source_pid)):
+            joined[role] = join(pid, role.upper(), args.controller, invoke, binaries / names["host"], directory)
+        replica = reader.WindowsProcess(args.replica_pid); processes[args.replica_pid] = replica
+        source = reader.WindowsProcess(args.source_pid); processes[args.source_pid] = source
+        control = pair.HostWindow(args.source_pid)
+        rooms.wait_running(source, "HOST", control); rooms.wait_running(replica, "REPLICA")
+        invoke("input", args.source_pid, binaries / names["host"]); started.append(("input-stop", args.source_pid, binaries / names["host"]))
+        client = json.loads((directory / f"input-host-{args.source_pid}.json").read_text())
+        invoke("world", args.source_pid, binaries / names["source"]); started.append(("world-stop", args.source_pid, binaries / names["source"]))
+        source_endpoint = json.loads((directory / f"coop-source-{args.source_pid}.json").read_text())
+        tears.wait_frame(source, source_endpoint)
+        invoke("world", args.replica_pid, binaries / names["replica"]); started.append(("world-stop", args.replica_pid, binaries / names["replica"]))
+        endpoint = json.loads((directory / f"coop-replica-{args.replica_pid}.json").read_text())
+        address, client_address = ("127.0.0.1", endpoint["port"]), ("127.0.0.1", client["port"])
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+            start_ms = pair.uptime_ms(); keys = list(KEYS); previous, last_valid, last_command = None, start_ms, 0
+            while True:
+                now = pair.uptime_ms(); control.require_focus()
+                if now - start_ms >= DURATION:
+                    break
+                while keys and now - start_ms >= keys[0][0]:
+                    _, key, down = keys.pop(0); control.key(key, down)
+                if now - last_command >= 10:
+                    _, move, shoot = [row for row in CLIENT if row[0] <= now - start_ms][-1]
+                    sent_commands += 1; last_command = now
+                    udp.sendto(commands.encode(client["session"], sent_commands, now, args.controller, move, shoot), client_address)
+                state = world.read_slot(source.read, source_endpoint, now)
+                if state is not None:
+                    frame, data = state; last_valid = now
+                    key = (frame["epoch"], frame["sequence"])
+                    if key != previous:
+                        previous = key
+                        packet = bytearray(data); struct.pack_into("<Q", packet, 8, int(endpoint["session"]))
+                        udp.sendto(packet, address); transmitted.append(frame)
+                elif now - last_valid > 1000:
+                    raise RuntimeError("Source stopped publishing world frames")
+                time.sleep(0.005)
+        # Both games stand still now and the replica is still held: read them from outside before anything is stopped.
+        ends = dict(host=team(source), replica=team(replica))
+    except BaseException as error:
+        failures.append(str(error))
+    finally:
+        if control is not None:
+            try:
+                control.release()
+            except BaseException as error:
+                failures.append(f"Input release: {error}")
+        for action, pid, dll in reversed(started):
+            try:
+                invoke(action, pid, dll)
+            except BaseException as error:
+                failures.append(f"Cleanup: {error}")
+        for process in processes.values():
+            try:
+                for slot, original, name in SLOTS:
+                    if struct.unpack("<I", process.read(process.base + slot, 4))[0] != process.base + original:
+                        failures.append(f"The {name} slot was not restored")
+            except BaseException as error:
+                failures.append(f"Restoration readback: {error}")
+            process.close()
+    reports, inputs, copied = {}, [], []
+    # Oldest first: the last input session is the one that drove the second player.
+    for file in sorted((set(logs.glob("coop-*.jsonl")) | set(logs.glob("input-*.jsonl"))) - before, key=lambda f: f.stat().st_mtime):
+        target = output / file.name
+        if target.exists():
+            raise RuntimeError("Report already exists")
+        shutil.copyfile(file, target); copied.append(str(target))
+        records = [json.loads(line) for line in target.read_text().splitlines()]
+        if file.name.startswith("input-"):
+            inputs.append(records[-1])
+        else:
+            reports[records[0]["role"]] = records
+    summary = dict(utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), sourcePid=args.source_pid, replicaPid=args.replica_pid,
+                   scope="standard-tears-rooms-enemies-players", realRoomTransition=False, runSeed=report["hostSeed"], room=report["room"],
+                   clientController=args.controller, secondPlayer=joined, keysPressedForSecondPlayer=0, commandsSent=sent_commands,
+                   transmitted=len(transmitted), reports=copied, failures=failures, passed=False)
+    if not failures:
+        try:
+            target = reports["replica"]; footer = target[-1]; host_records = reports["source"]; host_footer = host_records[-1]
+            if footer["type"] != "stop" or footer["faults"] or footer["dropped"] or footer["networkErrors"] or footer["remaining"] \
+                    or footer["levelMismatches"] or footer["traveling"] or footer["contextChanges"] or footer["rosterMismatches"] \
+                    or footer["transitions"] or footer["selfMoves"] or footer["playerShielded"] or not footer["slotsRestored"]:
+                raise RuntimeError("Incomplete lifecycle, recording or restoration on the replica")
+            if host_footer["faults"] or host_footer["dropped"] or host_footer["lastFault"] or not host_footer["slotsRestored"]:
+                raise RuntimeError("Host observation failed")
+            if (host_footer["players"], footer["players"]) != (2, 2):
+                raise RuntimeError("A module did not see two players")
+            if any(not f["slotRestored"] or f["networkErrors"] for f in inputs) or inputs[-1]["accepted"] < sent_commands * 0.9:
+                raise RuntimeError("The input module failed or did not receive the client's commands")
+            sent = {(f["epoch"], f["sequence"]): f for f in transmitted}
+            host_frames = {(r["epoch"], r["sequence"]): r for r in host_records if r["type"] == "frame"}
+            applied = [r for r in target if r["type"] == "frame" and r["action"] == 1]
+            copies = set(); born = {0: set(), 1: set()}
+            for frame in applied:
+                key = (frame["epoch"], frame["sequence"])
+                if key not in sent or not tears.equal_frame(sent[key], frame):
+                    raise RuntimeError("Applied world differs from its full transmitted snapshot")
+                if key not in host_frames or not tears.equal_frame(host_frames[key], frame):
+                    raise RuntimeError("Replica state cannot be traced to the original host update")
+                listed = world.players(frame)
+                if [p["controller"] for p in listed] != [0, args.controller]:
+                    raise RuntimeError(f"A frame does not list the keyboard player and the client's player: {listed}")
+                for entity in frame["entities"]:
+                    if (frame["epoch"], entity["id"]) not in copies:
+                        # A tear first appears next to the player who fired it.
+                        copies.add((frame["epoch"], entity["id"]))
+                        born[min((0, 1), key=lambda i: (listed[i]["body"][0] - entity["body"][0]) ** 2 +
+                                 (listed[i]["body"][1] - entity["body"][1]) ** 2)].add(entity["id"])
+            if len(applied) < 200 or not born[0] or not born[1]:
+                raise RuntimeError(f"Too few applied frames ({len(applied)}) or a player whose tears never reached the replica")
+            if footer["created"] != len(copies) or footer["removed"] + footer["vanished"] != footer["created"]:
+                raise RuntimeError("Unexpected respawn or unremoved entity")
+            moved = {}
+            for name, begin, end, player, axis, sign in EXPECTED:
+                rows = [world.players(f)[player]["body"] for f in applied if begin <= f["observedMs"] - start_ms <= end]
+                if len(rows) < 10:
+                    raise RuntimeError(f"Too few frames applied while the {name}")
+                shift = [rows[-1][i] - rows[0][i] for i in (0, 1)]; moved[name] = [round(v, 1) for v in shift]
+                if (sign and (shift[axis] * sign < 25 or abs(shift[1 - axis]) > 12)) or (not sign and max(map(abs, shift)) > 1.0):
+                    raise RuntimeError(f"On the replica the {name}: moved by {shift}")
+            apart = [((a["position"][0] - b["position"][0]) ** 2 + (a["position"][1] - b["position"][1]) ** 2) ** 0.5
+                     for a, b in zip(ends["host"], ends["replica"])]
+            if len(apart) != 2 or max(apart) > 0.5:
+                raise RuntimeError(f"The games disagree on where the players stand at the end: {apart}")
+            summary.update(passed=True, applied=len(applied), playersPerFrame=2, movedOnReplica=moved,
+                           tearsOfFirstPlayer=len(born[0]), tearsOfSecondPlayer=len(born[1]), created=footer["created"],
+                           removed=footer["removed"], vanished=footer["vanished"], remaining=footer["remaining"],
+                           playerUpdatesHeld=footer["playerHolds"], rejected=footer["rejected"],
+                           hostUpdateOrderSurprises=host_footer["updateOrderSurprises"],
+                           replicaUpdateOrderSurprises=footer["updateOrderSurprises"],
+                           commandsAccepted=inputs[-1]["accepted"], playerDistanceAtEnd=[round(d, 3) for d in apart],
+                           allStatesMatchFloat32=True, slotsRestored=True)
+        except (RuntimeError, KeyError, IndexError, TypeError) as error:
+            failures.append(str(error))
+    with (output / f"coop-{stamp}.sent.jsonl").open("x", encoding="utf-8") as file:
+        for frame in transmitted:
+            file.write(json.dumps(frame) + "\n")
+    summary_path = output / f"coop-{stamp}.summary.json"
+    with summary_path.open("x", encoding="utf-8") as file:
+        json.dump(summary, file, indent=2)
+    print(json.dumps(dict(summary=str(summary_path), **summary)))
+    if not summary["passed"]:
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source-pid", type=int)
+    parser.add_argument("--replica-pid", type=int)
+    parser.add_argument("--controller", type=int, default=1, help="free controller index that joins as the second player")
+    parser.add_argument("--check", action="store_true", help="only report whether both games share the run seed and room")
+    parser.add_argument("--restart-runs", action="store_true", help="first hold R in both games to restart their seeded runs")
+    parser.add_argument("--binary-directory", type=Path)
+    parser.add_argument("--output-directory", type=Path)
+    run(parser.parse_args())

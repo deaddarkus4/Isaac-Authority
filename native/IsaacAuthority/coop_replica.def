@@ -1,0 +1,4 @@
+LIBRARY IsaacAuthorityCoopReplica
+EXPORTS
+    IsaacAuthorityWorldStart=_IsaacAuthorityWorldStart@4
+    IsaacAuthorityWorldStop=_IsaacAuthorityWorldStop@4

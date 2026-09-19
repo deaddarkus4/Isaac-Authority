@@ -9,7 +9,7 @@ namespace {
 void Check(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 Frame Example() {
     Frame f; f.session = 123; f.sequence = 1; f.timeMs = 1000;
-    f.room = {1, 0, 84, 0, 1, 2, 1, 12345, 1}; f.player = {{320, 280}, {0, 0}};
+    f.room = {1, 0, 84, 0, 1, 2, 1, 12345, 1}; f.players[0].body = {{320, 280}, {0, 0}};
     f.count = 1; f.entities[0] = {1, 99, 2, 0, 0, {{350, 280}, {10, 0}}, -20, -1, 0.5f, 1}; return f;
 }
 void Protocol() {
@@ -111,6 +111,41 @@ void Enemies() {
     elsewhere = next; ++elsewhere.room.visits; Check(!Departed(&f, elsewhere, f.npcs[1]), "another visit proves no death");
     elsewhere = next; ++elsewhere.session; Check(!Departed(&f, elsewhere, f.npcs[1]), "another session proves no death");
 }
+void Players() {
+    auto f = Example(); Packet alone, packet; Frame out;
+    Check(Encode(f, alone) && alone.bytes[4] == 1 && !alone.bytes[92], "one player on controller 0 stays version 1");
+    f.playerCount = 2; f.players[1] = {1, {{200, 300}, {-4.5f, 0.25f}}};
+    Check(Encode(f, packet) && packet.size == alone.size + 2 * kPlayerRecord && packet.bytes[4] == 3 && packet.bytes[92] == 2,
+        "a second player makes version 3");
+    Check(std::equal(alone.bytes.begin() + 8, alone.bytes.begin() + 92, packet.bytes.begin() + 8) &&
+        std::equal(alone.bytes.begin() + kHeader, alone.bytes.begin() + alone.size, packet.bytes.begin() + kHeader),
+        "header, first player and tear layout unchanged");
+    Check(Decode(packet.bytes.data(), packet.size, out) && out.playerCount == 2 && out.players[0].controller == 0 &&
+        out.players[0].body.position.x == 320 && out.players[1].controller == 1 && out.players[1].body.position.y == 300 &&
+        out.players[1].body.velocity.x == -4.5f && out.count == 1 && out.entities[0].id == 1, "player wire roundtrip");
+    for (std::size_t n = 0; n < packet.size; ++n) Check(!Decode(packet.bytes.data(), n, out), "reject truncated player section");
+    auto bad = packet; bad.bytes[4] = 1; Check(!Decode(bad.bytes.data(), bad.size, out), "version 1 cannot list players");
+    bad = packet; bad.bytes[92] = 3; Check(!Decode(bad.bytes.data(), bad.size, out), "player count must match the size");
+    bad = packet; bad.bytes[92] = 0; Check(!Decode(bad.bytes.data(), bad.size, out), "version 3 needs a player section");
+    bad = packet; bad.bytes[packet.size - 4] = 1; Check(!Decode(bad.bytes.data(), bad.size, out), "reserved player field");
+    bad = packet; bad.bytes[68] ^= 1; Check(!Decode(bad.bytes.data(), bad.size, out), "header and first record must agree on the first player");
+    bad = packet; bad.bytes[packet.size - kPlayerRecord] = 8; Check(!Decode(bad.bytes.data(), bad.size, out), "controller out of range");
+    auto enemies = f; enemies.npcCount = 1; enemies.npcs[0] = {244, 0, 0, 2078110152u, {{80, 160}, {0, 0}}, {80, 160}, 10, 10, 8, 1, 5, 4};
+    Check(Encode(enemies, packet) && packet.bytes[4] == 3 && packet.size == alone.size + kNpcRecord + 2 * kPlayerRecord &&
+        Decode(packet.bytes.data(), packet.size, out) && out.npcCount == 1 && out.playerCount == 2 && out.players[1].controller == 1,
+        "players follow the enemy section");
+    auto g = Example(); g.players[0].controller = 1;
+    Check(Encode(g, packet) && packet.bytes[4] == 3 && packet.bytes[92] == 1 && Decode(packet.bytes.data(), packet.size, out) &&
+        out.playerCount == 1 && out.players[0].controller == 1, "a lone player on another controller is listed");
+    bad = packet; bad.bytes[packet.size - kPlayerRecord] = 0;
+    Check(!Decode(bad.bytes.data(), bad.size, out), "one player on controller 0 has only the version 1 spelling");
+    g = f; g.players[1].controller = 0; Check(Valid(g), "two players may share a controller");
+    g = f; g.playerCount = 0; Check(!Valid(g), "a run has a player");
+    g = f; g.playerCount = static_cast<std::uint32_t>(kMaxPlayers + 1); Check(!Encode(g, packet), "reject oversized team without truncation");
+    g = f; g.players[1].body.position.x = std::numeric_limits<float>::quiet_NaN(); Check(!Valid(g), "every player body is checked");
+    Gate gate(123); Check(gate.Receive(f, 1000) == Decision::Accept, "player frames pass the same gate");
+    Check(kMaxBytes == 3136, "slot payload bound");
+}
 void Contract(const wchar_t* path) {
     HMODULE dll = LoadLibraryW(path); Check(dll != nullptr, "load world adapter");
     using Export = DWORD(WINAPI*)(void*);
@@ -144,8 +179,8 @@ int Fixture() {
 int wmain(int argc, wchar_t** argv) {
     try {
         if (argc == 2 && std::wstring(argv[1]) == L"--fixture") return Fixture();
-        Protocol(); Lifecycle(); Rooms(); Enemies();
+        Protocol(); Lifecycle(); Rooms(); Enemies(); Players();
         for (int i = 1; i < argc; ++i) Contract(argv[i]);
-        std::cout << "PASS world wire, stable identities, lifetimes, epochs, room routing, enemy section, module contracts\n"; return 0;
+        std::cout << "PASS world wire, stable identities, lifetimes, epochs, room routing, enemy and player sections, module contracts\n"; return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

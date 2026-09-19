@@ -22,6 +22,8 @@ bool NpcValid(const Npc& n) {
         Number(n.hitPoints, -1e6f, 1e7f) && Number(n.maxHitPoints, 0, 1e7f) &&
         n.state >= -1 && n.state < 65536 && n.visible < 2 && n.gridCollision < 16 && n.entityCollision < 16;
 }
+// One player driven by controller 0 is what versions 1 and 2 already say in their header.
+bool PlayerSection(const Frame& f) { return f.playerCount != 1 || f.players[0].controller != 0; }
 bool SameIdentity(const Identity& a, const Identity& b) { return a.address == b.address && a.seed == b.seed && a.index == b.index; }
 bool Has(const Frame& f, std::uint32_t id) {
     for (std::size_t i = 0; i < f.count; ++i) if (f.entities[i].id == id) return true;
@@ -58,9 +60,11 @@ bool Departed(const Frame* previous, const Frame& next, const Npc& npc) {
     return false;
 }
 bool Valid(const Frame& f) {
-    if (!f.session || !f.epoch || !f.sequence || f.count > kMaxEntities || f.npcCount > kMaxNpcs || !BodyValid(f.player) ||
+    if (!f.session || !f.epoch || !f.sequence || f.count > kMaxEntities || f.npcCount > kMaxNpcs ||
+        !f.playerCount || f.playerCount > kMaxPlayers ||
         f.room.stage > 20 || f.room.stageType > 10 || f.room.dimension > 2 || f.room.type > 40 ||
         f.room.shape > 12 || !f.room.shape) return false;
+    for (std::size_t i = 0; i < f.playerCount; ++i) if (f.players[i].controller > 7 || !BodyValid(f.players[i].body)) return false;
     for (std::size_t i = 0; i < f.count; ++i) {
         const auto& e = f.entities[i];
         if (!e.id || !e.seed || e.type != 2 || e.variant != 0 || e.subtype != 0 || !BodyValid(e.body) ||
@@ -77,16 +81,20 @@ bool Valid(const Frame& f) {
 bool Fresh(const Frame& f, std::uint64_t now) { return f.timeMs <= now && now - f.timeMs <= kMaxAgeMs; }
 bool Encode(const Frame& f, Packet& p) {
     if (!Valid(f)) return false;
-    // Version 1 is the tear-only format, byte for byte; version 2 appends the enemy section.
-    p = {}; p.size = kHeader + f.count * kRecord + f.npcCount * kNpcRecord; auto b = p.bytes.data();
-    Put(b, 0, 0x31444c57); Put(b, 4, f.npcCount ? 2 : 1); Put(b, 88, f.npcCount);
+    // Version 1 is the tear-only format, byte for byte; version 2 appends the enemy section; version 3 appends the
+    // player section after it. The header always carries the first player's body.
+    const std::size_t listed = PlayerSection(f) ? f.playerCount : 0;
+    p = {}; p.size = kHeader + f.count * kRecord + f.npcCount * kNpcRecord + listed * kPlayerRecord; auto b = p.bytes.data();
+    Put(b, 0, 0x31444c57); Put(b, 4, listed ? 3 : f.npcCount ? 2 : 1); Put(b, 88, f.npcCount);
+    Put(b, 92, static_cast<std::uint32_t>(listed));
     Put(b, 8, static_cast<std::uint32_t>(f.session)); Put(b, 12, static_cast<std::uint32_t>(f.session >> 32));
     Put(b, 16, f.epoch); Put(b, 20, f.sequence);
     Put(b, 24, static_cast<std::uint32_t>(f.timeMs)); Put(b, 28, static_cast<std::uint32_t>(f.timeMs >> 32));
     const std::uint32_t room[]{f.room.stage, f.room.stageType, f.room.index, f.room.dimension, f.room.type,
         f.room.variant, f.room.shape, f.room.spawnSeed, f.room.visits};
     for (unsigned i = 0; i < 9; ++i) Put(b, 32 + i * 4, room[i]);
-    const float player[]{f.player.position.x, f.player.position.y, f.player.velocity.x, f.player.velocity.y};
+    const auto& first = f.players[0].body;
+    const float player[]{first.position.x, first.position.y, first.velocity.x, first.velocity.y};
     for (unsigned i = 0; i < 4; ++i) PutFloat(b, 68 + i * 4, player[i]);
     Put(b, 84, f.count);
     for (std::size_t i = 0; i < f.count; ++i) {
@@ -105,18 +113,26 @@ bool Encode(const Frame& f, Packet& p) {
         Put(b, at + 48, static_cast<std::uint32_t>(n.state)); Put(b, at + 52, n.visible);
         Put(b, at + 56, n.gridCollision); Put(b, at + 60, n.entityCollision);
     }
+    for (std::size_t i = 0; i < listed; ++i) {
+        const auto at = p.size - (listed - i) * kPlayerRecord; const auto& body = f.players[i].body;
+        Put(b, at, f.players[i].controller);
+        const float values[]{body.position.x, body.position.y, body.velocity.x, body.velocity.y};
+        for (unsigned j = 0; j < 4; ++j) PutFloat(b, at + 4 + j * 4, values[j]);
+    }
     return true;
 }
 bool Decode(const std::uint8_t* b, std::size_t size, Frame& out) {
-    if (!b || size < kHeader || Get(b, 0) != 0x31444c57 || Get(b, 92)) return false;
-    const auto version = Get(b, 4); Frame f; f.npcCount = Get(b, 88);
-    if (version == 1 ? f.npcCount != 0 : version != 2 || !f.npcCount || f.npcCount > kMaxNpcs) return false;
+    if (!b || size < kHeader || Get(b, 0) != 0x31444c57) return false;
+    const auto version = Get(b, 4); const std::size_t listed = Get(b, 92); Frame f; f.npcCount = Get(b, 88);
+    // Every frame has one spelling: 1 no sections, 2 enemies only, 3 a player section with or without enemies.
+    if (version < 1 || version > 3 || f.npcCount > kMaxNpcs || (version == 1 && f.npcCount) || (version == 2 && !f.npcCount) ||
+        (version == 3 ? !listed || listed > kMaxPlayers : listed != 0)) return false;
     f.session = Get(b, 8) | (std::uint64_t(Get(b, 12)) << 32); f.epoch = Get(b, 16); f.sequence = Get(b, 20);
     f.timeMs = Get(b, 24) | (std::uint64_t(Get(b, 28)) << 32);
     f.room = {Get(b, 32), Get(b, 36), Get(b, 40), Get(b, 44), Get(b, 48), Get(b, 52), Get(b, 56), Get(b, 60), Get(b, 64)};
-    f.player = {{GetFloat(b, 68), GetFloat(b, 72)}, {GetFloat(b, 76), GetFloat(b, 80)}};
+    f.players[0].body = {{GetFloat(b, 68), GetFloat(b, 72)}, {GetFloat(b, 76), GetFloat(b, 80)}};
     f.count = Get(b, 84);
-    if (f.count > kMaxEntities || size != kHeader + f.count * kRecord + f.npcCount * kNpcRecord) return false;
+    if (f.count > kMaxEntities || size != kHeader + f.count * kRecord + f.npcCount * kNpcRecord + listed * kPlayerRecord) return false;
     for (std::size_t i = 0; i < f.count; ++i) {
         const auto at = kHeader + i * kRecord;
         if (Get(b, at + 52)) return false;
@@ -132,6 +148,15 @@ bool Decode(const std::uint8_t* b, std::size_t size, Frame& out) {
         n.state = static_cast<std::int32_t>(Get(b, at + 48)); n.visible = Get(b, at + 52);
         n.gridCollision = Get(b, at + 56); n.entityCollision = Get(b, at + 60);
     }
+    for (std::size_t i = 0; i < listed; ++i) {
+        const auto at = size - (listed - i) * kPlayerRecord;
+        if (Get(b, at + 20)) return false;
+        // The first record repeats the header's body; two different answers are no answer.
+        for (unsigned j = 0; !i && j < 4; ++j) if (Get(b, at + 4 + j * 4) != Get(b, 68 + j * 4)) return false;
+        f.players[i] = {Get(b, at), {{GetFloat(b, at + 4), GetFloat(b, at + 8)}, {GetFloat(b, at + 12), GetFloat(b, at + 16)}}};
+    }
+    if (listed) f.playerCount = static_cast<std::uint32_t>(listed);
+    if (version == 3 && !PlayerSection(f)) return false;
     if (!Valid(f)) return false;
     out = f; return true;
 }
