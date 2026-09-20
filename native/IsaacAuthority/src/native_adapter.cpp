@@ -168,18 +168,28 @@
 // accepts that user's session, so no callback is needed). The flat C exports are looked up by name at start. The world
 // and the shots go out on every second update of the player - enemies and tears move 30 times a second, the player is
 // updated 60 times - which halves the traffic; the body goes out every time.
-// The own player's input is taken from the keyboard only once a neighbour's module has been heard: two players cannot
-// attach at the same instant, and a module that ran ahead alone would walk its player where the other game's unpatched
-// lockstep does not see it. The comparison of checksums is switched off at once - that alone changes nothing.
+// The own player's input is taken from the keyboard only once the handshake with every neighbour is through (see
+// kOfHello): two players cannot start at the same instant, and a module that ran ahead alone would walk its player where
+// the other game's unpatched lockstep does not see it. The comparison of checksums goes off in that handshake too, and
+// only when every player of the match has answered; only with slots carried from outside is it switched off at once.
 //
 // Whatever carries the published slots to the other games - for now a relay outside, later the game's own connection -
 // delivers them as PLR1 and WLN1 datagrams to this module's loopback socket.
 //
 // %LOCALAPPDATA%\IsaacAuthority\native-<pid>.cfg, written by the harness from the game's own log: the lobby's device number
 // of the local player (2, 3, ...) and, for the game that made the lobby, the word "host".
+//
+// Installed (IsaacAuthorityNativeAuto, called by the loader the game itself loads - see version_proxy.cpp): nobody writes
+// that configuration. The module follows the game's own log from inside the game: "Start Networked" opens a match, the
+// lines that add players name the own device and the other players (Steam id, device), "Menu Game Init" closes it. Per
+// match it starts itself with what the log said - the host is whoever has the lowest device number, the neighbours are
+// reached through Steam by their ids - and at the match's end it stops and puts the comparison of checksums back. With
+// the handshake this makes the installed module safe to keep: a match in which anybody lacks it is left untouched.
+// The game keeps all of this in memory too; where, is not found yet - the log is what has been checked on real matches.
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <shlobj.h>
 #include "profile.hpp"
 #include "vtable_slot.hpp"
 #include <array>
@@ -220,7 +230,15 @@ constexpr int kHealthFields = 10, kDeathRetryFrames = 30;
 constexpr std::array<std::uint8_t, 10> kKillEntry{0x55, 0x8b, 0xec, 0x83, 0xec, 0x28, 0xf3, 0x0f, 0x10, 0x0d};
 constexpr std::uint32_t kBodyMagic = 0x31524c50, kWorldMagic = 0x314e4c57;  // "PLR1", "WLN1"
 constexpr std::uint32_t kFrameMagic = 0x31464149, kChunkBytes = 1184, kMaxPeers = 4;   // "IAF1"
-constexpr std::uint8_t kOfBody = 1, kOfShots = 2, kOfWorld = 3;
+constexpr std::uint8_t kOfBody = 1, kOfShots = 2, kOfWorld = 3, kOfHello = 4;
+// The handshake. A module that has started is only "here": it changes nothing in its game, not even the comparison of
+// checksums, and says hello twice a second. Once EVERY other player of the match has said hello with the same protocol,
+// it turns its comparison off and says so; once every other player has said that too, it goes live. So a match in which
+// anybody plays without the module stays the game's own match to the last byte, and nobody diverges while a neighbour
+// still compares. A module nobody answers gives up after kHelloPatienceMs and sends nothing more.
+constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 1, kHelloEveryFrames = 30;   // "HEL1"
+constexpr std::uint64_t kHelloPatienceMs = 60000;
+constexpr std::uint8_t kHere = 0, kCompareOff = 1, kLive = 2;
 constexpr int kSteamChannel = 7460, kSteamSendFlags = 1 | 32;   // unreliable, no Nagle; restart a broken session by itself
 constexpr int kControllers = 64;   // device numbers grow from match to match within one run of the game: 13 and 14 were seen under Steam
 constexpr int kMaxNpcs = 48, kMaxDeaths = 16, kDeathFrames = 90, kOrphanSnapshots = 20;
@@ -316,6 +334,7 @@ struct Published { std::uint32_t magic, generation; Body body; };
 struct PublishedWorld { std::uint32_t magic, generation; World world; };
 struct PublishedShots { std::uint32_t magic, generation; Shots shots; };
 struct FrameHeader { std::uint32_t magic; std::uint8_t kind, chunk, chunks, reserved; std::uint32_t sequence, total; };
+struct Hello { std::uint32_t magic, protocol, rules; std::uint8_t controller, host, stage, reserved; };
 struct SteamIdentity { std::int32_t type, size; std::uint64_t id; std::uint8_t rest[120]; };   // SteamNetworkingIdentity: type 16 is a Steam id
 struct Stats {
     std::uint32_t published, received, applied, stale, rejected, otherRoom;
@@ -378,6 +397,10 @@ Inbox inbox[kControllers];
 World worldInbox{}; std::uint64_t worldAt = 0; std::uint32_t worldApplied = 0;
 SOCKET udp = INVALID_SOCKET; HANDLE worker = nullptr; bool winsock = false; unsigned short port = 0;
 sockaddr_in peers[kMaxPeers]{}; std::uint32_t peerCount = 0; std::atomic<bool> peerHeard{false};
+// The handshake: this module's stage, per neighbour the stage it last named plus one (0: not heard yet), how many hellos
+// came with another protocol, and when this module started (for its patience).
+std::atomic<std::uint8_t> stage{kHere}, heardStage[kMaxPeers]{}; std::atomic<std::uint32_t> otherProtocol{0}; std::uint64_t startedAt = 0; std::uint32_t helloNumber = 0;
+std::atomic<bool> gaveUp{false};
 // Steam: the neighbours by id and the four exports of the game's steam_api.dll that carry a datagram to them and back.
 using SteamSend = int(__cdecl*)(void*, const SteamIdentity*, const void*, std::uint32_t, int, int);
 using SteamReceive = int(__cdecl*)(void*, int, void**, int);
@@ -409,9 +432,11 @@ std::uint8_t entryMap[kGridMapBytes]{}; std::uint32_t entryRoom = 0xffffffff; st
 bool GridHeld(); bool HostRules();
 std::uint32_t rules = kAllRules;
 inline bool On(std::uint32_t rule) { return (rules & rule) != 0; }
-// The module runs and a neighbour's module has been heard. Until then nothing of the game is changed: a module that runs in
-// one game only must leave it exactly the game its unpatched neighbour compares checksums with.
+// The module runs and the handshake with every neighbour is through. Until then nothing of the game is changed: a module
+// that runs in one game only must leave it exactly the game its unpatched neighbour compares checksums with.
 bool Live();
+DWORD Patch(std::uintptr_t rva, const std::array<std::uint8_t, 8>& bytes, const std::array<std::uint8_t, 8>& expected);
+void SendAll(std::uint8_t kind, std::uint32_t number, const std::uint8_t* payload, std::uint32_t size);
 // Pickups: the seeds the host's list has brought, for how many snapshots a pickup has been out of step; the counters as
 // they were here a frame ago and until when the host's wait; per door what it was here and for how long it differs.
 std::int32_t lastCounters[3] = {-1, -1, -1}; std::uint32_t countersHeldUntil = 0;
@@ -430,7 +455,7 @@ bool Focused() {
 }
 
 int __fastcall OnInput(void* self, void*, int controller, void* reader, void* in, void* out, int* device) {
-    if (running.load(std::memory_order_acquire) && controller == ownController && peerHeard.load(std::memory_order_relaxed) && Focused()) {
+    if (controller == ownController && Live() && Focused()) {
         counters[0].fetch_add(1, std::memory_order_relaxed);
         return original(self, kKeyboard, reader, in, out, device);
     }
@@ -1259,6 +1284,32 @@ void FollowRoom(std::uintptr_t game, std::uint32_t roomIndex) {
     } else stats.roomFollowFailures++;
 }
 
+// The game's thread, once per update of the own player: say hello and move through the handshake. The comparison is
+// switched off here and not on another thread: inside this hook the game's thread cannot be inside the function patched.
+void Handshake() {
+    const std::uint32_t neighbours = steamPeerCount ? steamPeerCount : peerCount;
+    std::uint8_t now = stage.load(std::memory_order_relaxed);
+    if (!neighbours) {   // the slots are carried by a process outside: no hellos, and the comparison is off since the start
+        if (now != kLive && peerHeard.load(std::memory_order_relaxed)) stage.store(kLive, std::memory_order_relaxed);
+        return;
+    }
+    if (gaveUp.load(std::memory_order_relaxed)) return;
+    std::uint8_t least = 0xff;
+    for (std::uint32_t n = 0; n < neighbours; ++n) { const auto heard = heardStage[n].load(std::memory_order_relaxed); if (heard < least) least = heard; }
+    const std::uint8_t before = now;
+    if (now == kHere && least >= kHere + 1) {
+        if (Patch(kCompare, kCompareEqual, kCompareEntry)) { gaveUp.store(true, std::memory_order_relaxed); stats.rejected++; return; }
+        now = kCompareOff;
+    }
+    if (now == kCompareOff && least >= kCompareOff + 1) now = kLive;
+    if (now != before) stage.store(now, std::memory_order_relaxed);
+    if (now == kHere && GetTickCount64() - startedAt > kHelloPatienceMs) { gaveUp.store(true, std::memory_order_relaxed); return; }   // not a match of modules
+    if (now != before || frame % kHelloEveryFrames == 0) {
+        const Hello hello{kHelloMagic, kProtocol, rules, static_cast<std::uint8_t>(ownController), static_cast<std::uint8_t>(host ? 1 : 0), now, 0};
+        SendAll(kOfHello, ++helloNumber, reinterpret_cast<const std::uint8_t*>(&hello), sizeof(hello));
+    }
+}
+
 // The game's thread, right after the game's own update of one player.
 void AfterUpdate(std::uintptr_t player) noexcept {
     __try {
@@ -1277,7 +1328,9 @@ void AfterUpdate(std::uintptr_t player) noexcept {
                 if (gap > stats.frameMaxMs && gap < 5000) stats.frameMaxMs = gap;
             }
             lastFrameUs = nowUs;
-            if (On(kFollow)) FollowRoom(game, roomIndex);
+            Handshake();
+            if ((peerCount || steamPeerCount) && stage.load(std::memory_order_relaxed) == kHere) return;   // only hellos until every neighbour has answered
+            if (On(kFollow) && Live()) FollowRoom(game, roomIndex);
             published.generation |= 1;   // odd: being written, also after a write that never finished
             published.body.magic = kBodyMagic; published.body.controller = static_cast<std::uint32_t>(controller); published.body.sequence = ++sequence;
             published.body.room = roomIndex; published.body.floor = Floor(game);
@@ -1290,10 +1343,10 @@ void AfterUpdate(std::uintptr_t player) noexcept {
             published.generation++;
             stats.published++;
             if (peerCount || steamPeerCount) SendAll(kOfBody, published.body.sequence, reinterpret_cast<const std::uint8_t*>(&published.body), sizeof(Body));
-            if (room) { PublishShots(player, room, roomIndex); if (host) PublishWorld(player, room, roomIndex); else ApplyWorld(player, room, roomIndex); }
+            if (room) { PublishShots(player, room, roomIndex); if (host) PublishWorld(player, room, roomIndex); else if (Live()) ApplyWorld(player, room, roomIndex); }
             return;
         }
-        if (controller < 0 || controller >= kControllers) return;
+        if (controller < 0 || controller >= kControllers || !Live()) return;
         if (room && (On(kTears) || On(kBombsRule) || On(kPets))) ApplyTears(player, controller, room, roomIndex);
         Body body{}; bool fresh = false; std::uint64_t arrivedUs = 0;
         AcquireSRWLockShared(&inboxLock);
@@ -1359,10 +1412,10 @@ char __fastcall OnPlayerDamage(void* self, void*, float damage, std::uint32_t fl
 }
 
 // A guest's own breaking waits for the host's word, as its clearing does.
-bool Live() { return running.load(std::memory_order_acquire) && peerHeard.load(std::memory_order_relaxed); }
+bool Live() { return running.load(std::memory_order_acquire) && stage.load(std::memory_order_relaxed) == kLive; }
 
 bool HostRules() {
-    if (!running.load(std::memory_order_acquire) || host) return false;
+    if (!Live() || host) return false;
     const auto game = At<std::uintptr_t>(base + kGame);
     return game && GetTickCount64() - hostHeardAt.load() <= kHostSilenceMs && hostClearRoom.load() == At<std::uint32_t>(game + kRoomIndex);
 }
@@ -1453,7 +1506,7 @@ bool ValidWorld(const World& world, int got) {
     return true;
 }
 
-std::filesystem::path Folder();
+std::filesystem::path OwnFolder();
 
 bool DeliverBody(const Body& body) {
     const bool valid = body.magic == kBodyMagic && body.controller < kControllers && body.sequence &&
@@ -1493,6 +1546,15 @@ bool TakeChunk(std::uint32_t n, const std::uint8_t* datagram, int got) {
     if (header.kind == kOfBody) {
         if (header.chunks != 1 || part != sizeof(Body)) return false;
         Body body; std::memcpy(&body, payload, sizeof(body)); return DeliverBody(body);
+    }
+    if (header.kind == kOfHello) {
+        Hello hello;
+        if (header.chunks != 1 || part != sizeof(Hello) || n >= kMaxPeers) return false;
+        std::memcpy(&hello, payload, sizeof(hello));
+        if (hello.magic != kHelloMagic || hello.stage > kLive) return false;
+        if (hello.protocol != kProtocol) { otherProtocol.fetch_add(1, std::memory_order_relaxed); return true; }   // heard, but not one to go live with
+        if (heardStage[n].load(std::memory_order_relaxed) < hello.stage + 1) heardStage[n].store(static_cast<std::uint8_t>(hello.stage + 1), std::memory_order_relaxed);
+        return true;
     }
     if ((header.kind != kOfShots && header.kind != kOfWorld) || !header.chunks || header.chunks > 31 || header.chunk >= header.chunks || !header.total ||
         header.total > (header.kind == kOfWorld ? sizeof(World) : sizeof(Shots)) || part > kChunkBytes) return false;
@@ -1536,8 +1598,12 @@ void WriteStatus() {
     if (now - written < 2000) return;
     written = now;
     try {
-        std::ofstream status(Folder() / (L"native-" + std::to_wstring(GetCurrentProcessId()) + L".status"), std::ios::trunc);
-        status << "neighbour heard: " << (peerHeard.load() ? "yes" : "NO") << "; sent " << stats.bytesSent / 1024 << " KB, received " << stats.bytesReceived / 1024
+        std::ofstream status(OwnFolder() / (L"native-" + std::to_wstring(GetCurrentProcessId()) + L".status"), std::ios::trunc);
+        const auto at = stage.load(); std::uint32_t answered = 0; const std::uint32_t neighbours = steamPeerCount ? steamPeerCount : peerCount;
+        for (std::uint32_t n = 0; n < neighbours; ++n) if (heardStage[n].load()) ++answered;
+        status << (at == kLive ? "LIVE" : at == kCompareOff ? "comparison off, waiting for the neighbours to say the same" : gaveUp.load() ? "gave up: not every player answered" : "waiting for the neighbours' hello")
+               << " as " << (host ? "host" : "guest") << ", device " << ownController << "; neighbours answered " << answered << " of " << neighbours
+               << ", hellos of another version " << otherProtocol.load() << "; neighbour heard: " << (peerHeard.load() ? "yes" : "NO") << "; sent " << stats.bytesSent / 1024 << " KB, received " << stats.bytesReceived / 1024
                << " KB; bodies applied " << stats.applied << ", worlds applied " << stats.worldApplied << "; faults " << stats.rejected << ", frames lost in pieces " << stats.framesBroken
                << ", frames over 45 ms " << stats.longFrames << " of " << stats.published << "\n";
     } catch (...) {}
@@ -1556,8 +1622,9 @@ DWORD WINAPI Receive(void*) noexcept {
         stats.bytesReceived += static_cast<std::uint32_t>(got);
         bool taken = false;
         if (peerCount) {   // neighbours are named: only their frames count, whoever else may reach the port
-            std::uint32_t n = 0;
-            while (n < peerCount && peers[n].sin_addr.s_addr != sender.sin_addr.s_addr) ++n;
+            std::uint32_t n = 0;   // a neighbour sends from the port it listens on: several of one address (one machine) are told apart by it
+            while (n < peerCount && (peers[n].sin_addr.s_addr != sender.sin_addr.s_addr || peers[n].sin_port != sender.sin_port)) ++n;
+            if (n == peerCount) { n = 0; while (n < peerCount && peers[n].sin_addr.s_addr != sender.sin_addr.s_addr) ++n; }
             std::uint32_t magic = 0; if (got > static_cast<int>(sizeof(FrameHeader))) std::memcpy(&magic, packet, 4);
             taken = n < peerCount && magic == kFrameMagic && TakeChunk(n, reinterpret_cast<const std::uint8_t*>(packet), got);
         } else if (got == sizeof(Body)) {   // whole slots, carried by a process outside
@@ -1589,46 +1656,52 @@ DWORD Patch(std::uintptr_t rva, const std::array<std::uint8_t, 8>& bytes, const 
     return !matches ? ERROR_REVISION_MISMATCH : restored ? ERROR_SUCCESS : GetLastError();
 }
 
-std::filesystem::path Folder() {
+std::filesystem::path OwnFolder() {
     wchar_t local[32768]{}; const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", local, 32768);
     if (!n || n >= 32768) throw static_cast<DWORD>(ERROR_ENVVAR_NOT_FOUND);
     return std::filesystem::path(local) / L"IsaacAuthority";
 }
+
+// What a start needs to know: who the own player is, whose world it is, the rules, and how the neighbours are reached.
+struct Setup {
+    int controller = -1; bool host = false; std::uint32_t mask = kAllRules; unsigned short listenOn = 0; bool anywhere = false, outsideTests = false;
+    sockaddr_in peers[kMaxPeers]{}; std::uint32_t peerCount = 0; SteamIdentity steamPeers[kMaxPeers]{}; std::uint32_t steamPeerCount = 0;
+};
+
+// The words of a configuration, in any order: listen=PORT, peer=IP:PORT and steampeer=ID64 (up to four of each), steam - the
+// word without which only an isolated test instance is touched.
+void ReadWords(std::istream& config, Setup& setup) {
+    for (std::string word; config >> word;) {
+        if (word == "steam") setup.outsideTests = true;
+        else if (word.rfind("steampeer=", 0) == 0 && setup.steamPeerCount < kMaxPeers) {
+            SteamIdentity identity{}; identity.type = 16; identity.size = 8; identity.id = std::strtoull(word.c_str() + 10, nullptr, 10);
+            if (!identity.id) throw static_cast<DWORD>(ERROR_BAD_CONFIGURATION);
+            setup.steamPeers[setup.steamPeerCount++] = identity;
+        }
+        else if (word.rfind("listen=", 0) == 0) setup.listenOn = static_cast<unsigned short>(std::strtoul(word.c_str() + 7, nullptr, 10));
+        else if (word.rfind("peer=", 0) == 0 && setup.peerCount < kMaxPeers) {
+            const auto colon = word.rfind(':'); if (colon == std::string::npos || colon < 6) throw static_cast<DWORD>(ERROR_BAD_CONFIGURATION);
+            sockaddr_in peer{}; peer.sin_family = AF_INET; peer.sin_port = htons(static_cast<unsigned short>(std::strtoul(word.c_str() + colon + 1, nullptr, 10)));
+            if (inet_pton(AF_INET, word.substr(5, colon - 5).c_str(), &peer.sin_addr) != 1 || !peer.sin_port) throw static_cast<DWORD>(ERROR_BAD_CONFIGURATION);
+            if (peer.sin_addr.s_addr != htonl(INADDR_LOOPBACK)) setup.anywhere = true;
+            setup.peers[setup.peerCount++] = peer;
+        }
+    }
 }
 
-extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
-    AcquireSRWLockExclusive(&lifecycle);
-    DWORD result = ERROR_INVALID_DATA;
-    try {
+// The start itself, under the lifecycle lock. Throws a DWORD.
+void Begin(const Setup& setup) {
+    {
         if (running.load()) throw static_cast<DWORD>(ERROR_ALREADY_INITIALIZED);
         wchar_t image[32768]{};
         if (!GetModuleFileNameW(nullptr, image, 32768) || !isaac_probe::AnalyzeBytes(isaac_probe::ReadFile(image)).supported) throw static_cast<DWORD>(ERROR_BAD_EXE_FORMAT);
         base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
-        const auto folder = Folder();
-        std::ifstream config(folder / (L"native-" + std::to_wstring(GetCurrentProcessId()) + L".cfg"));
-        int controller = -1; std::string role;
-        if (!(config >> controller) || controller < 1 || controller >= kControllers) throw static_cast<DWORD>(ERROR_BAD_CONFIGURATION);
-        config >> role;
-        std::uint32_t mask = kAllRules; if (!(config >> std::hex >> mask)) mask = kAllRules;
-        // Then, in any order: listen=PORT, peer=IP:PORT (up to four), steam - the word without which only an isolated test instance is touched.
-        unsigned short listenOn = 0; bool anywhere = false, outsideTests = false; peerCount = 0; steamPeerCount = 0; steamMessages = nullptr; config.clear();
-        for (std::string word; config >> word;) {
-            if (word == "steam") outsideTests = true;
-            else if (word.rfind("steampeer=", 0) == 0 && steamPeerCount < kMaxPeers) {
-                SteamIdentity identity{}; identity.type = 16; identity.size = 8; identity.id = std::strtoull(word.c_str() + 10, nullptr, 10);
-                if (!identity.id) throw static_cast<DWORD>(ERROR_BAD_CONFIGURATION);
-                steamPeers[steamPeerCount++] = identity;
-            }
-            else if (word.rfind("listen=", 0) == 0) listenOn = static_cast<unsigned short>(std::strtoul(word.c_str() + 7, nullptr, 10));
-            else if (word.rfind("peer=", 0) == 0 && peerCount < kMaxPeers) {
-                const auto colon = word.rfind(':'); if (colon == std::string::npos || colon < 6) throw static_cast<DWORD>(ERROR_BAD_CONFIGURATION);
-                sockaddr_in peer{}; peer.sin_family = AF_INET; peer.sin_port = htons(static_cast<unsigned short>(std::strtoul(word.c_str() + colon + 1, nullptr, 10)));
-                if (inet_pton(AF_INET, word.substr(5, colon - 5).c_str(), &peer.sin_addr) != 1 || !peer.sin_port) throw static_cast<DWORD>(ERROR_BAD_CONFIGURATION);
-                if (peer.sin_addr.s_addr != htonl(INADDR_LOOPBACK)) anywhere = true;
-                peers[peerCount++] = peer;
-            }
-        }
-        if (!outsideTests && std::memcmp(reinterpret_cast<const char*>(base + kSaveLeaf), kIsolated, sizeof(kIsolated) - 1) != 0) throw static_cast<DWORD>(ERROR_ACCESS_DENIED);
+        const auto folder = OwnFolder();
+        const int controller = setup.controller; const std::uint32_t mask = setup.mask; const unsigned short listenOn = setup.listenOn; const bool anywhere = setup.anywhere;
+        if (controller < 1 || controller >= kControllers) throw static_cast<DWORD>(ERROR_BAD_CONFIGURATION);
+        peerCount = setup.peerCount; steamPeerCount = setup.steamPeerCount; steamMessages = nullptr;
+        for (std::uint32_t n = 0; n < kMaxPeers; ++n) { peers[n] = setup.peers[n]; steamPeers[n] = setup.steamPeers[n]; }
+        if (!setup.outsideTests && std::memcmp(reinterpret_cast<const char*>(base + kSaveLeaf), kIsolated, sizeof(kIsolated) - 1) != 0) throw static_cast<DWORD>(ERROR_ACCESS_DENIED);
         if (steamPeerCount) {   // the game's own steam_api.dll: nothing is loaded that the game has not loaded
             const HMODULE steam = GetModuleHandleW(L"steam_api.dll");
             const auto get = steam ? reinterpret_cast<void*(__cdecl*)()>(GetProcAddress(steam, "SteamAPI_SteamNetworkingMessages_SteamAPI_v002")) : nullptr;
@@ -1664,7 +1737,10 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
         originalPlayerDamage = reinterpret_cast<NpcDamage>(*playerDamageSlot); originalCollision = reinterpret_cast<Collision>(*pickupSlot); originalSlotCollision = reinterpret_cast<Collision>(*slotSlot);
         HMODULE pinned = nullptr;
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&OnInput), &pinned)) throw GetLastError();
-        ownController = controller; host = role == "host"; rules = mask; peerHeard = false;
+        if (std::memcmp(reinterpret_cast<void*>(base + kCompare), kCompareEntry.data(), kCompareEntry.size()) != 0 &&
+            std::memcmp(reinterpret_cast<void*>(base + kCompare), kCompareEqual.data(), kCompareEqual.size()) != 0) throw static_cast<DWORD>(ERROR_REVISION_MISMATCH);
+        ownController = controller; host = setup.host; rules = mask; peerHeard = false;
+        stage = kHere; gaveUp = false; otherProtocol = 0; helloNumber = 0; startedAt = GetTickCount64(); for (auto& heard : heardStage) heard = 0;
         for (auto& perPeer : assemblies) for (auto& assembly : perPeer) { assembly.sequence = assembly.total = assembly.have = 0; assembly.chunks = 0; } counters[0] = 0; counters[1] = 0; stats = Stats{}; sequence = worldSequence = frame = 0;
         published = Published{}; published.magic = kBodyMagic; publishedWorld = PublishedWorld{}; publishedWorld.magic = kWorldMagic;
         publishedShots = PublishedShots{}; publishedShots.magic = kShotsMagic; shotsSequence = 0; knownProjectiles = Known{}; knownDrops = Known{}; knownEnemyBombs = Known{};
@@ -1689,7 +1765,10 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
             const auto failure = static_cast<DWORD>(WSAGetLastError()); CloseNetwork(); throw failure;
         }
         port = ntohs(address.sin_port);
-        if (const DWORD failure = Patch(kCompare, kCompareEqual, kCompareEntry)) { CloseNetwork(); throw failure; }
+        // With neighbours of its own the comparison goes off in the handshake, once everybody is there. Carried from outside
+        // there are no hellos: it goes off at once, as it always did on that path.
+        const bool carried = !peerCount && !steamPeerCount;
+        if (carried) if (const DWORD failure = Patch(kCompare, kCompareEqual, kCompareEntry)) { CloseNetwork(); throw failure; }
         running.store(true, std::memory_order_release);
         worker = CreateThread(nullptr, 0, &Receive, nullptr, 0, nullptr);
         DWORD failure = worker ? ExchangeSlot(slot, reinterpret_cast<void*>(original), reinterpret_cast<void*>(&OnInput)) : GetLastError();
@@ -1754,7 +1833,7 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
                 ExchangeSlot(playerDamageSlot, reinterpret_cast<void*>(&OnPlayerDamage), reinterpret_cast<void*>(originalPlayerDamage));
             }
         }
-        if (failure) { running = false; CloseNetwork(); Patch(kCompare, kCompareEntry, kCompareEqual); throw failure; }
+        if (failure) { running = false; CloseNetwork(); if (carried) Patch(kCompare, kCompareEntry, kCompareEqual); throw failure; }
         std::ofstream descriptor(folder / (L"native-" + std::to_wstring(GetCurrentProcessId()) + L".json"), std::ios::trunc);
         descriptor << "{\"pid\":" << GetCurrentProcessId() << ",\"role\":\"" << (host ? "native-host" : "native-guest") << "\",\"ownController\":" << ownController
                    << ",\"rules\":" << rules << ",\"peers\":" << peerCount << ",\"steamPeers\":" << steamPeerCount
@@ -1763,14 +1842,13 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
                    << ",\"publishedWorld\":" << reinterpret_cast<std::uintptr_t>(&publishedWorld) << ",\"publishedWorldBytes\":" << sizeof(publishedWorld)
                    << ",\"publishedShots\":" << reinterpret_cast<std::uintptr_t>(&publishedShots) << ",\"publishedShotsBytes\":" << sizeof(publishedShots)
                    << ",\"stats\":" << reinterpret_cast<std::uintptr_t>(&stats) << ",\"statsBytes\":" << sizeof(stats) << "}\n";
-        result = ERROR_SUCCESS;
-    } catch (DWORD failure) { result = failure ? failure : ERROR_INVALID_DATA; } catch (...) { result = ERROR_INVALID_DATA; }
-    ReleaseSRWLockExclusive(&lifecycle);
-    return result;
+    }
 }
 
-extern "C" DWORD WINAPI IsaacAuthorityNativeStop(void*) noexcept {
-    AcquireSRWLockExclusive(&lifecycle);
+// The stop itself, under the lifecycle lock. A stop asked for from outside leaves the comparison off on purpose: the games
+// have diverged, and turning it back on would split the lobby. The installed module stops when the match is over, and then
+// the comparison goes back: the next match may be one with players who have no module.
+DWORD End(bool restoreCompare) {
     DWORD result = ERROR_NOT_READY;
     if (running.load()) {
         running.store(false, std::memory_order_release);
@@ -1783,8 +1861,190 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStop(void*) noexcept {
         const DWORD sixth = ExchangeSlot(slotSlot, reinterpret_cast<void*>(&OnSlotCollision), reinterpret_cast<void*>(originalSlotCollision));
         if (!result) result = second ? second : third ? third : fourth ? fourth : fifth ? fifth : sixth;
         CloseNetwork();
-        // The comparison stays off on purpose: the games have already diverged, and turning it back on would split the lobby.
+        if (restoreCompare) Patch(kCompare, kCompareEntry, kCompareEqual);
+        stage.store(kHere, std::memory_order_relaxed);
     }
+    return result;
+}
+
+// ---- The installed module: it follows the game's log and starts and stops itself per match -------------------------
+std::atomic<bool> supervising{false}; HANDLE supervisor = nullptr;
+struct MatchLog {
+    bool on = false, expectOwn = false; int own = -1; std::uint32_t number = 0, roster = 0; std::uint64_t changedAt = 0;   // roster: counts the players who have left
+    std::uint64_t remoteIds[8]{}; int remoteDevices[8]{}; int remotes = 0;
+} match;
+std::uint64_t logOffset = 0; std::string logCarry;
+
+bool Isolated() { return std::memcmp(reinterpret_cast<const char*>(base + kSaveLeaf), kIsolated, sizeof(kIsolated) - 1) == 0; }
+
+// <Documents>\My Games\<the save folder's leaf, as the running image names it>\log.txt
+std::filesystem::path LogPath() {
+    wchar_t documents[MAX_PATH]{};
+    if (FAILED(SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, SHGFP_TYPE_CURRENT, documents))) throw static_cast<DWORD>(ERROR_PATH_NOT_FOUND);
+    const char* leaf = reinterpret_cast<const char*>(base + kSaveLeaf);
+    return std::filesystem::path(documents) / L"My Games" / std::filesystem::path(std::string(leaf, strnlen(leaf, 96))) / L"log.txt";
+}
+
+void TakeLogLine(const std::string& line) {
+    const auto now = GetTickCount64();
+    if (line.find("Start Networked") != std::string::npos) { const auto number = match.number + 1; match = MatchLog{}; match.on = true; match.number = number; match.changedAt = now; return; }
+    if (line.find("Menu Game Init") != std::string::npos || line.find("Leaving current lobby") != std::string::npos) { match.on = false; match.changedAt = now; return; }
+    if (!match.on) return;
+    if (const auto remote = line.find("Adding remote player, UserID = "); remote != std::string::npos) {
+        const auto device = line.find(", device ID = ", remote);
+        if (device != std::string::npos && match.remotes < 8) {
+            match.remoteIds[match.remotes] = std::strtoull(line.c_str() + remote + 31, nullptr, 10);
+            match.remoteDevices[match.remotes++] = static_cast<int>(std::strtol(line.c_str() + device + 14, nullptr, 10));
+        }
+        match.expectOwn = false; match.changedAt = now;
+    } else if (line.find("Adding local player") != std::string::npos) { match.expectOwn = true; match.changedAt = now; }
+    else if (const auto set = line.find("Setting controller ID to "); set != std::string::npos && match.expectOwn && line.find("(Prev: 0)") != std::string::npos) {
+        match.own = static_cast<int>(std::strtol(line.c_str() + set + 25, nullptr, 10)); match.expectOwn = false; match.changedAt = now;
+    } else if (const auto gone = line.find("Input device (ID = "); gone != std::string::npos && line.find(") disconnected", gone) != std::string::npos) {
+        // A player has left; the match goes on for the others. Whoever now has the lowest device number is the host.
+        const int device = static_cast<int>(std::strtol(line.c_str() + gone + 19, nullptr, 10));
+        for (int n = 0; n < match.remotes; ++n) {
+            if (match.remoteDevices[n] != device) continue;
+            for (int k = n + 1; k < match.remotes; ++k) { match.remoteIds[k - 1] = match.remoteIds[k]; match.remoteDevices[k - 1] = match.remoteDevices[k]; }
+            --match.remotes; ++match.roster; match.changedAt = now;
+            break;
+        }
+    }
+}
+
+// What the game has written to its log since the last look. The game keeps the file open: read it shared.
+void FollowLog(const std::filesystem::path& path) {
+    const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER size{}; GetFileSizeEx(file, &size);
+    if (static_cast<std::uint64_t>(size.QuadPart) < logOffset) { logOffset = 0; logCarry.clear(); match = MatchLog{}; }   // a new log
+    LARGE_INTEGER from{}; from.QuadPart = static_cast<LONGLONG>(logOffset);
+    static char buffer[65536]; DWORD got = 0;
+    if (SetFilePointerEx(file, from, nullptr, FILE_BEGIN))
+        while (ReadFile(file, buffer, sizeof(buffer), &got, nullptr) && got) {
+            logOffset += got; logCarry.append(buffer, got);
+            for (std::size_t end; (end = logCarry.find('\n')) != std::string::npos; logCarry.erase(0, end + 1)) TakeLogLine(logCarry.substr(0, end));
+            if (logCarry.size() > 8192) logCarry.clear();   // no line of the game's is that long
+        }
+    CloseHandle(file);
+}
+
+// The state, where the player sees it without looking for a file: the end of the game window's title.
+void ShowState(const wchar_t* text) {
+    static HWND window = nullptr; static std::wstring plainTitle, shown;
+    if (shown == text) return;
+    if (!window || !IsWindow(window)) {
+        struct Find { HWND found; } find{nullptr};
+        EnumWindows([](HWND each, LPARAM to) -> BOOL {
+            DWORD owner = 0; GetWindowThreadProcessId(each, &owner);
+            if (owner != GetCurrentProcessId() || !IsWindowVisible(each) || GetWindow(each, GW_OWNER)) return TRUE;
+            reinterpret_cast<Find*>(to)->found = each; return FALSE;
+        }, reinterpret_cast<LPARAM>(&find));
+        window = find.found; plainTitle.clear();
+    }
+    if (!window) return;
+    if (plainTitle.empty()) {
+        wchar_t title[256]{}; GetWindowTextW(window, title, 256); plainTitle = title;
+        if (const auto cut = plainTitle.find(L" | Authority"); cut != std::wstring::npos) plainTitle.erase(cut);
+    }
+    const std::wstring caption = *text ? plainTitle + L" | Authority: " + text : plainTitle;
+    SetWindowTextW(window, caption.c_str()); shown = text;
+}
+
+DWORD WINAPI Supervise(void*) noexcept {
+    std::uint32_t doneNumber = 0, startedNumber = 0, startedRoster = 0; bool unsupported = false; std::filesystem::path gameLog; const wchar_t* why = L"";
+    try {
+        static wchar_t image[32768]{};
+        unsupported = !GetModuleFileNameW(nullptr, image, 32768) || !isaac_probe::AnalyzeBytes(isaac_probe::ReadFile(image)).supported;
+        base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+        if (!unsupported) gameLog = LogPath();
+    } catch (...) { unsupported = true; }
+    while (supervising.load(std::memory_order_acquire)) {
+        Sleep(250);
+        if (unsupported) { ShowState(L"off - this version of the game is not supported"); continue; }
+        try {
+            // An isolated test instance is touched only when its harness asks: native-<pid>.cfg that begins with "auto".
+            Setup setup; setup.outsideTests = !Isolated();
+            std::ifstream config(OwnFolder() / (setup.outsideTests ? std::wstring(L"native.cfg") : L"native-" + std::to_wstring(GetCurrentProcessId()) + L".cfg"));
+            std::string first; const bool asked = static_cast<bool>(config >> first) && first == "auto";
+            if (!asked && !setup.outsideTests) continue;
+            if (asked) { if (!(config >> std::hex >> setup.mask)) { setup.mask = kAllRules; config.clear(); } config >> std::dec; ReadWords(config, setup); }
+            FollowLog(gameLog);
+            AcquireSRWLockExclusive(&lifecycle);
+            if (running.load() && (!match.on || startedNumber != match.number || startedRoster != match.roster || gaveUp.load())) {
+                // Somebody left and others remain: start anew with who is left (the comparison stays off - they have diverged).
+                // Anything else ends this match for the module, and the comparison goes back.
+                const bool goesOn = match.on && startedNumber == match.number && !gaveUp.load() && match.remotes > 0;
+                if (gaveUp.load()) why = L"off in this match - not every player has the module";
+                else if (match.on && startedNumber == match.number) why = L"off - the other players have left";
+                End(!goesOn);
+                if (!goesOn) doneNumber = startedNumber;
+            }
+            if (!match.on) why = L"";
+            const bool settled = match.on && match.own > 0 && match.remotes > 0 && GetTickCount64() - match.changedAt > 1500;
+            if (!running.load() && settled && match.number != doneNumber) {
+                setup.controller = match.own; setup.host = true; bool known = true;
+                for (int n = 0; n < match.remotes; ++n) {
+                    if (match.remoteDevices[n] < match.own) setup.host = false;   // the lowest device number is the host's: every game numbers the players alike
+                    if (setup.outsideTests && static_cast<std::uint32_t>(n) < kMaxPeers) {
+                        SteamIdentity identity{}; identity.type = 16; identity.size = 8; identity.id = match.remoteIds[n];
+                        known = known && (identity.id >> 32) == 0x01100001;   // a person's Steam id
+                        setup.steamPeers[setup.steamPeerCount++] = identity;
+                    }
+                }
+                known = known && match.remotes <= static_cast<int>(kMaxPeers) && (setup.steamPeerCount || setup.peerCount);
+                startedNumber = match.number; startedRoster = match.roster;
+                if (!known) { doneNumber = match.number; why = L"off - the other players are not reachable through Steam"; }
+                else try { Begin(setup); } catch (...) { doneNumber = match.number; why = L"off - the module could not start in this game"; }
+            }
+            const bool on = running.load(); const auto at = stage.load();
+            ReleaseSRWLockExclusive(&lifecycle);
+            if (setup.outsideTests)   // a test instance keeps its title: the harness and the localhost service know it by that
+                ShowState(on && at == kLive ? (host ? L"ON, host" : L"ON, guest") : on ? L"waiting for the other players' module" : why);
+        } catch (...) {}
+    }
+    return 0;
+}
+}
+
+extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
+    AcquireSRWLockExclusive(&lifecycle);
+    DWORD result = ERROR_INVALID_DATA;
+    try {
+        if (supervising.load()) throw static_cast<DWORD>(ERROR_ALREADY_INITIALIZED);
+        std::ifstream config(OwnFolder() / (L"native-" + std::to_wstring(GetCurrentProcessId()) + L".cfg"));
+        Setup setup; std::string role;
+        if (!(config >> setup.controller)) throw static_cast<DWORD>(ERROR_BAD_CONFIGURATION);
+        config >> role; setup.host = role == "host";
+        if (!(config >> std::hex >> setup.mask)) { setup.mask = kAllRules; config.clear(); }
+        config >> std::dec; ReadWords(config, setup);
+        Begin(setup);
+        result = ERROR_SUCCESS;
+    } catch (DWORD failure) { result = failure ? failure : ERROR_INVALID_DATA; } catch (...) { result = ERROR_INVALID_DATA; }
+    ReleaseSRWLockExclusive(&lifecycle);
+    return result;
+}
+
+// The installed way in: from now on the module looks after itself.
+extern "C" DWORD WINAPI IsaacAuthorityNativeAuto(void*) noexcept {
+    AcquireSRWLockExclusive(&lifecycle);
+    DWORD result = ERROR_ALREADY_INITIALIZED;
+    if (!supervising.load() && !running.load()) {
+        HMODULE pinned = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&Supervise), &pinned);
+        supervising.store(true, std::memory_order_release);
+        supervisor = CreateThread(nullptr, 0, &Supervise, nullptr, 0, nullptr);
+        result = supervisor ? ERROR_SUCCESS : GetLastError();
+        if (!supervisor) supervising.store(false, std::memory_order_release);
+    }
+    ReleaseSRWLockExclusive(&lifecycle);
+    return result;
+}
+
+extern "C" DWORD WINAPI IsaacAuthorityNativeStop(void*) noexcept {
+    if (supervising.exchange(false) && supervisor) { WaitForSingleObject(supervisor, 3000); CloseHandle(supervisor); supervisor = nullptr; }
+    AcquireSRWLockExclusive(&lifecycle);
+    const DWORD result = End(false);
     ReleaseSRWLockExclusive(&lifecycle);
     return result;
 }

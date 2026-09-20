@@ -48,7 +48,7 @@ FIRST_PORT = 27460   # the local pair: one port per game
 release = root / "Binaries/authority-build/Release"
 
 
-def attach(instances, mask, restart, carried):
+def attach(instances, mask, restart, carried, auto, installed):
     """Tell each game's module which lobby device is its local player - the 'Setting controller ID to N' that follows
     'Adding local player' in the game's own log - and attach it. A game that already runs the module is left as it is."""
     for instance in instances:
@@ -63,10 +63,14 @@ def attach(instances, mask, restart, carried):
         # The modules send to each other by themselves (the way two machines would) unless a process outside is to carry the slots.
         ports = {other["pid"]: FIRST_PORT + n for n, other in enumerate(instances)}
         network = "" if carried else f" listen={ports[pid]} " + " ".join(f"peer=127.0.0.1:{port}" for other, port in ports.items() if other != pid)
-        (folder / f"native-{pid}.cfg").write_text(f"{found[0]} {'host' if hosting else 'guest'} {mask:x}{network}", encoding="ascii")
+        # Installed or --auto: the module reads the game's log by itself - device, host and the end of the match; it is told
+        # only that this test instance may be touched, the rules, and the way to the neighbours (no Steam here).
+        (folder / f"native-{pid}.cfg").write_text(f"auto {mask:x}{network}" if auto or installed else f"{found[0]} {'host' if hosting else 'guest'} {mask:x}{network}", encoding="ascii")
+        if installed:   # the game has loaded the module itself, through the version.dll beside it
+            continue
         if restart:   # the same build, other rules: stop the running module first
             subprocess.run([str(release / "IsaacAuthorityAttach.exe"), "native-stop", str(pid), str(release / "IsaacAuthorityNative.dll")], capture_output=True, text=True)
-        done = subprocess.run([str(release / "IsaacAuthorityAttach.exe"), "native", str(pid), str(release / "IsaacAuthorityNative.dll")], capture_output=True, text=True)
+        done = subprocess.run([str(release / "IsaacAuthorityAttach.exe"), "native-auto" if auto else "native", str(pid), str(release / "IsaacAuthorityNative.dll")], capture_output=True, text=True)
         result = json.loads(done.stdout)["result"] if done.stdout.strip().startswith("{") else done.stderr.strip()
         if result not in (0, 1247):   # 1247: already attached
             raise SystemExit(f"{instance['title']}: the module did not start: {result}")
@@ -75,6 +79,8 @@ def attach(instances, mask, restart, carried):
 parser = argparse.ArgumentParser()
 parser.add_argument("--no-relay", action="store_true"); parser.add_argument("--delay-ms", type=int, default=0)
 parser.add_argument("--carried", action="store_true", help="carry the published slots between the games from outside (the link with delay, jitter and loss) instead of letting the modules send to each other")
+parser.add_argument("--auto", action="store_true", help="start the module the installed way: it follows the game's log and starts and stops itself per match")
+parser.add_argument("--installed", action="store_true", help="attach nothing: the games have loaded the module themselves (version.dll beside the game); only tell it that it may run here")
 parser.add_argument("--jitter-ms", type=int, default=0); parser.add_argument("--loss", type=float, default=0.0)
 parser.add_argument("--seconds", type=float, default=1.2)
 parser.add_argument("--without", default="", metavar="RULES", help="comma-separated rules to leave out: " + ", ".join(RULES))
@@ -87,11 +93,14 @@ instances = json.loads((root / "Binaries/game-instances/native-pair.json").read_
 left_out = [name for name in args.without.split(",") if name]
 if any(name not in RULES for name in left_out):
     raise SystemExit("unknown rule; known: " + ", ".join(RULES))
-attach(instances, 0x1FFFF & ~sum(RULES[name] for name in left_out), args.restart, args.carried)
+attach(instances, 0x1FFFF & ~sum(RULES[name] for name in left_out), args.restart, args.carried, args.auto, args.installed)
 folder = Path(os.environ["LOCALAPPDATA"]) / "IsaacAuthority"
 games = []
 for instance in instances:
-    descriptor = json.loads((folder / f"native-{instance['pid']}.json").read_text())
+    described = folder / f"native-{instance['pid']}.json"; waited = time.monotonic()
+    while (args.auto or args.installed) and not described.exists() and time.monotonic() - waited < 20:   # the module starts itself some two seconds into the match
+        time.sleep(0.25)
+    descriptor = json.loads(described.read_text())
     games.append(dict(pid=instance["pid"], title=instance["title"], descriptor=descriptor, process=reader.WindowsProcess(instance["pid"]),
                       relay=reader.WindowsProcess(instance["pid"]), last=0, lastWorld=0))
 lock = threading.Lock(); stop = threading.Event(); sent = [0]
