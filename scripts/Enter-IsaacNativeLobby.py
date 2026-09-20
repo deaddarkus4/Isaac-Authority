@@ -6,7 +6,8 @@ mismatch stops the run where it is. All pictures end up on one sheet for review.
 Enter-IsaacNativeLobby.py host|guest|ready PID intro|title|lobby OUTPUT_SHEET.png
 
 The games come from Start-IsaacNativePair.ps1. Order: host (the first game) - guest (each other game) - ready (the host again).
-Look at the game first to tell whether it still shows the intro or already the title. The pictures show one game window
+Whether the intro or already the title is on the screen is told from the first picture (the intro ends by itself); "intro"
+only allows one key to skip it. The pictures show one game window
 only, cut by its visible frame, and only while that window is in front - never the desktop."""
 import ctypes as C
 import ctypes.wintypes as W
@@ -57,6 +58,13 @@ def step(control, key, wait, note):
     pictures.append(image); print(f"{len(pictures):2}. {note}")
 
 
+def title(image):
+    """The title is the only menu screen with the big red logo: 4.5 % of saturated red against 0.15 % at most elsewhere."""
+    pixels = image.convert("RGB").tobytes()
+    red = sum(1 for n in range(0, len(pixels), 3) if pixels[n] > 140 and pixels[n + 1] < 70 and pixels[n + 2] < 70)
+    return red * 3 / len(pixels) > 0.02
+
+
 def need(condition, message):
     if not condition:
         save(); raise SystemExit("STOP: " + message)
@@ -76,9 +84,13 @@ control = pair.HostWindow(pid)
 try:
     if role in ("host", "guest"):
         step(control, None, 0.3, "before any key")
-        if screen == "intro":
+        # The intro ends by itself, so what was seen a minute ago does not count: the picture decides.
+        if not title(pictures[-1]):
+            need(screen == "intro", "neither the title nor an expected intro is on the screen")
             step(control, "space", 2.0, "space: skip the intro -> title")
+        need(title(pictures[-1]), "the title is not on the screen")
         step(control, "enter", 2.0, "enter: title -> file select")
+        need(not title(pictures[-1]), "the title is still on the screen")
         step(control, "space", 2.0, "space: file 1 -> main menu")
         need(service() == "none", "a network service exists before Online was entered")
         step(control, "down", 1.0, "down: cursor to Online")

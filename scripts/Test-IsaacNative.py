@@ -30,7 +30,12 @@ import isaac_link as link  # noqa: E402
 
 spec = importlib.util.spec_from_file_location("coop", Path(__file__).with_name("Test-IsaacCoop.py")); coop = importlib.util.module_from_spec(spec); spec.loader.exec_module(coop)
 reader, pair = coop.reader, coop.pair
-PUBLISHED = struct.Struct("<II4I"); PUBLISHED_BYTES = 8 + 36 + 4 * 10; STATS = struct.Struct("<21I4f"); WORLD_BYTES = 20 + 48 * 32 + 16 * 4
+PUBLISHED = struct.Struct("<II4I")
+COUNTERS = ("published", "received", "applied", "stale", "rejected", "otherRoom", "worldPublished", "worldReceived", "worldApplied", "npcMatched", "npcOnlyHost",
+            "npcOnlyLocal", "npcKilled", "hitPointFixes", "deathsHeld", "npcPaired", "npcRemoved",
+            "healthFixes", "copyDamageIgnored", "copyDeaths", "copyRevivalsMissed", "roomFollows", "roomFollowFailures", "stateFixes", "npcSpawned", "npcSpawnFailures",
+            "clearsHeld", "clearsFromHost", "copyRevivals", "copyTouchesIgnored", "taken", "takenApplied", "takenMissed", "animationFixes", "gridHeld", "gridFixes", "gridMismatch", "fireHeld")
+STATS = struct.Struct(f"<{len(COUNTERS)}I4f"); SUM = len(COUNTERS)   # four floats follow: correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax
 folder = Path(os.environ["LOCALAPPDATA"]) / "IsaacAuthority"
 release = root / "Binaries/authority-build/Release"
 
@@ -74,7 +79,7 @@ lock = threading.Lock(); stop = threading.Event(); sent = [0]
 
 
 def published(game):
-    blob = game["relay"].read(game["descriptor"]["published"], PUBLISHED_BYTES)
+    blob = game["relay"].read(game["descriptor"]["published"], game["descriptor"]["publishedBytes"])
     magic, generation, body_magic, controller, sequence, _ = PUBLISHED.unpack_from(blob)
     return None if generation & 1 or magic != 0x31524C50 or not sequence else (sequence, blob[8:])
 
@@ -82,7 +87,7 @@ def published(game):
 def published_world(game):
     """The host's enemies: read twice around the body, like any seqlock reader."""
     address = game["descriptor"]["publishedWorld"]
-    first = struct.unpack("<II", game["relay"].read(address, 8)); blob = game["relay"].read(address + 8, WORLD_BYTES)
+    first = struct.unpack("<II", game["relay"].read(address, 8)); blob = game["relay"].read(address + 8, game["descriptor"]["publishedWorldBytes"] - 8)
     last = struct.unpack("<II", game["relay"].read(address, 8)); sequence = struct.unpack_from("<I", blob, 4)[0]
     return None if first != last or first[1] & 1 or not sequence else (sequence, blob)
 
@@ -132,9 +137,9 @@ def positions():
 
 
 def stats(game):
-    names = ("published", "received", "applied", "stale", "rejected", "otherRoom", "worldPublished", "worldReceived", "worldApplied", "npcMatched", "npcOnlyHost",
-             "npcOnlyLocal", "npcKilled", "hitPointFixes", "deathsHeld", "npcPaired", "npcRemoved",
-             "healthFixes", "copyDamageIgnored", "copyDeaths", "copyRevivalsMissed", "correctionSum", "correctionMax", "npcCorrectionSum", "npcCorrectionMax")
+    if game["descriptor"]["statsBytes"] != STATS.size:
+        raise RuntimeError(f"The module counts {game['descriptor']['statsBytes']} bytes of statistics, this script expects {STATS.size}")
+    names = COUNTERS + ("correctionSum", "correctionMax", "npcCorrectionSum", "npcCorrectionMax")
     return dict(zip(names, STATS.unpack(game["process"].read(game["descriptor"]["stats"], STATS.size))))
 
 
@@ -174,8 +179,8 @@ def monitor():
         now = [STATS.unpack(process.read(g["descriptor"]["stats"], STATS.size)) for g, process in watch]
         if previous:
             for (g, _), a, b in zip(watch, now, previous):
-                if a[21] - b[21] > 12:
-                    big.append(dict(game=g["title"], during=label[0], corrections=a[2] - b[2], distance=round(a[21] - b[21], 1)))
+                if a[SUM] - b[SUM] > 12:
+                    big.append(dict(game=g["title"], during=label[0], corrections=a[2] - b[2], distance=round(a[SUM] - b[SUM], 1)))
         previous = now; time.sleep(0.02)
     for _, process in watch:
         process.close()
@@ -195,9 +200,9 @@ if args.play is not None:
             time.sleep(10)
             now = [stats(g) for g in games]; line = []
             for g, a, b in zip(games, now, previous):
-                line.append(f"{g['title'][-1]}: bodies {a['applied'] - b['applied']} (max fix {a['correctionMax']:.1f}), enemies matched {a['npcMatched'] - b['npcMatched']}, "
+                line.append(f"{g['title'][-1]}: FAULTS {a['rejected']}, bodies {a['applied'] - b['applied']} (max fix {a['correctionMax']:.1f}), enemies matched {a['npcMatched'] - b['npcMatched']}, "
                             f"paired {a['npcPaired']}, only host {a['npcOnlyHost'] - b['npcOnlyHost']}, removed {a['npcRemoved']}, killed {a['npcKilled']}, held {a['deathsHeld']}, other room {a['otherRoom'] - b['otherRoom']}; health fixes {a['healthFixes'] - b['healthFixes']}, blows to copies ignored {a['copyDamageIgnored']}, "
-                            f"copy deaths {a['copyDeaths']}, revivals missed {a['copyRevivalsMissed'] - b['copyRevivalsMissed']}")
+                            f"copy deaths {a['copyDeaths']}, revived {a['copyRevivals']}, revivals missed {a['copyRevivalsMissed'] - b['copyRevivalsMissed']}, taken {a['taken']} / applied from others {a['takenApplied']} / missed {a['takenMissed']} (copies' touches ignored {a['copyTouchesIgnored']}), rooms followed {a['roomFollows']} (failed {a['roomFollowFailures']}), behaviour fixes {a['stateFixes'] - b['stateFixes']}, animations started {a['animationFixes'] - b['animationFixes']}, enemies created {a['npcSpawned']} (failed {a['npcSpawnFailures']}), clears held {a['clearsHeld'] - b['clearsHeld']}, clears from host {a['clearsFromHost']}, grid held {a['gridHeld']} / set from host {a['gridFixes']} / mismatch {a['gridMismatch'] - b['gridMismatch']}, blows to fireplaces held {a['fireHeld']}")
             print(time.strftime('%H:%M:%S'), ' | '.join(line), flush=True); previous = now
     except (OSError, KeyboardInterrupt) as error:
         print('stopped:', type(error).__name__, error, flush=True)
