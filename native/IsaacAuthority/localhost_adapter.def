@@ -1,0 +1,4 @@
+LIBRARY IsaacAuthorityLocalhost
+EXPORTS
+    IsaacAuthorityLocalhostStart=_IsaacAuthorityLocalhostStart@4
+    IsaacAuthorityLocalhostStop=_IsaacAuthorityLocalhostStop@4
