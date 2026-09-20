@@ -109,9 +109,11 @@
 //   202, 203, 218, 235, 236, 804, 809, 852, 877, 893, 965) travel with the host's enemies whatever their maximum.
 // - a player's bombs are its owner's, like its tears (Entity_Bomb, table 0x7670f4, spawned by that player; Dr. Fetus'
 //   too): where and when a bomb goes off is what breaks the host's world, so the copy's bomb must be the owner's. They
-//   ride behind the tears in the same packet: frames to the explosion (+0x410, and its twin +0x414, as the game's
-//   SetExplosionCountdown writes them), damage +0x418, flags +0x428, fetus +0x448, radius +0x44c. A bomb that is gone at
-//   its owner goes off here at once (countdown 0) rather than vanish. Troll bombs have no player behind them: untouched.
+//   ride behind the tears in the same packet: frames to the explosion +0x410, damage +0x418, flags +0x438 (128 bits;
+//   the game's own setter also raises the byte +0x463 so that the bomb's costumes are loaded again), fetus +0x448,
+//   radius +0x44c - all read in a live game: 39 frames, 100 damage, radius 1. A bomb that is gone at its owner goes off
+//   here at once - countdown 0 in +0x410 and +0x414, exactly what the game's SetExplosionCountdown(0) writes - rather
+//   than vanish. Troll bombs have no player behind them: untouched.
 // Every rule of this module can be left out when it starts (the third word of the configuration, a mask in hex), so that
 // a rule that misbehaves in a live run is switched off without a rebuild.
 //
@@ -191,7 +193,7 @@ constexpr std::uintptr_t kProjectileDamage = 0x41c, kProjectileScale = 0x420, kP
 constexpr std::uintptr_t kCollisionDamage = 0x388, kSpawner = 0x3c8, kColor = 0xf0, kWeapon = 0x13dc, kWeaponOther = 0x13e0, kFireDelay = 0xc;
 constexpr std::array<std::uint8_t, 8> kTearSetScaleEntry{0x55, 0x8B, 0xEC, 0xF3, 0x0F, 0x10, 0x45, 0x08};
 constexpr std::uint32_t kProjectile = 9, kTear = 2, kShotsMagic = 0x31544853, kMaxShots = 64, kMaxTears = 32, kKnownShots = 256, kMaxShotSpawns = 24;   // "SHT1"
-constexpr std::uintptr_t kBombTable = 0x7670f4, kBombCountdown = 0x410, kBombCountdownTwin = 0x414, kBombDamage = 0x418, kBombFlags = 0x428, kBombFetus = 0x448, kBombRadius = 0x44c;
+constexpr std::uintptr_t kBombTable = 0x7670f4, kBombCountdown = 0x410, kBombCountdownTwin = 0x414, kBombDamage = 0x418, kBombFlags = 0x438, kBombCostumes = 0x463, kBombFetus = 0x448, kBombRadius = 0x44c;
 constexpr std::uint32_t kBomb = 4; constexpr int kOfEnemy = 0, kOfTear = 1, kOfBomb = 2;   // the kinds of shot
 constexpr std::uint64_t kTearsHeardMs = 3000; constexpr float kHeldFireDelay = 5.0f;
 // Pickups: the group of which one may be taken +0x528, price +0x534, shop slot +0x53c, frames left +0x540 (Lua accessors).
@@ -393,9 +395,11 @@ void ShotOnto(std::uintptr_t entity, int kind, const Shot& shot) {
     std::memcpy(reinterpret_cast<void*>(entity + kColor), shot.color, sizeof(shot.color));
     if (kind == kOfBomb) {
         const auto frames = static_cast<std::int32_t>(shot.height);
-        At<std::int32_t>(entity + kBombCountdown) = frames; At<std::int32_t>(entity + kBombCountdownTwin) = frames;
+        At<std::int32_t>(entity + kBombCountdown) = frames;   // +0x414 stays as it is: 0 in a bomb that simply burns down
         At<float>(entity + kBombRadius) = shot.fallingSpeed; At<std::uint8_t>(entity + kBombFetus) = shot.fallingAccel != 0.0f; At<float>(entity + kBombDamage) = shot.damage;
-        std::memcpy(reinterpret_cast<void*>(entity + kBombFlags), shot.flags, 16);
+        if (std::memcmp(reinterpret_cast<void*>(entity + kBombFlags), shot.flags, 16) != 0) {   // as the game's own setter of Flags
+            std::memcpy(reinterpret_cast<void*>(entity + kBombFlags), shot.flags, 16); At<std::uint8_t>(entity + kBombCostumes) = 1;
+        }
         return;
     }
     At<float>(entity + kHeight) = shot.height; At<float>(entity + kFallingSpeed) = shot.fallingSpeed; At<float>(entity + kFallingAccel) = shot.fallingAccel;
