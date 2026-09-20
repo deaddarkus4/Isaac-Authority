@@ -1,0 +1,4 @@
+LIBRARY IsaacAuthorityNative
+EXPORTS
+    IsaacAuthorityNativeStart=_IsaacAuthorityNativeStart@4
+    IsaacAuthorityNativeStop=_IsaacAuthorityNativeStop@4
