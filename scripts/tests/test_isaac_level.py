@@ -10,11 +10,11 @@ spec.loader.exec_module(level)
 BASE, GAME, CONFIGS = 0x400000, 0x1000000, 0x2000000
 
 
-def memory(seed, index, rooms):
+def memory(seed, index, rooms, difficulty=1, curses=0):
     """Sparse fake process: (grid, type, variant, shape, spawnSeed, visits) per room."""
     cells = {BASE + level.GAME_RVA: GAME, GAME: 1, GAME + 4: 0, GAME + level.START_SEED: seed,
              GAME + level.ROOM_INDEX: index, GAME + level.DIMENSION: 0, GAME + level.ROOM_COUNT: len(rooms),
-             GAME + level.ROOM_TRANSITION: 0}
+             GAME + level.ROOM_TRANSITION: 0, GAME + level.DIFFICULTY: difficulty, GAME + level.CURSES: curses}
     for slot, (grid, kind, variant, shape, spawn, visits) in enumerate(rooms):
         descriptor, config = GAME + level.ROOMS + slot * level.ROOM_STRIDE, CONFIGS + slot * 0x100
         cells.update({descriptor: grid, descriptor + 0xC: 0, descriptor + 0x10: config, descriptor + 0x40: visits,
@@ -58,6 +58,16 @@ class LevelTests(unittest.TestCase):
         self.assertEqual(sorted(level.doors(a)), ["down", "right"])
         self.assertEqual({name: room["grid"] for name, room in level.shared_doors(a, b).items()}, {"down": 97})
         self.assertEqual(level.room_differences(a, level.snapshot(memory(446746862, 84, host[:-1]), BASE)), [(97, 0)])
+
+    def test_a_curse_or_a_difficulty_is_part_of_the_run(self):
+        # Observed with seed CZH4 8E6W on hard: Curse of Darkness with a progressed save, no curse with a clean one.
+        host = level.snapshot(memory(446746862, 84, ROOMS, curses=1), BASE)
+        clean = level.snapshot(memory(446746862, 84, ROOMS), BASE)
+        self.assertEqual(level.run_differences(host, clean), ["curses: 1 != 0"])
+        self.assertEqual(level.run_differences(host, level.snapshot(memory(446746862, 84, ROOMS, curses=1), BASE)), [])
+        self.assertEqual(level.run_differences(clean, level.snapshot(memory(446746862, 84, ROOMS, difficulty=0), BASE)), ["difficulty: 1 != 0"])
+        self.assertEqual((level.curse_names(0), level.curse_names(1), level.curse_names(0b1000010), level.curse_names(0x100)),
+                         ([], ["Darkness"], ["Labyrinth", "Blind"], ["0x100"]))
 
     def test_doors_only_lead_to_ordinary_single_rooms(self):
         host = level.snapshot(memory(446746862, 84, ROOMS), BASE)

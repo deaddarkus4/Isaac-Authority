@@ -1,0 +1,34 @@
+{
+  "gameSha256": "3bdfc8bae0dc7e334b76009d0ad45dfbb16ee5f00c06ffbc3a0094e34d44616b",
+  "scope": "what decides a level besides the seed: the save file, the difficulty, the curses",
+  "finding": "with one run seed, character and difficulty, two games generate the same level and the same curse only from the same persistent game data; mods (all disabled) and difficulty were ruled out",
+  "persistentGameData": {
+    "object": "embedded in Manager (RVA 0x87169c) at +0x14",
+    "readOnlyFlag": "byte +1 of the object, Manager+0x15; 1 in every seeded run observed",
+    "setReadOnlyRva": "0x5299e0",
+    "fileHeader": "ISAACNGSAVE09R  ",
+    "fileNames": "persistentgamedata<slot>.dat in the profile folder; rep+persistentgamedata<slot>.dat in Steam Cloud, same format"
+  },
+  "gameFields": {
+    "difficulty": "Game+0x269c8, 0 normal, 1 hard, 2 greed, 3 greedier (Lua getter RVA 0x19e290; Game::IsGreedMode RVA 0x2f8120 reads the same field)",
+    "levelCurses": "Level+0xc with the level at the head of the game object, bit 0 Darkness .. bit 7 Giant (Level::GetCurses RVA 0x348490 also ors Game+0x26550 and two adjustments)"
+  },
+  "officialOnline": {
+    "note": "read statically from the log strings' users, nothing here was called",
+    "matchStartRva": "0x50e2a0",
+    "matchStart": "sets the save read-only, starts the game (0x2f8140), restores the flag, places the players, then loads shared state from a buffer (0x2f6500, pointer and size), checks player count against remote players, binds players to controllers and colours",
+    "saveChecksumInFrameCheckRva": "0x50d4a0",
+    "participantSaves": "container at Manager+0x4b414 keyed by Manager+0x4c5a8; the desync report (RVA 0x503040, 0x5032d0) prints four shared save user ids and dumps desync_shared_save.dat",
+    "fromRepentogonSignatures": {"Game::RestoreState": "0x2bb790", "GameState::write": "0x5c9340", "Game::SaveState": ["0x2f9000", "0x512b60"], "Game::NetStart": null}
+  },
+  "validation": {
+    "threeInstancesCompared": true,
+    "sameSaveSameLevel": "0 of 15 rooms differ, same Curse of Darkness",
+    "cleanSaveDiffers": "5 of 15 rooms differ (83, 85, 109, 126, 138), no curse",
+    "seedKeptAcrossRestart": true,
+    "liveRoomTransitionThroughFormerlyDivergentRoom": "right door 84 -> 85, 7 of 7 enemies matched in 208 of 208 frames",
+    "hostSaveOnlyRead": true,
+    "report": "docs/j460-shared-save.md",
+    "summary": "npc-20260920-001232-732906"
+  }
+}

@@ -10,7 +10,8 @@ import java.nio.file.*;
 import java.util.*;
 
 // Arguments: OUTPUT_DIRECTORY, then "name:LuaMethod" (resolved through its binding registration), "data:RVA"
-// (every function referencing that global) or a hex RVA.
+// (every function referencing that global), "addr:RVA" (the function containing it), "text:Fragment_of_a_log_string"
+// (every function using a string that contains it; '_' stands for a space) or a hex RVA.
 public class ExportIsaacRoom extends GhidraScript {
     @Override public void run() throws Exception {
         if (!"3bdfc8bae0dc7e334b76009d0ad45dfbb16ee5f00c06ffbc3a0094e34d44616b".equalsIgnoreCase(currentProgram.getExecutableSHA256()))
@@ -39,6 +40,36 @@ public class ExportIsaacRoom extends GhidraScript {
                 // The function containing an instruction address, e.g. one found by scanning for a field offset.
                 Function owner = getFunctionContaining(currentProgram.getImageBase().add(Long.decode(args[i].substring(5))));
                 if (owner != null) targets.putIfAbsent(owner.getEntryPoint().getOffset() - imageBase, args[i]);
+                continue;
+            }
+            if (args[i].startsWith("text:")) {
+                // Every function that uses a log or format string containing this fragment ('_' stands for a space,
+                // the headless launcher splits arguments on spaces). The string may start before the fragment.
+                String fragment = args[i].substring(5).replace('_', ' ');
+                byte[] bytes = fragment.getBytes(StandardCharsets.US_ASCII);
+                Address next = currentProgram.getMinAddress();
+                while (next != null) {
+                    Address found = currentProgram.getMemory().findBytes(next, bytes, null, true, monitor);
+                    if (found == null) break;
+                    Address start = found;
+                    for (int back = 0; back < 200; ++back) {
+                        Address previous = start.subtract(1);
+                        if (!currentProgram.getMemory().contains(previous)) break;
+                        int ch = currentProgram.getMemory().getByte(previous) & 0xff;
+                        if (ch < 32 || ch > 126) break;
+                        start = previous;
+                    }
+                    ReferenceIterator users = currentProgram.getReferenceManager().getReferencesTo(start);
+                    while (users.hasNext()) {
+                        Address reference = users.next().getFromAddress();
+                        Function user = getFunctionContaining(reference);
+                        index.add(fragment + "\t" + start + "\t" + reference + "\t" +
+                            (user == null ? "" : "0x" + Long.toHexString(user.getEntryPoint().getOffset() - imageBase)) + "\t" +
+                            (user == null ? "" : user.getEntryPoint().toString()));
+                        if (user != null) targets.putIfAbsent(user.getEntryPoint().getOffset() - imageBase, "text:" + fragment);
+                    }
+                    next = found.add(bytes.length);
+                }
                 continue;
             }
             if (!args[i].startsWith("name:")) { targets.putIfAbsent(Long.decode(args[i]), "rva"); continue; }

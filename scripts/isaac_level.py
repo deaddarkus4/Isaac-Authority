@@ -6,6 +6,10 @@ START_SEED = 0x1BB88
 ROOM_INDEX, DIMENSION = 0x18304, 0x1830C
 ROOM_COUNT, ROOMS, ROOM_STRIDE, ROOM_LOOKUP = 0x182CC, 0x14, 0xB8, 0x17ADC
 ROOM_TRANSITION = 0x1B83C
+# Game.Difficulty (Lua getter RVA 0x19e290): 0 normal, 1 hard, 2 greed, 3 greedier. Level curses as a bit mask
+# (Level::GetCurses, RVA 0x348490, reads Level+0xc; the level is the head of the game object).
+DIFFICULTY, CURSES = 0x269C8, 0xC
+CURSE_NAMES = ("Darkness", "Labyrinth", "Lost", "Unknown", "Cursed", "Maze", "Blind", "Giant")
 FRAME_COUNT = 0x264F8
 # Both are inputs of Game::IsPaused (RVA 0x2fd350). Observed: PAUSE_MENU 1 with Options / Resume / Exit open,
 # GAME_OVER 2 on the death screen; both 0 during play.
@@ -78,7 +82,8 @@ def snapshot(read, base):
                           visits=u32(read, descriptor + 0x40)))
     return dict(startSeed=u32(read, game + START_SEED), stage=u32(read, game), stageType=u32(read, game + 4),
                 index=u32(read, game + ROOM_INDEX), dimension=u32(read, game + DIMENSION),
-                transition=u32(read, game + ROOM_TRANSITION), rooms=rooms)
+                transition=u32(read, game + ROOM_TRANSITION), difficulty=u32(read, game + DIFFICULTY),
+                curses=u32(read, game + CURSES), rooms=rooms)
 
 
 def entities(read, base):
@@ -115,8 +120,14 @@ def place(room):
     return tuple(room[key] for key in PLACE)
 
 
+def curse_names(mask):
+    return [name for bit, name in enumerate(CURSE_NAMES) if mask >> bit & 1] + ([hex(mask >> len(CURSE_NAMES) << len(CURSE_NAMES))] if mask >> len(CURSE_NAMES) else [])
+
+
 def run_differences(a, b):
-    return [f"{key}: {a[key]} != {b[key]}" for key in ("startSeed", "stage", "stageType") if a[key] != b[key]]
+    """What two games must share besides the rooms. A curse is part of the level: with one seed it still differs when the
+    save files differ, because curses, like room pools, depend on what the save has unlocked."""
+    return [f"{key}: {a[key]} != {b[key]}" for key in ("startSeed", "stage", "stageType", "difficulty", "curses") if a[key] != b[key]]
 
 
 def room_differences(a, b):

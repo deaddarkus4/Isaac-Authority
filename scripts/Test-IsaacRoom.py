@@ -129,7 +129,9 @@ def run(args):
     if args.check or report["problems"]:
         print(json.dumps(report, indent=2))
         if report["problems"]:
-            raise SystemExit("Start the REPLICA run with the HOST seed %s, both in the first room" % report["hostSeed"])
+            raise SystemExit("Both games need the run seed %s, the same difficulty and the first room; a level or a curse that still "
+                             "differs means different save files: start the other instance with "
+                             "Start-IsaacReplica.ps1 -PersistentGameData <the host's save>" % report["hostSeed"])
         return
     direction = args.direction or next(iter(report["doors"]))
     if direction not in report["doors"]:
