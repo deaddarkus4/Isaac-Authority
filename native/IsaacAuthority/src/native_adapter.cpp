@@ -236,7 +236,7 @@ constexpr std::uint8_t kOfBody = 1, kOfShots = 2, kOfWorld = 3, kOfHello = 4;
 // it turns its comparison off and says so; once every other player has said that too, it goes live. So a match in which
 // anybody plays without the module stays the game's own match to the last byte, and nobody diverges while a neighbour
 // still compares. A module nobody answers gives up after kHelloPatienceMs and sends nothing more.
-constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 1, kHelloEveryFrames = 30;   // "HEL1"
+constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 2, kHelloEveryFrames = 30;   // "HEL1"; protocol 2: the receiver numbers the sender's player
 constexpr std::uint64_t kHelloPatienceMs = 60000;
 constexpr std::uint8_t kHere = 0, kCompareOff = 1, kLive = 2;
 constexpr int kSteamChannel = 7460, kSteamSendFlags = 1 | 32;   // unreliable, no Nagle; restart a broken session by itself
@@ -401,6 +401,8 @@ sockaddr_in peers[kMaxPeers]{}; std::uint32_t peerCount = 0; std::atomic<bool> p
 // came with another protocol, and when this module started (for its patience).
 std::atomic<std::uint8_t> stage{kHere}, heardStage[kMaxPeers]{}; std::atomic<std::uint32_t> otherProtocol{0}; std::uint64_t startedAt = 0; std::uint32_t helloNumber = 0;
 std::atomic<bool> gaveUp{false};
+// Under which device number THIS game keeps each neighbour's player (-1: not known - then the number the neighbour names is taken).
+int peerControllers[kMaxPeers] = {-1, -1, -1, -1};
 // Steam: the neighbours by id and the four exports of the game's steam_api.dll that carry a datagram to them and back.
 using SteamSend = int(__cdecl*)(void*, const SteamIdentity*, const void*, std::uint32_t, int, int);
 using SteamReceive = int(__cdecl*)(void*, int, void**, int);
@@ -1543,9 +1545,15 @@ bool DeliverWorld(const World& world) {
 bool TakeChunk(std::uint32_t n, const std::uint8_t* datagram, int got) {
     FrameHeader header; std::memcpy(&header, datagram, sizeof(header));
     const auto* payload = datagram + sizeof(header); const auto part = static_cast<std::uint32_t>(got) - static_cast<std::uint32_t>(sizeof(header));
+    // Device numbers are each process's own: a game that has played matches since its launch numbers the same players higher
+    // than a fresh one (seen between two Steam clients: the owner said 5, its copy here was 3 - and no body ever reached the
+    // copy). So when this game knows under which number it keeps the sender's player, that number replaces the sender's.
+    const int localNumber = n < kMaxPeers ? peerControllers[n] : -1;
     if (header.kind == kOfBody) {
         if (header.chunks != 1 || part != sizeof(Body)) return false;
-        Body body; std::memcpy(&body, payload, sizeof(body)); return DeliverBody(body);
+        Body body; std::memcpy(&body, payload, sizeof(body));
+        if (localNumber >= 0) body.controller = static_cast<std::uint32_t>(localNumber);
+        return DeliverBody(body);
     }
     if (header.kind == kOfHello) {
         Hello hello;
@@ -1570,7 +1578,10 @@ bool TakeChunk(std::uint32_t n, const std::uint8_t* datagram, int got) {
     if (assembly.have != (1u << header.chunks) - 1u) return true;
     assembly.have = 0;   // whole: once
     if (header.kind == kOfWorld) { static World world; return UnpackWorld(assembly.data, assembly.total, world) && DeliverWorld(world); }
-    static Shots shots; return UnpackShots(assembly.data, assembly.total, shots) && DeliverShots(shots);
+    static Shots shots;
+    if (!UnpackShots(assembly.data, assembly.total, shots)) return false;
+    if (localNumber >= 0) shots.controller = static_cast<std::uint32_t>(localNumber);
+    return DeliverShots(shots);
 }
 
 // Steam's messages of our channel: each is one datagram of a frame. SteamNetworkingMessage_t: data +0, size +4, the sender's identity +12 (its Steam id +20).
@@ -1666,6 +1677,7 @@ std::filesystem::path OwnFolder() {
 struct Setup {
     int controller = -1; bool host = false; std::uint32_t mask = kAllRules; unsigned short listenOn = 0; bool anywhere = false, outsideTests = false;
     sockaddr_in peers[kMaxPeers]{}; std::uint32_t peerCount = 0; SteamIdentity steamPeers[kMaxPeers]{}; std::uint32_t steamPeerCount = 0;
+    int peerControllers[kMaxPeers] = {-1, -1, -1, -1};   // this game's device number of each neighbour's player, where known
 };
 
 // The words of a configuration, in any order: listen=PORT, peer=IP:PORT and steampeer=ID64 (up to four of each), steam - the
@@ -1700,7 +1712,7 @@ void Begin(const Setup& setup) {
         const int controller = setup.controller; const std::uint32_t mask = setup.mask; const unsigned short listenOn = setup.listenOn; const bool anywhere = setup.anywhere;
         if (controller < 1 || controller >= kControllers) throw static_cast<DWORD>(ERROR_BAD_CONFIGURATION);
         peerCount = setup.peerCount; steamPeerCount = setup.steamPeerCount; steamMessages = nullptr;
-        for (std::uint32_t n = 0; n < kMaxPeers; ++n) { peers[n] = setup.peers[n]; steamPeers[n] = setup.steamPeers[n]; }
+        for (std::uint32_t n = 0; n < kMaxPeers; ++n) { peers[n] = setup.peers[n]; steamPeers[n] = setup.steamPeers[n]; peerControllers[n] = setup.peerControllers[n]; }
         if (!setup.outsideTests && std::memcmp(reinterpret_cast<const char*>(base + kSaveLeaf), kIsolated, sizeof(kIsolated) - 1) != 0) throw static_cast<DWORD>(ERROR_ACCESS_DENIED);
         if (steamPeerCount) {   // the game's own steam_api.dll: nothing is loaded that the game has not loaded
             const HMODULE steam = GetModuleHandleW(L"steam_api.dll");
@@ -1929,10 +1941,11 @@ void FollowLog(const std::filesystem::path& path) {
     CloseHandle(file);
 }
 
-// The state, where the player sees it without looking for a file: the end of the game window's title.
+// The state, where the player sees it without looking for a file: the end of the game window's title. It is there from the
+// main menu on ("loaded"), so that a player knows the module is in before a match begins.
+constexpr wchar_t kVersionText[] = L"0.1.1";
 void ShowState(const wchar_t* text) {
-    static HWND window = nullptr; static std::wstring plainTitle, shown;
-    if (shown == text) return;
+    static HWND window = nullptr;
     if (!window || !IsWindow(window)) {
         struct Find { HWND found; } find{nullptr};
         EnumWindows([](HWND each, LPARAM to) -> BOOL {
@@ -1940,15 +1953,16 @@ void ShowState(const wchar_t* text) {
             if (owner != GetCurrentProcessId() || !IsWindowVisible(each) || GetWindow(each, GW_OWNER)) return TRUE;
             reinterpret_cast<Find*>(to)->found = each; return FALSE;
         }, reinterpret_cast<LPARAM>(&find));
-        window = find.found; plainTitle.clear();
+        window = find.found;
     }
     if (!window) return;
-    if (plainTitle.empty()) {
-        wchar_t title[256]{}; GetWindowTextW(window, title, 256); plainTitle = title;
-        if (const auto cut = plainTitle.find(L" | Authority"); cut != std::wstring::npos) plainTitle.erase(cut);
-    }
-    const std::wstring caption = *text ? plainTitle + L" | Authority: " + text : plainTitle;
-    SetWindowTextW(window, caption.c_str()); shown = text;
+    // Against the title as it is now: the game names its window some time after it has made it, and may name it again.
+    wchar_t title[256]{}; GetWindowTextW(window, title, 256);
+    const std::wstring current = title; std::wstring plain = current;
+    if (const auto cut = plain.find(L" | Authority"); cut != std::wstring::npos) plain.erase(cut);
+    if (plain.empty()) return;
+    const std::wstring caption = *text ? plain + L" | Authority " + kVersionText + L": " + text : plain;
+    if (caption != current) SetWindowTextW(window, caption.c_str());
 }
 
 DWORD WINAPI Supervise(void*) noexcept {
@@ -1985,13 +1999,18 @@ DWORD WINAPI Supervise(void*) noexcept {
             if (!running.load() && settled && match.number != doneNumber) {
                 setup.controller = match.own; setup.host = true; bool known = true;
                 for (int n = 0; n < match.remotes; ++n) {
-                    if (match.remoteDevices[n] < match.own) setup.host = false;   // the lowest device number is the host's: every game numbers the players alike
+                    // The lowest device number is the host's. The numbers are each process's own, but every game adds the
+                    // players in the lobby's order and numbers them as it adds them - so all agree on who came first.
+                    if (match.remoteDevices[n] < match.own) setup.host = false;
                     if (setup.outsideTests && static_cast<std::uint32_t>(n) < kMaxPeers) {
                         SteamIdentity identity{}; identity.type = 16; identity.size = 8; identity.id = match.remoteIds[n];
                         known = known && (identity.id >> 32) == 0x01100001;   // a person's Steam id
+                        setup.peerControllers[setup.steamPeerCount] = match.remoteDevices[n];
                         setup.steamPeers[setup.steamPeerCount++] = identity;
                     }
                 }
+                // A test pair names its one neighbour by address: that neighbour is the one remote player of the log.
+                if (!setup.outsideTests && setup.peerCount == 1 && match.remotes == 1) setup.peerControllers[0] = match.remoteDevices[0];
                 known = known && match.remotes <= static_cast<int>(kMaxPeers) && (setup.steamPeerCount || setup.peerCount);
                 startedNumber = match.number; startedRoster = match.roster;
                 if (!known) { doneNumber = match.number; why = L"off - the other players are not reachable through Steam"; }
@@ -2000,7 +2019,7 @@ DWORD WINAPI Supervise(void*) noexcept {
             const bool on = running.load(); const auto at = stage.load();
             ReleaseSRWLockExclusive(&lifecycle);
             if (setup.outsideTests)   // a test instance keeps its title: the harness and the localhost service know it by that
-                ShowState(on && at == kLive ? (host ? L"ON, host" : L"ON, guest") : on ? L"waiting for the other players' module" : why);
+                ShowState(on && at == kLive ? (host ? L"ON, host" : L"ON, guest") : on ? L"waiting for the other players' module" : *why ? why : L"loaded");
         } catch (...) {}
     }
     return 0;

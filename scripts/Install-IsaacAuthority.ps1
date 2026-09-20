@@ -60,7 +60,7 @@ try {
     if ($mask -ne 0x1FFFF) { [IO.File]::WriteAllText((Join-Path $settings 'native.cfg'), ('auto {0:x}' -f $mask), [Text.Encoding]::ASCII) }
     else { Remove-Item -LiteralPath (Join-Path $settings 'native.cfg') -ErrorAction SilentlyContinue }
     Write-Host "Installed into $GameFolder."
-    Write-Host 'Play as usual. In an online match of players who ALL have this installed, the window title ends with "Authority: ON".'
+    Write-Host 'Play as usual. The window title ends with "Authority <version>: loaded" from the main menu on, and with "ON, host" or "ON, guest" in an online match of players who ALL have the same version installed.'
 } catch [UnauthorizedAccessException] {
     throw "No right to write into $GameFolder - run this as administrator."
 }
