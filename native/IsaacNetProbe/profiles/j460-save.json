@@ -27,7 +27,8 @@
         "0x512b60"
       ],
       "Game::NetStart": null
-    }
+    },
+    "sharedSaveIsAnIntersection": "first-hand account of the user, not read from the binary: what any lobby member has not unlocked appears for nobody, and the shop's level and donated coins adjust the same way; there is no joining a run in progress"
   },
   "validation": {
     "threeInstancesCompared": true,
@@ -58,5 +59,19 @@
       "report": "docs/j460-run-join.md",
       "summary": "predict-20260920-002456-550696"
     }
+  },
+  "fileFormat": {
+    "loaderRva": "0x526f10",
+    "layout": "16-byte header ISAACNGSAVE09R, one word the loader stores unchecked (object +0xf84), chunks of (type, size word, element count, elements), the bestiary (chunk 11, variable), a closing checksum",
+    "chunks": "1 achievements 642 x u8, 2 counters 523 x u32, 3 level counters 14 x u32, 4 collectibles 733 x u8, 5 minibosses 7 x u8, 6 bosses 104 x u8, 7 challenges 46 x u8, 8 cutscene counters 27 x u32, 9 game settings 2 x u32, 10 special seed counters 80 x u8; chunks 1-10 end at byte 4016; the size word is four times the count except for chunk 1",
+    "checksumRva": "0x283580 (range) and 0x283410 (algorithm)",
+    "checksum": "over bytes [16, length-4): CRC-32 polynomial 0xEDB88320 with the game's own table, built with one logical and seven arithmetic right shifts, seed 0xFEDCBA76 inverted before and after; stored in the last four bytes",
+    "verifiedOn": "four real J460 saves, byte-exact parse and rebuild"
+  },
+  "lobbySave": {
+    "tool": "scripts/isaac_save.py merge --output <file> <host save> <guest save>...",
+    "rule": "every flag and counter becomes the smallest value any participant has; game settings, bestiary and the unchecked word come from the host",
+    "validation": "a file written by the tool from the progressed and the clean save was accepted by the game (no checksum warning, locked characters, win streak 0) and gave the clean save's level: 0 of 15 rooms differ from the clean-save game, no curse; 5 rooms and the curse differ from the host",
+    "report": "docs/j460-lobby-save.md"
   }
 }
