@@ -122,6 +122,14 @@
 // - the floor. A room index means a room of one floor only: every body and the world name the floor (the game's stage and
 //   stage type, Game+0 and +4), and nothing of another floor is applied - neither a place nor the host's lists, which
 //   would empty a room that merely shares the number. Following to another floor is not done yet, only counted.
+// - slot machines and beggars (Entity_Slot, table 0x764c50; read in the user's running game: state +0x410 is 1 while it
+//   waits and 2 while it plays, the 16 bits at +0x41c count the play down from 30, and the payout is rolled when they
+//   reach 0). The host's world lists them with state, prize, countdown, donations, trigger timer and animation; a guest
+//   writes these into its twin and starts the host's animation, and keeps a playing twin's countdown at 2 or more so that
+//   it never rolls a payout of its own - the payout is the host's pickups. A touch is its owner's event, like a taking: a
+//   copy's touch does nothing anywhere (a copy led along its owner's path stands just outside the machine), a guest's own
+//   touch of a waiting machine is not played here but sent, and the host plays it with the machine's own collision (slot
+//   23, RVA 0x2627e0) for its copy of that player - who pays from the team's counters, which are the host's anyway.
 // Every rule of this module can be left out when it starts (the third word of the configuration, a mask in hex), so that
 // a rule that misbehaves in a live run is switched off without a rebuild.
 //
@@ -202,6 +210,8 @@ constexpr std::uintptr_t kCollisionDamage = 0x388, kSpawner = 0x3c8, kColor = 0x
 constexpr std::array<std::uint8_t, 8> kTearSetScaleEntry{0x55, 0x8B, 0xEC, 0xF3, 0x0F, 0x10, 0x45, 0x08};
 constexpr std::uint32_t kProjectile = 9, kTear = 2, kShotsMagic = 0x31544853, kMaxShots = 64, kMaxTears = 32, kKnownShots = 256, kMaxShotSpawns = 24;   // "SHT1"
 constexpr std::uintptr_t kBombTable = 0x7670f4, kBombCountdown = 0x410, kBombCountdownTwin = 0x414, kBombDamage = 0x418, kBombFlags = 0x438, kBombCostumes = 0x463, kBombFetus = 0x448, kBombRadius = 0x44c;
+constexpr std::uintptr_t kSlotTable = 0x764c50, kSlotCollision = 0x2627e0, kSlotState = 0x410, kSlotPrize = 0x414, kSlotTimeout = 0x41c, kSlotDonation = 0x420, kSlotTrigger = 0x424;
+constexpr std::uint32_t kSlotEntity = 6, kMaxSlots = 8, kSlotTouch = 0x100, kSlotTouchEveryFrames = 8, kSlotSpawnSnapshots = 10;   // kSlotTouch: in a taking's 'low', a touch of a machine
 constexpr std::uintptr_t kRoomHurt = 0x120c, kNotAPlayer = 1;   // kNotAPlayer: as a spawner to look for - nobody of the players
 constexpr std::uint32_t kMaxEnemyBombs = 16;
 constexpr std::uint32_t kBomb = 4; constexpr int kOfEnemy = 0, kOfTear = 1, kOfBomb = 2;   // the kinds of shot
@@ -220,7 +230,7 @@ constexpr std::array<std::uint8_t, 8> kDoorRefreshEntry{0x55, 0x8B, 0xEC, 0x6A, 
 constexpr std::uint32_t kDoorSnapshots = 4, kDoorHoldFrames = 30;
 // The rules that can be left out: the third word of the configuration is their mask in hex.
 constexpr std::uint32_t kFollow = 1, kBehaviour = 2, kClear = 4, kTaken = 8, kGridRule = 16, kFire = 32, kProjectiles = 64, kTears = 128, kDrops = 256,
-    kCounters = 512, kDoors = 1024, kTraps = 2048, kBombsRule = 4096, kHurt = 8192, kAllRules = 0x3FFF;
+    kCounters = 512, kDoors = 1024, kTraps = 2048, kBombsRule = 4096, kHurt = 8192, kSlotsRule = 16384, kAllRules = 0x7FFF;
 constexpr int kMaxTaken = 8, kTakenRetryFrames = 30, kAliveBodies = 5; constexpr float kTakenReach = 120.0f;
 #pragma pack(push, 1)
 struct Taken { std::uint32_t number, room, seed, variant, subtype, low; float position[2]; };
@@ -240,9 +250,10 @@ struct Shot {
 };
 struct Drop { std::uint32_t seed, variant, subtype; float position[2], velocity[2]; std::int32_t price, timeout, options, shopItemId; };
 struct DoorState { std::uint16_t cell; std::uint8_t busted, reserved; std::int32_t variant, state; };
+struct SlotState { std::uint32_t seed, variant, subtype; float position[2]; std::int32_t state, prize, timeout, donation, trigger; char animation[kAnimationName]; };
 struct World {
-    std::uint32_t magic, sequence, room, count, deaths, clear, cells, shots, drops, dropsTotal, doors, npcTotal, hurt, enemyBombs, floor; std::int32_t coins, bombs, keys;
-    Npc npcs[kMaxNpcs]; std::uint32_t died[kMaxDeaths]; Cell grid[kMaxCells]; Shot shot[kMaxShots]; Drop drop[kMaxDrops]; DoorState door[kMaxDoors]; Shot enemyBomb[kMaxEnemyBombs];
+    std::uint32_t magic, sequence, room, count, deaths, clear, cells, shots, drops, dropsTotal, doors, npcTotal, hurt, enemyBombs, floor, slots; std::int32_t coins, bombs, keys;
+    Npc npcs[kMaxNpcs]; std::uint32_t died[kMaxDeaths]; Cell grid[kMaxCells]; Shot shot[kMaxShots]; Drop drop[kMaxDrops]; DoorState door[kMaxDoors]; Shot enemyBomb[kMaxEnemyBombs]; SlotState slot[kMaxSlots];
 };
 // Tears first, then bombs. A bomb in a Shot: height = frames to the explosion, fallingSpeed = radius multiplier,
 // fallingAccel = 1 for a fetus bomb, damage = explosion damage.
@@ -257,13 +268,14 @@ struct Stats {
     std::uint32_t healthFixes, copyDamageIgnored, copyDeaths, copyRevivalsMissed, roomFollows, roomFollowFailures, stateFixes, npcSpawned, npcSpawnFailures, clearsHeld, clearsFromHost;
     std::uint32_t copyRevivals, copyTouchesIgnored, taken, takenApplied, takenMissed, animationFixes, gridHeld, gridFixes, gridMismatch, fireHeld;
     std::uint32_t projectilesMade, projectilesEnded, projectilesDropped, tearsSent, tearsMade, tearsEnded, tearsDropped, fireHolds;
-    std::uint32_t dropsMade, dropsRemoved, dropsMorphed, dropsSkipped, counterFixes, doorFixes, doorMismatch, bombsMade, bombsEnded, bombsDropped, enemyBombsMade, enemyBombsEnded, enemyBombsDropped, hurtTaken, otherFloor;
+    std::uint32_t dropsMade, dropsRemoved, dropsMorphed, dropsSkipped, counterFixes, doorFixes, doorMismatch, bombsMade, bombsEnded, bombsDropped, enemyBombsMade, enemyBombsEnded, enemyBombsDropped, hurtTaken, otherFloor, slotFixes, slotsMade, slotTouchesSent, slotTouchesPlayed, slotTouchesIgnored;
     float correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax;
 };
 #pragma pack(pop)
 static_assert(sizeof(Taken) == 32 && sizeof(Body) == 64 + 4 * kHealthFields + kMaxTaken * 32 && sizeof(Npc) == 104 && sizeof(Cell) == 8 && sizeof(Shot) == 108 && sizeof(Shots) == 24 + kMaxTears * 108 &&
               sizeof(Drop) == 44 && sizeof(DoorState) == 12 &&
-              sizeof(World) == 72 + kMaxNpcs * 104 + kMaxDeaths * 4 + kMaxCells * 8 + kMaxShots * 108 + kMaxDrops * 44 + kMaxDoors * 12 + kMaxEnemyBombs * 108 && sizeof(Shots) != sizeof(Body), "wire layout");
+              sizeof(SlotState) == 64 &&
+              sizeof(World) == 76 + kMaxNpcs * 104 + kMaxDeaths * 4 + kMaxCells * 8 + kMaxShots * 108 + kMaxDrops * 44 + kMaxDoors * 12 + kMaxEnemyBombs * 108 + kMaxSlots * 64 && sizeof(Shots) != sizeof(Body), "wire layout");
 using WithDevice = int(__thiscall*)(void*, int, void*, void*, void*, int*);
 using PlayerUpdate = void(__thiscall*)(void*);
 using NpcDamage = char(__thiscall*)(void*, float, std::uint32_t, std::uint32_t, void*, int);
@@ -284,6 +296,8 @@ std::uint32_t deathTried[8]{};  // per controller: the frame a copy was last sen
 std::uint32_t aliveSeen[8]{};   // per controller: bodies in a row that said the owner lives
 // Takings: this game's own, numbered from 1; per remote controller the last one dealt with and since when the next is tried.
 void** pickupSlot = nullptr; Collision originalCollision = nullptr; bool applyingTaken = false;
+void** slotSlot = nullptr; Collision originalSlotCollision = nullptr; std::uint32_t touchedSlot = 0, touchedAt = 0;
+struct SlotAge { std::uint32_t seed, age; } slotAges[8]{}; std::uint32_t slotAgeCount = 0;
 Taken takenLog[kMaxTaken]{}; std::uint32_t takenTotal = 0, takenDone[8]{}, takenSince[8]{}; bool takenKnown[8]{};
 // Rooms: the room this game was in a frame ago, its epoch, the newest epoch heard of, and the room being followed to.
 std::uint32_t lastRoom = 0xfffffffe, roomEpoch = 0, heardEpoch = 0, followRoom = 0xfffffffe, followTried = 0; bool following = false;
@@ -521,6 +535,10 @@ bool GridChanged(std::uintptr_t grid) {
     return kind == 1 ? state != 1 : kind ? state != 0 : false;
 }
 
+bool LivingSlot(std::uintptr_t entity) {
+    return At<std::uintptr_t>(entity) == base + kSlotTable && At<std::uint8_t>(entity + kExists) && !At<std::uint8_t>(entity + kDead);
+}
+
 bool LivingPickup(std::uintptr_t entity) {
     return At<std::uintptr_t>(entity) == base + kPickupTable && At<std::uint8_t>(entity + kExists) && !At<std::uint8_t>(entity + kDead);
 }
@@ -572,6 +590,17 @@ void PublishWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t room
         if (entity && LivingShot(entity, kOfBomb) && SpawnedBy(entity, kNotAPlayer)) ShotOf(entity, kOfBomb, world.enemyBomb[world.enemyBombs++]);
     }
     world.hurt = At<std::uint8_t>(room + kRoomHurt);
+    world.slots = 0;
+    for (std::uint32_t i = 0; i < count && world.slots < kMaxSlots; ++i) {
+        const auto entity = At<std::uintptr_t>(data + i * sizeof(std::uintptr_t));
+        if (!entity || !LivingSlot(entity)) continue;
+        auto& machine = world.slot[world.slots++];
+        machine.seed = At<std::uint32_t>(entity + kSeed); machine.variant = At<std::uint32_t>(entity + kVariant); machine.subtype = At<std::uint32_t>(entity + kSubtype);
+        std::memcpy(machine.position, reinterpret_cast<void*>(entity + kPosition), 8);
+        machine.state = At<std::int32_t>(entity + kSlotState); machine.prize = At<std::int32_t>(entity + kSlotPrize); machine.timeout = At<std::int16_t>(entity + kSlotTimeout);
+        machine.donation = At<std::int32_t>(entity + kSlotDonation); machine.trigger = At<std::int32_t>(entity + kSlotTrigger);
+        AnimationOf(entity, machine.animation);
+    }
     world.drops = world.dropsTotal = 0;
     for (std::uint32_t i = 0; i < count; ++i) {
         const auto entity = At<std::uintptr_t>(data + i * sizeof(std::uintptr_t));
@@ -690,6 +719,42 @@ void ApplyDrops(std::uintptr_t room, const World& world) {
     }
 }
 
+// Guest: the host's machines and beggars over the local ones; one the guest lacks for a while is created.
+void ApplySlots(std::uintptr_t room, const World& world) {
+    const auto data = At<std::uintptr_t>(room + kListData); const auto listCount = At<std::uint32_t>(room + kListCount);
+    if (!data || listCount > 4096 || world.slots > kMaxSlots) return;
+    bool taken[kMaxSlots]{};
+    for (std::uint32_t i = 0; i < listCount; ++i) {
+        const auto entity = At<std::uintptr_t>(data + i * sizeof(std::uintptr_t));
+        if (!entity || !LivingSlot(entity)) continue;
+        const auto seed = At<std::uint32_t>(entity + kSeed); std::uint32_t n = 0;
+        while (n < world.slots && (taken[n] || world.slot[n].seed != seed)) ++n;
+        if (n == world.slots) continue;
+        const auto& machine = world.slot[n]; taken[n] = true;
+        // A playing machine must not reach the end of its countdown here: that is where the game rolls the payout.
+        const std::int16_t timeout = static_cast<std::int16_t>(machine.state == 2 && machine.timeout < 2 ? 2 : machine.timeout);
+        const bool differs = At<std::int32_t>(entity + kSlotState) != machine.state || At<std::int32_t>(entity + kSlotPrize) != machine.prize || At<std::int32_t>(entity + kSlotDonation) != machine.donation;
+        At<std::int32_t>(entity + kSlotState) = machine.state; At<std::int32_t>(entity + kSlotPrize) = machine.prize; At<std::int16_t>(entity + kSlotTimeout) = timeout;
+        At<std::int32_t>(entity + kSlotDonation) = machine.donation; At<std::int32_t>(entity + kSlotTrigger) = machine.trigger;
+        if (machine.animation[0]) {
+            char own[kAnimationName]; AnimationOf(entity, own);
+            if (std::memcmp(own, machine.animation, kAnimationName) != 0) reinterpret_cast<SpritePlay>(base + kSpritePlay)(reinterpret_cast<void*>(entity + kSprite), machine.animation, true);
+        }
+        if (differs) stats.slotFixes++;
+    }
+    const auto game = At<std::uintptr_t>(base + kGame);
+    for (std::uint32_t n = 0; n < world.slots && game; ++n) {
+        if (taken[n] || !world.slot[n].seed) continue;
+        std::uint32_t a = 0;
+        while (a < slotAgeCount && slotAges[a].seed != world.slot[n].seed) ++a;
+        if (a == slotAgeCount) { if (slotAgeCount == 8) continue; slotAges[slotAgeCount++] = SlotAge{world.slot[n].seed, 0}; }
+        if (++slotAges[a].age != kSlotSpawnSnapshots) continue;   // once
+        static const float still[2]{0.0f, 0.0f};
+        if (reinterpret_cast<Spawn>(base + kSpawn)(reinterpret_cast<void*>(game), kSlotEntity, world.slot[n].variant, world.slot[n].position, still, nullptr, world.slot[n].subtype,
+                                                   world.slot[n].seed)) stats.slotsMade++;
+    }
+}
+
 // Guest: the host's doors, unless a door has just changed here.
 void ApplyDoors(std::uintptr_t room, const World& world) {
     for (std::uint32_t d = 0; d < world.doors && d < kMaxDoors; ++d) {
@@ -738,7 +803,7 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
     if (const auto game = At<std::uintptr_t>(base + kGame)) if (world.floor != Floor(game)) { stats.otherFloor++; return; }
     if (world.room != roomIndex) { stats.otherRoom++; return; }
     hostClearRoom.store(world.room); hostClear.store(world.clear); hostHeardAt.store(GetTickCount64());
-    if (aliasRoom != roomIndex) { aliasRoom = roomIndex; aliasCount = 0; orphanCount = 0; missingCount = 0; dropAgeCount = 0; doorMemoryCount = 0; }
+    if (aliasRoom != roomIndex) { aliasRoom = roomIndex; aliasCount = 0; orphanCount = 0; missingCount = 0; dropAgeCount = 0; doorMemoryCount = 0; slotAgeCount = 0; }
     if (On(kCounters)) if (const auto game = At<std::uintptr_t>(base + kGame)) ApplyCounters(game, player, world);
     const auto data = At<std::uintptr_t>(room + kListData); const auto count = At<std::uint32_t>(room + kListCount);
     if (!data || count > 4096) return;
@@ -835,6 +900,7 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
         ApplyShots(room, world.enemyBomb, world.enemyBombs, world.enemyBombs < kMaxEnemyBombs, kOfBomb, kNotAPlayer, knownEnemyBombs, stats.enemyBombsMade, stats.enemyBombsEnded,
                    stats.enemyBombsDropped);
     if (On(kHurt) && world.hurt && !At<std::uint8_t>(room + kRoomHurt)) { At<std::uint8_t>(room + kRoomHurt) = 1; stats.hurtTaken++; }
+    if (On(kSlotsRule)) ApplySlots(room, world);
     if (On(kDrops)) ApplyDrops(room, world);
     if (On(kDoors)) ApplyDoors(room, world);
     stats.worldApplied++; worldApplied = world.sequence;
@@ -867,6 +933,40 @@ bool __fastcall OnPickupCollision(void* self, void*, void* collider, std::uint32
     return result;
 }
 
+bool __fastcall OnSlotCollision(void* self, void*, void* collider, std::uint32_t low) {
+    const auto other = reinterpret_cast<std::uintptr_t>(collider);
+    if (!running.load(std::memory_order_acquire) || !On(kSlotsRule) || applyingTaken || !other || At<std::uintptr_t>(other) != base + kPlayerTable)
+        return originalSlotCollision(self, collider, low);
+    if (At<int>(other + kController) != ownController) { stats.slotTouchesIgnored++; return false; }   // a copy: its owner's game says when it touches
+    if (host || !HostRules()) return originalSlotCollision(self, collider, low);                         // the host's own player, or a guest on its own
+    // A guest's own player: the machine is the host's. A touch that would start a waiting machine is sent; the rest is nothing.
+    const auto machine = reinterpret_cast<std::uintptr_t>(self); const auto seed = At<std::uint32_t>(machine + kSeed);
+    if (At<std::int32_t>(machine + kSlotState) == 1 && At<std::int16_t>(machine + kSlotTimeout) <= 0 && (seed != touchedSlot || frame - touchedAt >= kSlotTouchEveryFrames)) {
+        const auto game = At<std::uintptr_t>(base + kGame); const auto* position = reinterpret_cast<float*>(machine + kPosition);
+        takenLog[takenTotal % kMaxTaken] = Taken{takenTotal + 1, game ? At<std::uint32_t>(game + kRoomIndex) : 0, seed, At<std::uint32_t>(machine + kVariant), At<std::uint32_t>(machine + kSubtype),
+                                                 (low & 0xff) | kSlotTouch, {position[0], position[1]}};
+        ++takenTotal; touchedSlot = seed; touchedAt = frame; stats.slotTouchesSent++;
+    }
+    return false;
+}
+
+// The host plays a guest's touch of a machine with the machine's own collision, for its copy of that guest's player.
+void PlaySlotTouch(std::uintptr_t player, const Taken& touch, std::uintptr_t room) {
+    const auto data = At<std::uintptr_t>(room + kListData); const auto count = At<std::uint32_t>(room + kListCount);
+    std::uintptr_t found = 0; float foundDistance = 0;
+    for (std::uint32_t i = 0; data && count <= 4096 && i < count; ++i) {
+        const auto entity = At<std::uintptr_t>(data + i * sizeof(std::uintptr_t));
+        if (!entity || !LivingSlot(entity) || At<std::uint32_t>(entity + kVariant) != touch.variant) continue;
+        if (At<std::uint32_t>(entity + kSeed) == touch.seed) { found = entity; break; }
+        const auto* position = reinterpret_cast<float*>(entity + kPosition);
+        const float dx = position[0] - touch.position[0], dy = position[1] - touch.position[1], distance = dx * dx + dy * dy;
+        if (distance <= kTakenReach * kTakenReach && (!found || distance < foundDistance)) { found = entity; foundDistance = distance; }
+    }
+    if (!found) return;
+    applyingTaken = true; originalSlotCollision(reinterpret_cast<void*>(found), reinterpret_cast<void*>(player), touch.low & 0xff); applyingTaken = false;
+    stats.slotTouchesPlayed++;
+}
+
 // A remote player's takings, in order: its copy takes here what its owner's game saw it take.
 void ApplyTaken(std::uintptr_t player, int controller, const Body& body, std::uintptr_t room, std::uint32_t roomIndex) {
     if (!takenKnown[controller]) { takenKnown[controller] = true; takenDone[controller] = body.takenTotal; return; }   // what came before this module is not replayed
@@ -875,6 +975,11 @@ void ApplyTaken(std::uintptr_t player, int controller, const Body& body, std::ui
         const std::uint32_t number = takenDone[controller] + 1; const Taken* taken = nullptr;
         for (const auto& t : body.taken) if (t.number == number) taken = &t;
         if (!taken || taken->room != roomIndex) { takenDone[controller] = number; takenSince[controller] = 0; stats.takenMissed++; continue; }
+        if (taken->low & kSlotTouch) {   // a touch of a machine: played by the host alone, once, whatever comes of it
+            if (host && On(kSlotsRule)) PlaySlotTouch(player, *taken, room);
+            takenDone[controller] = number; takenSince[controller] = 0; continue;
+        }
+        if (!On(kTaken)) { takenDone[controller] = number; takenSince[controller] = 0; continue; }
         if (!takenSince[controller]) takenSince[controller] = frame ? frame : 1;
         const auto data = At<std::uintptr_t>(room + kListData); const auto count = At<std::uint32_t>(room + kListCount);
         std::uintptr_t found = 0; float foundDistance = 0;
@@ -994,7 +1099,7 @@ void AfterUpdate(std::uintptr_t player) noexcept {
                 if (At<std::int32_t>(player + kHealth[h]) != body.health[h]) { At<std::int32_t>(player + kHealth[h]) = body.health[h]; fixed = true; }
             if (fixed) stats.healthFixes++;
         }
-        if (room && On(kTaken)) ApplyTaken(player, controller, body, room, roomIndex);
+        if (room && (On(kTaken) || On(kSlotsRule))) ApplyTaken(player, controller, body, room, roomIndex);
         // A guest's player lost red hearts in this room: the host, who ignores blows to its copies, learns it here.
         if (room && host && On(kHurt) && body.hurt && !At<std::uint8_t>(room + kRoomHurt)) { At<std::uint8_t>(room + kRoomHurt) = 1; stats.hurtTaken++; }
     } __except (EXCEPTION_EXECUTE_HANDLER) { stats.rejected++; applyingTaken = false; applyingGrid = false; }
@@ -1105,7 +1210,8 @@ bool ValidShot(const Shot& shot) {
 }
 
 bool ValidWorld(const World& world, int got) {
-    if (got != sizeof(World) || world.magic != kWorldMagic || !world.sequence || world.count > kMaxNpcs || world.deaths > kMaxDeaths || world.cells > kMaxCells || world.shots > kMaxShots || world.drops > kMaxDrops || world.doors > kMaxDoors || world.enemyBombs > kMaxEnemyBombs) return false;
+    if (got != sizeof(World) || world.magic != kWorldMagic || !world.sequence || world.count > kMaxNpcs || world.deaths > kMaxDeaths || world.cells > kMaxCells || world.shots > kMaxShots || world.drops > kMaxDrops || world.doors > kMaxDoors || world.enemyBombs > kMaxEnemyBombs || world.slots > kMaxSlots) return false;
+    for (std::uint32_t n = 0; n < world.slots; ++n) if (!Finite(world.slot[n].position) || world.slot[n].animation[kAnimationName - 1]) return false;
     for (std::uint32_t n = 0; n < world.enemyBombs; ++n) if (!ValidShot(world.enemyBomb[n])) return false;
     for (std::uint32_t n = 0; n < world.drops; ++n) if (!Finite(world.drop[n].position) || !Finite(world.drop[n].velocity)) return false;
     for (std::uint32_t n = 0; n < world.shots; ++n) if (!ValidShot(world.shot[n])) return false;
@@ -1192,9 +1298,10 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
         damageSlot = reinterpret_cast<void**>(base + kNpcTable + 8 * sizeof(void*));
         playerDamageSlot = reinterpret_cast<void**>(base + kPlayerTable + 8 * sizeof(void*));
         pickupSlot = reinterpret_cast<void**>(base + kPickupTable + 23 * sizeof(void*));
+        slotSlot = reinterpret_cast<void**>(base + kSlotTable + 23 * sizeof(void*));
         if (table != base + kManagerTable || *slot != reinterpret_cast<void*>(base + kWithDevice) || *playerSlot != reinterpret_cast<void*>(base + kPlayerUpdate) ||
             *damageSlot != reinterpret_cast<void*>(base + kNpcDamage) || *playerDamageSlot != reinterpret_cast<void*>(base + kPlayerDamage) ||
-            *pickupSlot != reinterpret_cast<void*>(base + kPickupCollision) ||
+            *pickupSlot != reinterpret_cast<void*>(base + kPickupCollision) || *slotSlot != reinterpret_cast<void*>(base + kSlotCollision) ||
             std::memcmp(reinterpret_cast<void*>(base + kRevive), kReviveEntry.data(), kReviveEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kSpritePlay), kSpritePlayEntry.data(), kSpritePlayEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kGridDestroy), kGridDestroyEntry.data(), kGridDestroyEntry.size()) != 0 ||
@@ -1206,7 +1313,7 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
             std::memcmp(reinterpret_cast<void*>(base + kTransition), kTransitionEntry.data(), kTransitionEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kSpawn), kSpawnEntry.data(), kSpawnEntry.size()) != 0) throw static_cast<DWORD>(ERROR_REVISION_MISMATCH);
         original = reinterpret_cast<WithDevice>(*slot); originalPlayer = reinterpret_cast<PlayerUpdate>(*playerSlot); originalDamage = reinterpret_cast<NpcDamage>(*damageSlot);
-        originalPlayerDamage = reinterpret_cast<NpcDamage>(*playerDamageSlot); originalCollision = reinterpret_cast<Collision>(*pickupSlot);
+        originalPlayerDamage = reinterpret_cast<NpcDamage>(*playerDamageSlot); originalCollision = reinterpret_cast<Collision>(*pickupSlot); originalSlotCollision = reinterpret_cast<Collision>(*slotSlot);
         HMODULE pinned = nullptr;
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&OnInput), &pinned)) throw GetLastError();
         ownController = controller; host = role == "host"; rules = mask; counters[0] = 0; counters[1] = 0; stats = Stats{}; sequence = worldSequence = frame = 0;
@@ -1218,7 +1325,7 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
         for (auto& tried : deathTried) tried = 0;
         for (int c = 0; c < kControllers; ++c) { aliveSeen[c] = takenDone[c] = takenSince[c] = 0; takenKnown[c] = false; }
         for (auto& taken : takenLog) taken = Taken{};
-        takenTotal = 0; applyingTaken = false; applyingGrid = false;
+        takenTotal = 0; applyingTaken = false; applyingGrid = false; touchedSlot = touchedAt = slotAgeCount = 0;
         hostClearRoom = 0xfffffffe; hostClear = 0; hostHeardAt = 0;
         lastRoom = followRoom = 0xfffffffe; roomEpoch = heardEpoch = followTried = 0; following = false;
         worldInbox = World{}; worldAt = 0; worldApplied = 0; livedRoom = aliasRoom = 0xffffffff; livedCount = deathCount = aliasCount = orphanCount = missingCount = 0;
@@ -1256,8 +1363,18 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
             }
         }
         if (!failure) {
+            failure = ExchangeSlot(slotSlot, reinterpret_cast<void*>(originalSlotCollision), reinterpret_cast<void*>(&OnSlotCollision));
+            if (failure) {
+                ExchangeSlot(slot, reinterpret_cast<void*>(&OnInput), reinterpret_cast<void*>(original));
+                ExchangeSlot(playerSlot, reinterpret_cast<void*>(&OnPlayer), reinterpret_cast<void*>(originalPlayer));
+                ExchangeSlot(damageSlot, reinterpret_cast<void*>(&OnNpcDamage), reinterpret_cast<void*>(originalDamage));
+                ExchangeSlot(playerDamageSlot, reinterpret_cast<void*>(&OnPlayerDamage), reinterpret_cast<void*>(originalPlayerDamage));
+            }
+        }
+        if (!failure) {
             failure = ExchangeSlot(pickupSlot, reinterpret_cast<void*>(originalCollision), reinterpret_cast<void*>(&OnPickupCollision));
             if (failure) {
+                ExchangeSlot(slotSlot, reinterpret_cast<void*>(&OnSlotCollision), reinterpret_cast<void*>(originalSlotCollision));
                 ExchangeSlot(slot, reinterpret_cast<void*>(&OnInput), reinterpret_cast<void*>(original));
                 ExchangeSlot(playerSlot, reinterpret_cast<void*>(&OnPlayer), reinterpret_cast<void*>(originalPlayer));
                 ExchangeSlot(damageSlot, reinterpret_cast<void*>(&OnNpcDamage), reinterpret_cast<void*>(originalDamage));
@@ -1267,6 +1384,7 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
         if (!failure && !host && !clearHooked) {
             failure = HookClear();
             if (failure) {
+                ExchangeSlot(slotSlot, reinterpret_cast<void*>(&OnSlotCollision), reinterpret_cast<void*>(originalSlotCollision));
                 ExchangeSlot(pickupSlot, reinterpret_cast<void*>(&OnPickupCollision), reinterpret_cast<void*>(originalCollision));
                 ExchangeSlot(slot, reinterpret_cast<void*>(&OnInput), reinterpret_cast<void*>(original));
                 ExchangeSlot(playerSlot, reinterpret_cast<void*>(&OnPlayer), reinterpret_cast<void*>(originalPlayer));
@@ -1278,6 +1396,7 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
             failure = HookGrid();
             if (failure) {
                 UnhookGrid(); UnhookClear();
+                ExchangeSlot(slotSlot, reinterpret_cast<void*>(&OnSlotCollision), reinterpret_cast<void*>(originalSlotCollision));
                 ExchangeSlot(pickupSlot, reinterpret_cast<void*>(&OnPickupCollision), reinterpret_cast<void*>(originalCollision));
                 ExchangeSlot(slot, reinterpret_cast<void*>(&OnInput), reinterpret_cast<void*>(original));
                 ExchangeSlot(playerSlot, reinterpret_cast<void*>(&OnPlayer), reinterpret_cast<void*>(originalPlayer));
@@ -1311,7 +1430,8 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStop(void*) noexcept {
         const DWORD third = ExchangeSlot(damageSlot, reinterpret_cast<void*>(&OnNpcDamage), reinterpret_cast<void*>(originalDamage));
         const DWORD fourth = ExchangeSlot(playerDamageSlot, reinterpret_cast<void*>(&OnPlayerDamage), reinterpret_cast<void*>(originalPlayerDamage));
         const DWORD fifth = ExchangeSlot(pickupSlot, reinterpret_cast<void*>(&OnPickupCollision), reinterpret_cast<void*>(originalCollision));
-        if (!result) result = second ? second : third ? third : fourth ? fourth : fifth;
+        const DWORD sixth = ExchangeSlot(slotSlot, reinterpret_cast<void*>(&OnSlotCollision), reinterpret_cast<void*>(originalSlotCollision));
+        if (!result) result = second ? second : third ? third : fourth ? fourth : fifth ? fifth : sixth;
         CloseNetwork();
         // The comparison stays off on purpose: the games have already diverged, and turning it back on would split the lobby.
     }
