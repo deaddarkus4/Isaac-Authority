@@ -159,9 +159,14 @@
 // listen on and the neighbours (listen=PORT peer=IP:PORT ...), and after every frame the body, the own shots and - on the
 // host - the world go to every neighbour. Shots and world are packed first (only the entries in use: a room's world is
 // one to three kilobytes instead of nineteen) and cut into datagrams of at most 1200 bytes, each with a small header
-// ('IAF1', kind, chunk of chunks, sequence, size); the receiver puts a sequence together and drops one that a newer
-// sequence overtakes. Only datagrams from a named neighbour's address are taken. The game's own connection (Steam or the
+// ('IAF1', kind, chunk of chunks, sequence, size, the sender's start); the receiver puts a sequence together and drops one
+// that a newer sequence overtakes. A module counts its sequences from 1 every time it starts - when a player leaves, the
+// others start anew a moment apart - so every frame names the start it is of, and a receiver that sees a newer start of a
+// neighbour forgets the sequences it had reached with the old one instead of dropping everything that follows as stale.
+// Only datagrams from a named neighbour's address are taken. The game's own connection (Steam or the
 // localhost service) still carries the game's own lockstep messages; this exchange runs beside it.
+// The layout of all this, packing, the ranges a received list must keep, the assembly of a frame and the handshake's
+// decisions need no game to be checked: they are in native_state.cpp, under tests/native_tests.cpp.
 // Between Steam clients the same datagrams go through Steam instead of UDP: the game has steam_api.dll loaded, and its
 // ISteamNetworkingMessages sends a message to a user by Steam id, through whatever NAT there is (steampeer=ID64 in the
 // configuration, one per neighbour; channel 7460, so that nothing of the game's own is read away; sending to a user also
@@ -190,6 +195,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <shlobj.h>
+#include "native_state.hpp"
 #include "profile.hpp"
 #include "vtable_slot.hpp"
 #include <array>
@@ -206,6 +212,7 @@
 
 namespace {
 using namespace authority;
+using namespace authority::native;   // the wire, and every rule of the exchange that needs no game: native_state.hpp
 // InputManager at RVA 0x857b18; slot 29 is WithDevice(controller, reader, in, out, deviceId), thiscall, ret 0x14.
 constexpr std::uintptr_t kManager = 0x857b18, kManagerTable = 0x782950, kWithDevice = 0x620fb0;
 constexpr std::uintptr_t kCompare = 0x50d4a0, kSaveLeaf = 0x77e04c;
@@ -226,22 +233,23 @@ constexpr std::uintptr_t kKill = 0x45dc30, kNpcDamage = 0x2d60a0, kPlayerDamage 
 // Hearts as the game's own getters read them: containers, red, eternal, soul, black mask, two words that follow them,
 // bone (+0x1d88), rotten (+0x1da4), golden (+0x194c).
 constexpr std::uintptr_t kHealth[] = {0x1340, 0x1344, 0x1348, 0x134c, 0x1350, 0x1354, 0x1358, 0x1d88, 0x1da4, 0x194c};
-constexpr int kHealthFields = 10, kDeathRetryFrames = 30;
+constexpr int kDeathRetryFrames = 30;
 constexpr std::array<std::uint8_t, 10> kKillEntry{0x55, 0x8b, 0xec, 0x83, 0xec, 0x28, 0xf3, 0x0f, 0x10, 0x0d};
-constexpr std::uint32_t kBodyMagic = 0x31524c50, kWorldMagic = 0x314e4c57;  // "PLR1", "WLN1"
-constexpr std::uint32_t kFrameMagic = 0x31464149, kChunkBytes = 1184, kMaxPeers = 4;   // "IAF1"
-constexpr std::uint8_t kOfBody = 1, kOfShots = 2, kOfWorld = 3, kOfHello = 4;
 // The handshake. A module that has started is only "here": it changes nothing in its game, not even the comparison of
 // checksums, and says hello twice a second. Once EVERY other player of the match has said hello with the same protocol,
 // it turns its comparison off and says so; once every other player has said that too, it goes live. So a match in which
 // anybody plays without the module stays the game's own match to the last byte, and nobody diverges while a neighbour
-// still compares. A module nobody answers gives up after kHelloPatienceMs and sends nothing more.
-constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 3, kHelloEveryFrames = 30;   // "HEL1"; 2: the receiver numbers the sender's player; 3: an enemy's collision damage, a player's hits and blink
+// still compares. A hello also says whether its module hosts and which rules it runs: modules that do not agree on
+// exactly one host, or run different rules, do not go past "here" either (native_state.hpp: Agree). A module nobody
+// answers, or nobody agrees with, gives up after kHelloPatienceMs and sends nothing more.
+constexpr std::uint32_t kHelloEveryFrames = 30;
 constexpr std::uint64_t kHelloPatienceMs = 60000;
-constexpr std::uint8_t kHere = 0, kCompareOff = 1, kLive = 2;
 constexpr int kSteamChannel = 7460, kSteamSendFlags = 1 | 32;   // unreliable, no Nagle; restart a broken session by itself
 constexpr int kControllers = 64;   // device numbers grow from match to match within one run of the game: 13 and 14 were seen under Steam
-constexpr int kMaxNpcs = 48, kMaxDeaths = 16, kDeathFrames = 90, kOrphanSnapshots = 20;
+constexpr int kDeathFrames = 90, kOrphanSnapshots = 20;
+// A fault inside the game's own code (an access violation under AfterUpdate) is counted apart from a datagram refused, and
+// names the rule that was at work: the third fault of one rule switches that rule off in this game for the rest of the match.
+constexpr std::uint8_t kFaultsToSwitchOff = 3;
 constexpr std::uintptr_t kType = 0x28, kVariant = 0x2c, kSubtype = 0x30, kTarget = 0x334;
 // Entity_NPC, from the Lua property registration of J460.
 constexpr std::uintptr_t kState = 0xb64, kStateFrame = 0x410, kCooldown = 0xba0, kV1 = 0xbb0, kV2 = 0xbb8, kI1 = 0xbc0, kI2 = 0xbc4;
@@ -249,7 +257,6 @@ constexpr std::uintptr_t kState = 0xb64, kStateFrame = 0x410, kCooldown = 0xba0,
 // its current animation +0x34 (an object that begins with its name, a std::string).
 constexpr std::uintptr_t kSprite = 0x48, kAnimation = 0x34, kSpritePlay = 0xa380;
 constexpr std::array<std::uint8_t, 8> kSpritePlayEntry{0x55, 0x8B, 0xEC, 0x80, 0x7D, 0x0C, 0x00, 0x56};
-constexpr int kAnimationName = 24;
 constexpr std::uintptr_t kSpawn = 0x28b20, kTriggerClear = 0x4068f0, kDescriptor = 0x4, kRoomFlags = 0x44;
 constexpr std::array<std::uint8_t, 9> kClearEntry{0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08, 0x53, 0x8B, 0xD9};  // the first six move as they are
 constexpr std::uint64_t kHostSilenceMs = 2000;
@@ -263,7 +270,8 @@ constexpr std::array<std::uint8_t, 8> kReviveEntry{0x55, 0x8B, 0xEC, 0x83, 0xE4,
 constexpr std::uintptr_t kGrid = 0x24, kGridType = 0x4, kGridVariant = 0x8, kGridState = 0xc, kGridSprite = 0x40, kGridDestroy = 0x45de20;
 constexpr std::uintptr_t kRockTable = 0x768738, kPoopTable = 0x768648, kTntTable = 0x769300, kWebTable = 0x769558;
 constexpr std::array<std::uint8_t, 8> kGridDestroyEntry{0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x2C, 0x8B, 0x01};
-constexpr std::uint32_t kGridCells = 448, kMaxCells = 96, kFireplace = 33, kGridMapBytes = 56, kMaxBorn = 48, kGridGoneSnapshots = 10, kMaxGridSpawns = 8;
+constexpr std::uint32_t kGridCells = 448, kFireplace = 33, kGridGoneSnapshots = 10, kMaxGridSpawns = 8;
+static_assert(kGridMapBytes * 8 == kGridCells, "a bit of the map for every cell");
 constexpr std::uintptr_t kGridSeed = 0x14, kSpawnGrid = 0x3ebca0, kRemoveGrid = 0x41e930;   // the cell's description starts at +4: its seed is description +0x10
 constexpr std::array<std::uint8_t, 8> kSpawnGridEntry{0x55, 0x8B, 0xEC, 0x53, 0x56, 0x8B, 0x75, 0x08}, kRemoveGridEntry{0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x8B, 0x55};
 // Shots: both classes keep height +0x410, falling speed +0x414, falling acceleration +0x418 (the Lua accessors of J460).
@@ -278,14 +286,13 @@ constexpr std::uintptr_t kProjectileDamage = 0x41c, kProjectileScale = 0x420, kP
 constexpr std::uintptr_t kHeadFrameDelay = 0x1338; constexpr std::uint32_t kDamageFake = 1u << 21, kDamageNoPenalties = 1u << 28;
 constexpr std::uintptr_t kCollisionDamage = 0x388, kSpawner = 0x3c8, kColor = 0xf0, kWeapon = 0x13dc, kWeaponOther = 0x13e0, kFireDelay = 0xc;
 constexpr std::array<std::uint8_t, 8> kTearSetScaleEntry{0x55, 0x8B, 0xEC, 0xF3, 0x0F, 0x10, 0x45, 0x08};
-constexpr std::uint32_t kProjectile = 9, kTear = 2, kShotsMagic = 0x31544853, kMaxShots = 64, kMaxTears = 32, kKnownShots = 256, kMaxShotSpawns = 24;   // "SHT1"
+constexpr std::uint32_t kProjectile = 9, kTear = 2, kKnownShots = 256, kMaxShotSpawns = 24;
 constexpr std::uintptr_t kBombTable = 0x7670f4, kBombCountdown = 0x410, kBombCountdownTwin = 0x414, kBombDamage = 0x418, kBombFlags = 0x438, kBombCostumes = 0x463, kBombFetus = 0x448, kBombRadius = 0x44c;
 constexpr std::uintptr_t kSlotTable = 0x764c50, kSlotCollision = 0x2627e0, kSlotState = 0x410, kSlotPrize = 0x414, kSlotTimeout = 0x41c, kSlotDonation = 0x420, kSlotTrigger = 0x424;
-constexpr std::uint32_t kSlotEntity = 6, kMaxSlots = 8, kSlotTouch = 0x100, kSlotTouchEveryFrames = 8, kSlotSpawnSnapshots = 10;   // kSlotTouch: in a taking's 'low', a touch of a machine
+constexpr std::uint32_t kSlotEntity = 6, kSlotTouch = 0x100, kSlotTouchEveryFrames = 8, kSlotSpawnSnapshots = 10;   // kSlotTouch: in a taking's 'low', a touch of a machine
 constexpr std::uintptr_t kParent = 0x3bc, kChild = 0x3c0, kFamiliarTable = 0x76491c, kFamiliarPlayer = 0x410, kFamiliarCooldown = 0xd4c;
-constexpr std::uint32_t kMaxPets = 24; constexpr std::int32_t kHeldFamiliarCooldown = 5;
+constexpr std::int32_t kHeldFamiliarCooldown = 5;
 constexpr std::uintptr_t kRoomHurt = 0x120c, kNotAPlayer = 1;   // kNotAPlayer: as a spawner to look for - nobody of the players
-constexpr std::uint32_t kMaxEnemyBombs = 16;
 constexpr std::uint32_t kBomb = 4; constexpr int kOfEnemy = 0, kOfTear = 1, kOfBomb = 2;   // the kinds of shot
 constexpr std::uint64_t kTearsHeardMs = 3000; constexpr float kHeldFireDelay = 5.0f;
 // Pickups: the group of which one may be taken +0x528, price +0x534, shop slot +0x53c, frames left +0x540 (Lua accessors).
@@ -294,70 +301,35 @@ constexpr std::array<std::uint8_t, 8> kPickupMorphEntry{0x55, 0x8B, 0xEC, 0x6A, 
 // The pickup's own setter of its price (it also loads the price tag; the game's restore_entity sets prices with it).
 constexpr std::uintptr_t kPickupSetPrice = 0x2e2570;
 constexpr std::array<std::uint8_t, 8> kPickupSetPriceEntry{0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68, 0x57, 0xB0};
-constexpr std::uint32_t kPickup = 5, kCollectible = 100, kMaxDrops = 64, kAges = 128, kMaxDropSpawns = 16;
+constexpr std::uint32_t kPickup = 5, kCollectible = 100, kAges = 128, kMaxDropSpawns = 16;
 constexpr std::uint32_t kDropMadeHereSnapshots = 6, kDropGoneSnapshots = 20, kDropItemSnapshots = 15;
 constexpr std::uintptr_t kKeys = 0x135c, kBombs = 0x1364, kCoins = 0x1368, kPlayers = 0x1baa8; constexpr std::uint32_t kCountersHoldFrames = 45;
-constexpr std::uintptr_t kDoorTable = 0x768698, kDoorBusted = 0x391, kDoorRefresh = 0x30ee40; constexpr std::uint32_t kGridDoor = 16, kMaxDoors = 8;
+constexpr std::uintptr_t kDoorTable = 0x768698, kDoorBusted = 0x391, kDoorRefresh = 0x30ee40; constexpr std::uint32_t kGridDoor = 16;
 constexpr std::array<std::uint8_t, 8> kDoorRefreshEntry{0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68, 0x6D, 0xC9};
 constexpr std::uint32_t kDoorSnapshots = 4, kDoorHoldFrames = 30;
 // The rules that can be left out: the third word of the configuration is their mask in hex.
 constexpr std::uint32_t kFollow = 1, kBehaviour = 2, kClear = 4, kTaken = 8, kGridRule = 16, kFire = 32, kProjectiles = 64, kTears = 128, kDrops = 256,
     kCounters = 512, kDoors = 1024, kTraps = 2048, kBombsRule = 4096, kHurt = 8192, kSlotsRule = 16384, kPets = 32768, kLead = 65536, kLook = 131072, kAllRules = 0x3FFFF;
-constexpr int kMaxTaken = 8, kTakenRetryFrames = 30, kAliveBodies = 5; constexpr float kTakenReach = 120.0f;
+constexpr int kTakenRetryFrames = 30, kAliveBodies = 5; constexpr float kTakenReach = 120.0f;
 #pragma pack(push, 1)
-struct Taken { std::uint32_t number, room, seed, variant, subtype, low; float position[2]; };
-struct Body {
-    std::uint32_t magic, controller, sequence, room; float position[2], velocity[2]; std::uint32_t ghost; std::int32_t health[kHealthFields];
-    std::uint32_t dimension, roomEpoch, host, dying, takenTotal, hurt, floor; Taken taken[kMaxTaken];
-    std::uint32_t hits; std::int32_t headFrameDelay;   // blows that landed on the owner so far; the owner's blink
-};
-struct Npc {
-    std::uint32_t seed, type, variant, subtype; float position[2], velocity[2], hitPoints;
-    std::int32_t state, stateFrame, cooldown; float v1[2], v2[2]; std::int32_t i1, i2; float target[2];
-    char animation[kAnimationName];   // empty: none, or a name too long to carry
-    std::uint32_t linked;             // 1 has a parent, 2 has a child: a part of something, never created or removed by the lists
-    float collisionDamage;            // what touching it costs: a fireplace the host has put out costs nothing, whatever the guest's own code thinks
-};
-struct Cell { std::uint16_t index, type; std::int32_t state; };
-struct Born { std::uint16_t index, type; std::uint32_t variant, seed; };
-struct Shot {
-    std::uint32_t seed, variant, subtype; float position[2], velocity[2], height, fallingSpeed, fallingAccel, scale, damage;
-    std::uint64_t flags[2]; float color[11];
-};
-struct Drop { std::uint32_t seed, variant, subtype; float position[2], velocity[2]; std::int32_t price, timeout, options, shopItemId; };
-struct DoorState { std::uint16_t cell; std::uint8_t busted, reserved; std::int32_t variant, state; };
-struct SlotState { std::uint32_t seed, variant, subtype; float position[2]; std::int32_t state, prize, timeout, donation, trigger; char animation[kAnimationName]; };
-struct World {
-    std::uint32_t magic, sequence, room, count, deaths, clear, cells, shots, drops, dropsTotal, doors, npcTotal, hurt, enemyBombs, floor, slots, born; std::int32_t coins, bombs, keys;
-    Npc npcs[kMaxNpcs]; std::uint32_t died[kMaxDeaths]; Cell grid[kMaxCells]; Shot shot[kMaxShots]; Drop drop[kMaxDrops]; DoorState door[kMaxDoors]; Shot enemyBomb[kMaxEnemyBombs]; SlotState slot[kMaxSlots]; Born bornCell[kMaxBorn]; std::uint8_t gridMap[kGridMapBytes];
-};
-// Tears first, then bombs. A bomb in a Shot: height = frames to the explosion, fallingSpeed = radius multiplier,
-// fallingAccel = 1 for a fetus bomb, damage = explosion damage.
-struct Pet { std::uint32_t seed, variant, subtype; float position[2], velocity[2]; std::uint32_t reserved; };
-struct Shots { std::uint32_t magic, controller, sequence, room, count, bombs, pets; Shot shot[kMaxTears]; Pet pet[kMaxPets]; };
 // What a reader outside copies: generation is odd while the content is being written.
 struct Published { std::uint32_t magic, generation; Body body; };
 struct PublishedWorld { std::uint32_t magic, generation; World world; };
 struct PublishedShots { std::uint32_t magic, generation; Shots shots; };
-struct FrameHeader { std::uint32_t magic; std::uint8_t kind, chunk, chunks, reserved; std::uint32_t sequence, total; };
-struct Hello { std::uint32_t magic, protocol, rules; std::uint8_t controller, host, stage, reserved; };
 struct SteamIdentity { std::int32_t type, size; std::uint64_t id; std::uint8_t rest[120]; };   // SteamNetworkingIdentity: type 16 is a Steam id
+// rejected: datagrams refused - a stranger's, a broken one, another build's. gameFaults: exceptions caught on the game's
+// thread, inside or around the game's own code - the number to look at first. faultRules: the rules switched off after them.
 struct Stats {
     std::uint32_t published, received, applied, stale, rejected, otherRoom;
     std::uint32_t worldPublished, worldReceived, worldApplied, npcMatched, npcOnlyHost, npcOnlyLocal, npcKilled, hitPointFixes, deathsHeld, npcPaired, npcRemoved;
     std::uint32_t healthFixes, copyDamageIgnored, copyDeaths, copyRevivalsMissed, roomFollows, roomFollowFailures, stateFixes, npcSpawned, npcSpawnFailures, clearsHeld, clearsFromHost;
     std::uint32_t copyRevivals, copyTouchesIgnored, taken, takenApplied, takenMissed, animationFixes, gridHeld, gridFixes, gridMismatch, fireHeld;
     std::uint32_t projectilesMade, projectilesEnded, projectilesDropped, tearsSent, tearsMade, tearsEnded, tearsDropped, fireHolds;
-    std::uint32_t dropsMade, dropsRemoved, dropsMorphed, dropsSkipped, counterFixes, doorFixes, doorMismatch, bombsMade, bombsEnded, bombsDropped, enemyBombsMade, enemyBombsEnded, enemyBombsDropped, hurtTaken, otherFloor, slotFixes, slotsMade, slotTouchesSent, slotTouchesPlayed, slotTouchesIgnored, npcPartsLeft, petsSent, petsSet, petFireHolds, gridBorn, gridRemoved, longFrames, frameMaxMs, bytesSent, bytesReceived, framesBroken, copyHitsPlayed;
+    std::uint32_t dropsMade, dropsRemoved, dropsMorphed, dropsSkipped, counterFixes, doorFixes, doorMismatch, bombsMade, bombsEnded, bombsDropped, enemyBombsMade, enemyBombsEnded, enemyBombsDropped, hurtTaken, otherFloor, slotFixes, slotsMade, slotTouchesSent, slotTouchesPlayed, slotTouchesIgnored, npcPartsLeft, petsSent, petsSet, petFireHolds, gridBorn, gridRemoved, longFrames, frameMaxMs, bytesSent, bytesReceived, framesBroken, copyHitsPlayed, gameFaults, faultRules;
     float correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax;
 };
 #pragma pack(pop)
-static_assert(sizeof(Taken) == 32 && sizeof(Body) == 72 + 4 * kHealthFields + kMaxTaken * 32 && sizeof(Npc) == 112 && sizeof(Pet) == 32 && sizeof(Cell) == 8 && sizeof(Shot) == 108 && sizeof(Shots) == 28 + kMaxTears * 108 + kMaxPets * 32 &&
-              sizeof(Drop) == 44 && sizeof(DoorState) == 12 &&
-              sizeof(SlotState) == 64 &&
-              sizeof(Born) == 12 && sizeof(FrameHeader) == 16 && sizeof(SteamIdentity) == 136 &&
-              sizeof(World) == 80 + kMaxNpcs * 112 + kMaxDeaths * 4 + kMaxCells * 8 + kMaxShots * 108 + kMaxDrops * 44 + kMaxDoors * 12 + kMaxEnemyBombs * 108 + kMaxSlots * 64 +
-                                   kMaxBorn * 12 + kGridMapBytes && sizeof(Shots) != sizeof(Body), "wire layout");
+static_assert(sizeof(SteamIdentity) == 136 && sizeof(Published) == 8 + sizeof(Body) && sizeof(PublishedWorld) == 8 + sizeof(World), "layout");
 using WithDevice = int(__thiscall*)(void*, int, void*, void*, void*, int*);
 using PlayerUpdate = void(__thiscall*)(void*);
 using NpcDamage = char(__thiscall*)(void*, float, std::uint32_t, std::uint32_t, void*, int);
@@ -393,8 +365,9 @@ std::atomic<bool> running{false};
 std::atomic<unsigned> counters[2]{};  // reads of the own player's input answered by the keyboard; all other reads
 Published published{}; PublishedWorld publishedWorld{}; PublishedShots publishedShots{};
 Stats stats{};
-struct Inbox { Body body{}; std::uint64_t at = 0, arrivedUs = 0; std::uint32_t appliedSequence = 0; };
+struct Inbox { Body body{}; std::uint64_t at = 0, arrivedUs = 0; std::uint32_t appliedSequence = 0, session = 0; };   // session: the owner's start this body is of
 struct ShotsInbox { Shots shots{}; std::uint64_t at = 0; std::uint32_t applied = 0; };
+std::uint32_t seenSession[kControllers]{};   // the game's thread: the owner's start whose takings and hits this game counts along with
 ShotsInbox shotsInbox[kControllers];
 // The seeds a list has brought here: a shot of such a seed that is missing here has ended here, and is not made again.
 struct Known { std::uint32_t seeds[kKnownShots]; std::uint32_t next; };
@@ -405,10 +378,18 @@ Inbox inbox[kControllers];
 World worldInbox{}; std::uint64_t worldAt = 0; std::uint32_t worldApplied = 0;
 SOCKET udp = INVALID_SOCKET; HANDLE worker = nullptr; bool winsock = false; unsigned short port = 0;
 sockaddr_in peers[kMaxPeers]{}; std::uint32_t peerCount = 0; std::atomic<bool> peerHeard{false};
-// The handshake: this module's stage, per neighbour the stage it last named plus one (0: not heard yet), how many hellos
-// came with another protocol, and when this module started (for its patience).
-std::atomic<std::uint8_t> stage{kHere}, heardStage[kMaxPeers]{}; std::atomic<std::uint32_t> otherProtocol{0}; std::uint64_t startedAt = 0; std::uint32_t helloNumber = 0;
+// The handshake: this module's stage, per neighbour the stage it last named plus one (0: not heard yet) with what its hello
+// said of hosting and rules, how many hellos came with another protocol, what the modules do not agree on (a Discord), and
+// when this module started (for its patience).
+std::atomic<std::uint8_t> stage{kHere}, heardStage[kMaxPeers]{}, heardHost[kMaxPeers]{}, discord{0}; std::atomic<std::uint32_t> heardRules[kMaxPeers]{}, otherProtocol{0};
+std::uint64_t startedAt = 0; std::uint32_t helloNumber = 0;
 std::atomic<bool> gaveUp{false};
+// Starts. This module's own number (kept from start to start: the next is always higher), and on the receiving thread per
+// neighbour the start its frames are of, when it was last heard, and of which kinds the first frame of that start is still
+// to come - that one is taken whatever its sequence.
+std::uint32_t session = 0, peerSession[kMaxPeers]{}; std::uint64_t peerHeardAt[kMaxPeers]{}; std::uint8_t peerAnew[kMaxPeers]{};
+// Faults on the game's thread: the rule at work (0: none of them), how often each has faulted, and the rules switched off for it.
+std::uint32_t doing = 0, faulted = 0; std::uint8_t ruleFaults[32]{};
 // Under which device number THIS game keeps each neighbour's player (-1: not known - then the number the neighbour names is taken).
 int peerControllers[kMaxPeers] = {-1, -1, -1, -1};
 // Steam: the neighbours by id and the four exports of the game's steam_api.dll that carry a datagram to them and back.
@@ -417,9 +398,7 @@ using SteamReceive = int(__cdecl*)(void*, int, void**, int);
 using SteamRelease = void(__cdecl*)(void*);
 SteamIdentity steamPeers[kMaxPeers]{}; std::uint32_t steamPeerCount = 0; void* steamMessages = nullptr;
 SteamSend steamSend = nullptr; SteamReceive steamReceive = nullptr; SteamRelease steamRelease = nullptr;
-// A sequence being put together, per neighbour and kind.
-struct Assembly { std::uint32_t sequence, total, have; std::uint8_t chunks; std::uint8_t data[sizeof(World)]; };
-Assembly assemblies[kMaxPeers][2]{};   // [neighbour][0 shots, 1 world]
+Assembly assemblies[kMaxPeers][2]{};   // a sequence being put together: [neighbour][0 shots, 1 world]
 std::uint32_t sequence = 0, worldSequence = 0, frame = 0;
 // The host's memory of the room: who lived a frame ago, and who died lately (seed, frame of death).
 std::uint32_t livedRoom = 0xffffffff, lived[kMaxNpcs]{}, livedCount = 0;
@@ -441,7 +420,7 @@ bool applyingGrid = false;
 std::uint8_t entryMap[kGridMapBytes]{}; std::uint32_t entryRoom = 0xffffffff; std::uint8_t cellGone[kGridCells]{}; std::uint32_t cellGoneRoom = 0xffffffff;
 bool GridHeld(); bool HostRules();
 std::uint32_t rules = kAllRules;
-inline bool On(std::uint32_t rule) { return (rules & rule) != 0; }
+inline bool On(std::uint32_t rule) { return (rules & ~faulted & rule) != 0; }
 // The module runs and the handshake with every neighbour is through. Until then nothing of the game is changed: a module
 // that runs in one game only must leave it exactly the game its unpatched neighbour compares checksums with.
 bool Live();
@@ -483,7 +462,6 @@ std::uint64_t NowUs() {
     return static_cast<std::uint64_t>(now.QuadPart) * 1000000ull / static_cast<std::uint64_t>(frequency.QuadPart);
 }
 
-bool Finite(const float* v) { return std::isfinite(v[0]) && std::isfinite(v[1]); }
 template <class T> T& At(std::uintptr_t address) { return *reinterpret_cast<T*>(address); }
 
 // The game's own Room::IsPersistentRoomEntity (RVA 0x3ed2a0), as decompiled: the traps a room keeps.
@@ -511,51 +489,15 @@ void AnimationOf(std::uintptr_t entity, char* name) {
     if (text && size && size < static_cast<std::uint32_t>(kAnimationName)) std::memcpy(name, text, size);
 }
 
-// Only what is in use, in the order of the struct: the header, then every array by its count.
-template <class T> void Put(std::uint8_t*& at, const T* from, std::uint32_t count) { std::memcpy(at, from, count * sizeof(T)); at += count * sizeof(T); }
-template <class T> bool Take(const std::uint8_t*& at, const std::uint8_t* end, T* to, std::uint32_t count, std::uint32_t most) {
-    if (count > most || static_cast<std::size_t>(end - at) < count * sizeof(T)) return false;
-    std::memcpy(to, at, count * sizeof(T)); at += count * sizeof(T); return true;
-}
-
-std::uint32_t PackWorld(const World& world, std::uint8_t* out) {
-    auto* at = out; Put(at, reinterpret_cast<const std::uint8_t*>(&world), static_cast<std::uint32_t>(offsetof(World, npcs)));
-    Put(at, world.npcs, world.count); Put(at, world.died, world.deaths); Put(at, world.grid, world.cells); Put(at, world.shot, world.shots); Put(at, world.drop, world.drops);
-    Put(at, world.door, world.doors); Put(at, world.enemyBomb, world.enemyBombs); Put(at, world.slot, world.slots); Put(at, world.bornCell, world.born);
-    Put(at, world.gridMap, kGridMapBytes);
-    return static_cast<std::uint32_t>(at - out);
-}
-
-bool UnpackWorld(const std::uint8_t* from, std::uint32_t size, World& world) {
-    const auto* at = from; const auto* end = from + size; world = World{};
-    return Take(at, end, reinterpret_cast<std::uint8_t*>(&world), static_cast<std::uint32_t>(offsetof(World, npcs)), static_cast<std::uint32_t>(offsetof(World, npcs))) &&
-        Take(at, end, world.npcs, world.count, kMaxNpcs) && Take(at, end, world.died, world.deaths, kMaxDeaths) && Take(at, end, world.grid, world.cells, kMaxCells) &&
-        Take(at, end, world.shot, world.shots, kMaxShots) && Take(at, end, world.drop, world.drops, kMaxDrops) && Take(at, end, world.door, world.doors, kMaxDoors) &&
-        Take(at, end, world.enemyBomb, world.enemyBombs, kMaxEnemyBombs) && Take(at, end, world.slot, world.slots, kMaxSlots) && Take(at, end, world.bornCell, world.born, kMaxBorn) &&
-        Take(at, end, world.gridMap, kGridMapBytes, kGridMapBytes) && at == end;
-}
-
-std::uint32_t PackShots(const Shots& shots, std::uint8_t* out) {
-    auto* at = out; Put(at, reinterpret_cast<const std::uint8_t*>(&shots), static_cast<std::uint32_t>(offsetof(Shots, shot)));
-    Put(at, shots.shot, shots.count + shots.bombs); Put(at, shots.pet, shots.pets);
-    return static_cast<std::uint32_t>(at - out);
-}
-
-bool UnpackShots(const std::uint8_t* from, std::uint32_t size, Shots& shots) {
-    const auto* at = from; const auto* end = from + size; shots = Shots{};
-    return Take(at, end, reinterpret_cast<std::uint8_t*>(&shots), static_cast<std::uint32_t>(offsetof(Shots, shot)), static_cast<std::uint32_t>(offsetof(Shots, shot))) &&
-        shots.count <= kMaxTears && shots.bombs <= kMaxTears && Take(at, end, shots.shot, shots.count + shots.bombs, kMaxTears) && Take(at, end, shots.pet, shots.pets, kMaxPets) && at == end;
-}
-
 // To every neighbour, in datagrams of at most kChunkBytes. Nothing is sent without neighbours: then a process outside carries the slots.
 void SendAll(std::uint8_t kind, std::uint32_t number, const std::uint8_t* payload, std::uint32_t size) {
     if ((!peerCount && !steamPeerCount) || !size) return;
     const std::uint32_t chunks = (size + kChunkBytes - 1) / kChunkBytes;
-    if (chunks > 31) return;
+    if (chunks > kMaxChunks) return;
     std::uint8_t datagram[sizeof(FrameHeader) + kChunkBytes];
     for (std::uint32_t c = 0; c < chunks; ++c) {
         const std::uint32_t from = c * kChunkBytes, part = size - from < kChunkBytes ? size - from : kChunkBytes;
-        const FrameHeader header{kFrameMagic, kind, static_cast<std::uint8_t>(c), static_cast<std::uint8_t>(chunks), 0, number, size};
+        const FrameHeader header{kFrameMagic, kind, static_cast<std::uint8_t>(c), static_cast<std::uint8_t>(chunks), 0, number, size, session};
         std::memcpy(datagram, &header, sizeof(header)); std::memcpy(datagram + sizeof(header), payload + from, part);
         for (std::uint32_t n = 0; n < peerCount && udp != INVALID_SOCKET; ++n) {
             sendto(udp, reinterpret_cast<const char*>(datagram), static_cast<int>(sizeof(header) + part), 0, reinterpret_cast<const sockaddr*>(&peers[n]), sizeof(peers[n]));
@@ -724,18 +666,23 @@ void ApplyTears(std::uintptr_t player, int controller, std::uintptr_t room, std:
     ReleaseSRWLockShared(&inboxLock);
     if (fresh && shots.room == roomIndex) {
         const bool complete = shots.count + shots.bombs < kMaxTears;
-        if (On(kTears)) ApplyShots(room, shots.shot, shots.count, complete, kOfTear, player, knownTears[controller], stats.tearsMade, stats.tearsEnded, stats.tearsDropped);
-        if (On(kBombsRule))
+        if (On(kTears)) { doing = kTears; ApplyShots(room, shots.shot, shots.count, complete, kOfTear, player, knownTears[controller], stats.tearsMade, stats.tearsEnded, stats.tearsDropped); }
+        if (On(kBombsRule)) {
+            doing = kBombsRule;
             ApplyShots(room, shots.shot + shots.count, shots.bombs, complete, kOfBomb, player, knownBombs[controller], stats.bombsMade, stats.bombsEnded, stats.bombsDropped);
+        }
+        doing = 0;
         for (std::uint32_t b = 0; b < shots.bombs; ++b) if (shots.shot[shots.count + b].fallingAccel != 0.0f) tearsHeardAt[controller] = now;   // fetus bombs are this player's fire
         AcquireSRWLockExclusive(&inboxLock); shotsInbox[controller].applied = shots.sequence; ReleaseSRWLockExclusive(&inboxLock);
         if (shots.count) tearsHeardAt[controller] = now;
-        if (On(kPets)) ApplyPets(player, shots, room, On(kTears) && tearsHeardAt[controller] && now - tearsHeardAt[controller] <= kTearsHeardMs);
+        if (On(kPets)) { doing = kPets; ApplyPets(player, shots, room, On(kTears) && tearsHeardAt[controller] && now - tearsHeardAt[controller] <= kTearsHeardMs); }
     }
     if (On(kTears) && tearsHeardAt[controller] && now - tearsHeardAt[controller] <= kTearsHeardMs) {
+        doing = kTears;
         auto weapon = At<std::uintptr_t>(player + kWeapon); if (!weapon) weapon = At<std::uintptr_t>(player + kWeaponOther);
         if (weapon && At<float>(weapon + kFireDelay) < kHeldFireDelay) { At<float>(weapon + kFireDelay) = kHeldFireDelay; stats.fireHolds++; }
     }
+    doing = 0;
 }
 
 // 1 rock, 2 poop, 3 TNT, 4 web; 0 for every other cell.
@@ -1055,7 +1002,7 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
     if (world.room != roomIndex) { stats.otherRoom++; return; }
     hostClearRoom.store(world.room); hostClear.store(world.clear); hostHeardAt.store(GetTickCount64());
     if (aliasRoom != roomIndex) { aliasRoom = roomIndex; aliasCount = 0; orphanCount = 0; missingCount = 0; dropAgeCount = 0; doorMemoryCount = 0; slotAgeCount = 0; }
-    if (On(kCounters)) if (const auto game = At<std::uintptr_t>(base + kGame)) ApplyCounters(game, player, world);
+    if (On(kCounters)) if (const auto game = At<std::uintptr_t>(base + kGame)) { doing = kCounters; ApplyCounters(game, player, world); doing = 0; }
     const auto data = At<std::uintptr_t>(room + kListData); const auto count = At<std::uint32_t>(room + kListCount);
     if (!data || count > 4096) return;
     std::uintptr_t local[kMaxNpcs]; int partner[kMaxNpcs]; bool taken[kMaxNpcs]{}; std::uint32_t locals = 0;
@@ -1064,6 +1011,16 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
         const auto entity = At<std::uintptr_t>(data + i * sizeof(std::uintptr_t));
         if (entity && LivingNpc(entity)) { local[locals] = entity; partner[locals] = -1; ++locals; }
     }
+    // The room's memory keeps only who is still there. A fight that goes on making enemies - a boss and its flies - would
+    // otherwise fill the tables, and from then on nobody new is created, removed or remembered as a pair. A list that did
+    // not fit says nothing about who is gone: then that side's tables are left as they are.
+    if (locals < static_cast<std::uint32_t>(kMaxNpcs)) {
+        const auto here = [&](std::uint32_t seed) { for (std::uint32_t l = 0; l < locals; ++l) if (At<std::uint32_t>(local[l] + kSeed) == seed) return true; return false; };
+        Prune(aliases, aliasCount, [&](const Alias& alias) { return here(alias.localSeed); });
+        Prune(orphans, orphanCount, [&](const Orphan& orphan) { return here(orphan.seed); });
+    }
+    if (world.npcTotal <= static_cast<std::uint32_t>(kMaxNpcs))
+        Prune(missing, missingCount, [&](const Missing& absent) { for (std::uint32_t n = 0; n < world.count; ++n) if (world.npcs[n].seed == absent.seed) return true; return false; });
     // 1. by seed, or by the pairing remembered from an earlier snapshot
     for (std::uint32_t l = 0; l < locals; ++l) {
         auto seed = At<std::uint32_t>(local[l] + kSeed);
@@ -1094,7 +1051,7 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
         if (aliasCount < kMaxNpcs) aliases[aliasCount++] = Alias{world.npcs[n].seed, At<std::uint32_t>(local[best] + kSeed)};
     }
     // 3. the host's state over the partners; who has none grows older and is removed in the end; who died at the host dies here
-    std::uintptr_t doomed[kMaxNpcs]; std::uint32_t doomedCount = 0;
+    std::uintptr_t doomed[kMaxNpcs], unwanted[kMaxNpcs]; std::uint32_t doomedCount = 0, unwantedCount = 0;
     for (std::uint32_t l = 0; l < locals; ++l) {
         const auto entity = local[l]; const auto ownSeed = At<std::uint32_t>(entity + kSeed); auto seed = ownSeed;
         for (std::uint32_t a = 0; a < aliasCount; ++a) if (aliases[a].localSeed == ownSeed) { seed = aliases[a].hostSeed; break; }
@@ -1107,7 +1064,7 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
             stats.npcOnlyLocal++;
             if (index == orphanCount && orphanCount < kMaxNpcs) orphans[orphanCount++] = Orphan{ownSeed, 0};
             if (At<std::uintptr_t>(entity + kParent) || At<std::uintptr_t>(entity + kChild)) { stats.npcPartsLeft++; continue; }   // nor removed
-            if (index < orphanCount && world.npcTotal <= kMaxNpcs && ++orphans[index].age > kOrphanSnapshots) { doomed[doomedCount++] = entity; stats.npcRemoved++; }
+            if (index < orphanCount && world.npcTotal <= kMaxNpcs && ++orphans[index].age > kOrphanSnapshots) { unwanted[unwantedCount++] = entity; stats.npcRemoved++; }
             continue;
         }
         if (index < orphanCount) orphans[index].age = 0;
@@ -1119,6 +1076,7 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
         if (npc.collisionDamage >= 0.0f && npc.collisionDamage < 1000.0f) At<float>(entity + kCollisionDamage) = npc.collisionDamage;
         // What the enemy does: the host's. The guest's own code goes on from here, so it plays the host's attack.
         if (!On(kBehaviour)) { stats.npcCorrectionSum += distance; if (distance > stats.npcCorrectionMax) stats.npcCorrectionMax = distance; stats.npcMatched++; continue; }
+        doing = kBehaviour;
         if (At<std::int32_t>(entity + kState) != npc.state) { At<std::int32_t>(entity + kState) = npc.state; stats.stateFixes++; }
         At<std::int32_t>(entity + kStateFrame) = npc.stateFrame; At<std::int32_t>(entity + kCooldown) = npc.cooldown;
         At<std::int32_t>(entity + kI1) = npc.i1; At<std::int32_t>(entity + kI2) = npc.i2;
@@ -1130,33 +1088,46 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
                 reinterpret_cast<SpritePlay>(base + kSpritePlay)(reinterpret_cast<void*>(entity + kSprite), npc.animation, true); stats.animationFixes++;
             }
         }
+        doing = 0;
         stats.npcCorrectionSum += distance; if (distance > stats.npcCorrectionMax) stats.npcCorrectionMax = distance;
         stats.npcMatched++;
     }
     // Killing spawns effects, which may move the list: only after the walk over it.
     for (std::uint32_t d = 0; d < doomedCount; ++d) { reinterpret_cast<PlayerUpdate>(base + kKill)(reinterpret_cast<void*>(doomed[d])); stats.npcKilled++; }
+    // An enemy the host never had has not died: it goes without the death the game would play for it - no blood, no halves
+    // of an enemy that splits, nothing dropped. The entity's own Remove, slot 10, as for a shot of this game's own making
+    // (the enemy's override, RVA 0x2b8f00, looks at one type and ends in the base Remove, RVA 0x2acb00: read in the EXE).
+    for (std::uint32_t u = 0; u < unwantedCount; ++u) reinterpret_cast<PlayerUpdate>(At<void**>(unwanted[u])[10])(reinterpret_cast<void*>(unwanted[u]));
     // And creating changes the list as well: last of all.
     const auto game = At<std::uintptr_t>(base + kGame);
+    doing = kBehaviour;
     for (std::uint32_t w = 0; w < wantedCount && game && On(kBehaviour); ++w) {
         const auto& npc = world.npcs[wanted[w]];
         const auto made = reinterpret_cast<Spawn>(base + kSpawn)(reinterpret_cast<void*>(game), npc.type, npc.variant, npc.position, npc.velocity, nullptr, npc.subtype, npc.seed ? npc.seed : 1);
         if (made) stats.npcSpawned++; else stats.npcSpawnFailures++;
     }
+    doing = 0;
     // The host's room is clear and this one is not: clear it as the game does.
     const auto descriptor = At<std::uintptr_t>(room + kDescriptor);
     if (On(kClear) && world.clear && clearTrampoline && descriptor && !(At<std::uint32_t>(descriptor + kRoomFlags) & 1)) {
-        reinterpret_cast<TriggerClear>(clearTrampoline)(reinterpret_cast<void*>(room), 0); stats.clearsFromHost++;
+        doing = kClear; reinterpret_cast<TriggerClear>(clearTrampoline)(reinterpret_cast<void*>(room), 0); stats.clearsFromHost++;
     }
-    if (On(kGridRule)) { ApplyGridCells(room, roomIndex, world); ApplyGrid(room, world); }
-    if (On(kProjectiles))
+    if (On(kGridRule)) { doing = kGridRule; ApplyGridCells(room, roomIndex, world); ApplyGrid(room, world); }
+    if (On(kProjectiles)) {
+        doing = kProjectiles;
         ApplyShots(room, world.shot, world.shots, world.shots < kMaxShots, kOfEnemy, 0, knownProjectiles, stats.projectilesMade, stats.projectilesEnded, stats.projectilesDropped);
-    if (On(kBombsRule))
+    }
+    if (On(kBombsRule)) {
+        doing = kBombsRule;
         ApplyShots(room, world.enemyBomb, world.enemyBombs, world.enemyBombs < kMaxEnemyBombs, kOfBomb, kNotAPlayer, knownEnemyBombs, stats.enemyBombsMade, stats.enemyBombsEnded,
                    stats.enemyBombsDropped);
+    }
+    doing = 0;
     if (On(kHurt) && world.hurt && !At<std::uint8_t>(room + kRoomHurt)) { At<std::uint8_t>(room + kRoomHurt) = 1; stats.hurtTaken++; }
-    if (On(kSlotsRule)) ApplySlots(room, world);
-    if (On(kDrops)) ApplyDrops(room, world);
-    if (On(kDoors)) ApplyDoors(room, world);
+    if (On(kSlotsRule)) { doing = kSlotsRule; ApplySlots(room, world); }
+    if (On(kDrops)) { doing = kDrops; ApplyDrops(room, world); }
+    if (On(kDoors)) { doing = kDoors; ApplyDoors(room, world); }
+    doing = 0;
     stats.worldApplied++; worldApplied = world.sequence;
 }
 
@@ -1233,7 +1204,7 @@ void ApplyTaken(std::uintptr_t player, int controller, const Body& body, std::ui
         for (const auto& t : body.taken) if (t.number == number) taken = &t;
         if (!taken || taken->room != roomIndex) { takenDone[controller] = number; takenSince[controller] = 0; stats.takenMissed++; continue; }
         if (taken->low & kSlotTouch) {   // a touch of a machine: played by the host alone, once, whatever comes of it
-            if (host && On(kSlotsRule)) PlaySlotTouch(player, *taken, room);
+            if (host && On(kSlotsRule)) { doing = kSlotsRule; PlaySlotTouch(player, *taken, room); doing = 0; }
             takenDone[controller] = number; takenSince[controller] = 0; continue;
         }
         if (!On(kTaken)) { takenDone[controller] = number; takenSince[controller] = 0; continue; }
@@ -1255,7 +1226,9 @@ void ApplyTaken(std::uintptr_t player, int controller, const Body& body, std::ui
         if (found) {
             const Shape before = ShapeOf(found);
             At<std::int32_t>(found + kWait) = 0;   // the owner's game has decided: no waiting here
+            doing = kTaken;
             applyingTaken = true; originalCollision(reinterpret_cast<void*>(found), reinterpret_cast<void*>(player), taken->low); applyingTaken = false;
+            doing = 0;
             done = !Same(before, ShapeOf(found));
         }
         if (done) stats.takenApplied++;
@@ -1306,20 +1279,35 @@ void Handshake() {
         return;
     }
     if (gaveUp.load(std::memory_order_relaxed)) return;
-    std::uint8_t least = 0xff;
-    for (std::uint32_t n = 0; n < neighbours; ++n) { const auto heard = heardStage[n].load(std::memory_order_relaxed); if (heard < least) least = heard; }
+    Heard heard[kMaxPeers];
+    for (std::uint32_t n = 0; n < neighbours && n < kMaxPeers; ++n)
+        heard[n] = Heard{heardStage[n].load(std::memory_order_relaxed), heardHost[n].load(std::memory_order_relaxed) != 0, heardRules[n].load(std::memory_order_relaxed)};
+    // Modules that do not agree on one host and one set of rules go no further: they stay the game's own match, and the
+    // patience below ends it. (Around a player's leaving the neighbours start anew a moment apart, and for that moment a
+    // hello of the old start may well disagree - so this waits rather than gives up at once.)
+    const auto disagreed = Agree(host, rules, heard, neighbours);
+    discord.store(static_cast<std::uint8_t>(disagreed), std::memory_order_relaxed);
     const std::uint8_t before = now;
-    if (now == kHere && least >= kHere + 1) {
-        if (Patch(kCompare, kCompareEqual, kCompareEntry)) { gaveUp.store(true, std::memory_order_relaxed); stats.rejected++; return; }
-        now = kCompareOff;
-    }
-    if (now == kCompareOff && least >= kCompareOff + 1) now = kLive;
+    if (disagreed == Discord::None) now = NextStage(now, heard, neighbours);
+    if (before == kHere && now != kHere && Patch(kCompare, kCompareEqual, kCompareEntry)) { gaveUp.store(true, std::memory_order_relaxed); stats.gameFaults++; return; }
     if (now != before) stage.store(now, std::memory_order_relaxed);
     if (now == kHere && GetTickCount64() - startedAt > kHelloPatienceMs) { gaveUp.store(true, std::memory_order_relaxed); return; }   // not a match of modules
     if (now != before || frame % kHelloEveryFrames == 0) {
         const Hello hello{kHelloMagic, kProtocol, rules, static_cast<std::uint8_t>(ownController), static_cast<std::uint8_t>(host ? 1 : 0), now, 0};
         SendAll(kOfHello, ++helloNumber, reinterpret_cast<const std::uint8_t*>(&hello), sizeof(hello));
     }
+}
+
+// The game's thread, after an exception under AfterUpdate. The game goes on, as it did before, but what happened is no
+// longer hidden among refused datagrams, and it is held against the rule that was at work: a rule that reads a wrong
+// place faults on every frame, each time in the middle of the game's own code, and nothing good comes of the next one.
+void TakeFault() {
+    stats.gameFaults++; applyingTaken = false; applyingGrid = false;
+    if (doing) {
+        std::uint32_t bit = 0; while (bit < 31 && !(doing >> bit & 1)) ++bit;
+        if (++ruleFaults[bit] >= kFaultsToSwitchOff) { faulted |= doing; stats.faultRules = faulted; }
+    }
+    doing = 0;
 }
 
 // The game's thread, right after the game's own update of one player.
@@ -1361,14 +1349,16 @@ void AfterUpdate(std::uintptr_t player) noexcept {
         }
         if (controller < 0 || controller >= kControllers || !Live()) return;
         if (room && (On(kTears) || On(kBombsRule) || On(kPets))) ApplyTears(player, controller, room, roomIndex);
-        Body body{}; bool fresh = false; std::uint64_t arrivedUs = 0;
+        Body body{}; bool fresh = false; std::uint64_t arrivedUs = 0; std::uint32_t ownerSession = 0;
         AcquireSRWLockShared(&inboxLock);
         if (inbox[controller].body.sequence && inbox[controller].body.sequence != inbox[controller].appliedSequence) {
-            fresh = GetTickCount64() - inbox[controller].at <= kFreshMs; body = inbox[controller].body; arrivedUs = inbox[controller].arrivedUs;
+            fresh = GetTickCount64() - inbox[controller].at <= kFreshMs; body = inbox[controller].body; arrivedUs = inbox[controller].arrivedUs; ownerSession = inbox[controller].session;
         }
         ReleaseSRWLockShared(&inboxLock);
         if (!body.sequence) return;
         if (!fresh) { stats.stale++; return; }
+        // The owner's module has started anew: it counts its takings and hits from nothing again, and so does this game.
+        if (ownerSession != seenSession[controller]) { seenSession[controller] = ownerSession; takenKnown[controller] = false; hitsKnown[controller] = false; }
         // A body of another room is not a position in this one: around a door the two games change rooms a moment apart.
         if (body.floor != Floor(game)) { stats.otherFloor++; return; }
         if (body.room != roomIndex) { stats.otherRoom++; return; }
@@ -1397,18 +1387,20 @@ void AfterUpdate(std::uintptr_t player) noexcept {
             if (fixed) stats.healthFixes++;
         }
         if (On(kLook) && !gone && !ghost && !dying) {
+            doing = kLook;
             if (hitsKnown[controller] && body.hits != hitsPlayed[controller]) {
                 static std::uint8_t nothing[0x40]{};   // an empty damage source
                 originalPlayerDamage(reinterpret_cast<void*>(player), 1.0f, kDamageFake | kDamageNoPenalties, 0, nothing, 0); stats.copyHitsPlayed++;
                 for (int h = 0; h < kHealthFields; ++h) At<std::int32_t>(player + kHealth[h]) = body.health[h];   // whatever that hit did to the copy's hearts
             }
             if (body.headFrameDelay >= 0 && body.headFrameDelay < 600) At<std::int32_t>(player + kHeadFrameDelay) = body.headFrameDelay;
+            doing = 0;
         }
         hitsPlayed[controller] = body.hits; hitsKnown[controller] = true;
         if (room && (On(kTaken) || On(kSlotsRule))) ApplyTaken(player, controller, body, room, roomIndex);
         // A guest's player lost red hearts in this room: the host, who ignores blows to its copies, learns it here.
         if (room && host && On(kHurt) && body.hurt && !At<std::uint8_t>(room + kRoomHurt)) { At<std::uint8_t>(room + kRoomHurt) = 1; stats.hurtTaken++; }
-    } __except (EXCEPTION_EXECUTE_HANDLER) { stats.rejected++; applyingTaken = false; applyingGrid = false; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { TakeFault(); }
 }
 
 void __fastcall OnPlayer(void* object, void*) {
@@ -1509,40 +1501,25 @@ void UnhookClear() {
     }
 }
 
-bool ValidShot(const Shot& shot) {
-    if (!Finite(shot.position) || !Finite(shot.velocity) || !std::isfinite(shot.height) || !std::isfinite(shot.fallingSpeed) || !std::isfinite(shot.fallingAccel) ||
-        !std::isfinite(shot.scale) || !std::isfinite(shot.damage)) return false;
-    for (const float c : shot.color) if (!std::isfinite(c) || std::fabs(c) > 100.0f) return false;
-    // Far outside what a shot can be: the sender read something else (another build's layout), and nothing of it is applied.
-    return std::fabs(shot.position[0]) < 10000.0f && std::fabs(shot.position[1]) < 10000.0f && std::fabs(shot.velocity[0]) < 1000.0f && std::fabs(shot.velocity[1]) < 1000.0f &&
-        shot.height > -5000.0f && shot.height < 2.0e9f &&   // a bomb carries its frames to the explosion here, and a remote one's may be very many std::fabs(shot.fallingSpeed) < 1000.0f && std::fabs(shot.fallingAccel) < 100.0f &&
-        shot.scale >= 0.0f && shot.scale < 50.0f && shot.damage >= 0.0f && shot.damage < 100000.0f;
-}
-
-bool ValidWorld(const World& world, int got) {
-    if (got != sizeof(World) || world.magic != kWorldMagic || !world.sequence || world.count > kMaxNpcs || world.deaths > kMaxDeaths || world.cells > kMaxCells || world.shots > kMaxShots || world.drops > kMaxDrops || world.doors > kMaxDoors || world.enemyBombs > kMaxEnemyBombs || world.slots > kMaxSlots || world.born > kMaxBorn) return false;
-    for (std::uint32_t n = 0; n < world.slots; ++n) if (!Finite(world.slot[n].position) || world.slot[n].animation[kAnimationName - 1]) return false;
-    for (std::uint32_t n = 0; n < world.enemyBombs; ++n) if (!ValidShot(world.enemyBomb[n])) return false;
-    for (std::uint32_t n = 0; n < world.drops; ++n) if (!Finite(world.drop[n].position) || !Finite(world.drop[n].velocity)) return false;
-    for (std::uint32_t n = 0; n < world.shots; ++n) if (!ValidShot(world.shot[n])) return false;
-    for (std::uint32_t n = 0; n < world.count; ++n)
-        if (!Finite(world.npcs[n].position) || !Finite(world.npcs[n].velocity) || !std::isfinite(world.npcs[n].hitPoints) || world.npcs[n].animation[kAnimationName - 1]) return false;
-    return true;
-}
-
 std::filesystem::path OwnFolder();
 
-bool DeliverBody(const Body& body) {
+// anew: the first of its kind from a start of the sender's module this game has not heard before - taken whatever its
+// sequence, for the sender counts from 1 again. session: that start (0 where a process outside carries the slots).
+bool DeliverBody(const Body& body, std::uint32_t ofSession, bool anew) {
     const bool valid = body.magic == kBodyMagic && body.controller < kControllers && body.sequence &&
         static_cast<int>(body.controller) != ownController && Finite(body.position) && Finite(body.velocity);
     if (!valid) return false;
     AcquireSRWLockExclusive(&inboxLock);
-    if (body.sequence > inbox[body.controller].body.sequence) { inbox[body.controller].body = body; inbox[body.controller].at = GetTickCount64(); inbox[body.controller].arrivedUs = NowUs(); stats.received++; }
+    auto& box = inbox[body.controller];
+    if (anew || body.sequence > box.body.sequence) {
+        if (anew) box.appliedSequence = 0;
+        box.body = body; box.at = GetTickCount64(); box.arrivedUs = NowUs(); box.session = ofSession; stats.received++;
+    }
     ReleaseSRWLockExclusive(&inboxLock);
     return true;
 }
 
-bool DeliverShots(const Shots& shots) {
+bool DeliverShots(const Shots& shots, bool anew) {
     bool valid = shots.magic == kShotsMagic && shots.controller < kControllers && shots.sequence && static_cast<int>(shots.controller) != ownController &&
         shots.count <= kMaxTears && shots.bombs <= kMaxTears && shots.count + shots.bombs <= kMaxTears && shots.pets <= kMaxPets;
     for (std::uint32_t n = 0; valid && n < shots.pets; ++n) valid = Finite(shots.pet[n].position) && Finite(shots.pet[n].velocity);
@@ -1550,60 +1527,68 @@ bool DeliverShots(const Shots& shots) {
     if (!valid) return false;
     AcquireSRWLockExclusive(&inboxLock);
     auto& box = shotsInbox[shots.controller];
-    if (shots.sequence > box.shots.sequence) { box.shots = shots; box.at = GetTickCount64(); }
+    if (anew || shots.sequence > box.shots.sequence) { if (anew) box.applied = 0; box.shots = shots; box.at = GetTickCount64(); }
     ReleaseSRWLockExclusive(&inboxLock);
     return true;
 }
 
-bool DeliverWorld(const World& world) {
-    if (host || !ValidWorld(world, sizeof(World))) return false;   // the host takes nobody's world
+bool DeliverWorld(const World& world, bool anew) {
+    if (host || !ValidWorld(world)) return false;   // the host takes nobody's world
     AcquireSRWLockExclusive(&inboxLock);
-    if (world.sequence > worldInbox.sequence) { worldInbox = world; worldAt = GetTickCount64(); stats.worldReceived++; }
+    if (anew || world.sequence > worldInbox.sequence) { worldInbox = world; worldAt = GetTickCount64(); stats.worldReceived++; }
     ReleaseSRWLockExclusive(&inboxLock);
     return true;
 }
 
-// One datagram of a frame from neighbour n: a whole body, or a chunk of packed shots or of a packed world.
+// One datagram of a frame from neighbour n: a whole body, a hello, or a chunk of packed shots or of a packed world.
 bool TakeChunk(std::uint32_t n, const std::uint8_t* datagram, int got) {
     FrameHeader header; std::memcpy(&header, datagram, sizeof(header));
     const auto* payload = datagram + sizeof(header); const auto part = static_cast<std::uint32_t>(got) - static_cast<std::uint32_t>(sizeof(header));
+    // A hello of a protocol before 4: its header had no session and was 16 bytes. Heard, but not one to go live with.
+    if (header.kind == kOfHello && got == 16 + static_cast<int>(sizeof(Hello))) { otherProtocol.fetch_add(1, std::memory_order_relaxed); return true; }
+    if (n >= kMaxPeers || !header.session) return false;
+    // Which start of the neighbour's module this is of (native_state.hpp: NewerSession). A newer one: what was known of
+    // the neighbour - its stage, half-built frames, the sequences it had reached - is of a module that is no more.
+    const auto now = GetTickCount64();
+    if (header.session != peerSession[n]) {
+        if (!NewerSession(peerSession[n], header.session, now - peerHeardAt[n])) return true;   // a straggler of a start the neighbour has left behind
+        peerSession[n] = header.session; peerAnew[n] = 0xff; heardStage[n].store(0, std::memory_order_relaxed);
+        for (auto& assembly : assemblies[n]) assembly.Reset();
+    }
+    peerHeardAt[n] = now;
+    const auto first = [&](std::uint8_t kind, bool delivered) { if (delivered) peerAnew[n] &= static_cast<std::uint8_t>(~(1u << kind)); return delivered; };
+    const auto anew = [&](std::uint8_t kind) { return (peerAnew[n] >> kind & 1) != 0; };
     // Device numbers are each process's own: a game that has played matches since its launch numbers the same players higher
     // than a fresh one (seen between two Steam clients: the owner said 5, its copy here was 3 - and no body ever reached the
     // copy). So when this game knows under which number it keeps the sender's player, that number replaces the sender's.
-    const int localNumber = n < kMaxPeers ? peerControllers[n] : -1;
+    const int localNumber = peerControllers[n];
     if (header.kind == kOfBody) {
         if (header.chunks != 1 || part != sizeof(Body)) return false;
         Body body; std::memcpy(&body, payload, sizeof(body));
         if (localNumber >= 0) body.controller = static_cast<std::uint32_t>(localNumber);
-        return DeliverBody(body);
+        return first(kOfBody, DeliverBody(body, header.session, anew(kOfBody)));
     }
     if (header.kind == kOfHello) {
         Hello hello;
-        if (header.chunks != 1 || part != sizeof(Hello) || n >= kMaxPeers) return false;
+        if (header.chunks != 1 || part != sizeof(Hello)) return false;
         std::memcpy(&hello, payload, sizeof(hello));
         if (hello.magic != kHelloMagic || hello.stage > kLive) return false;
         if (hello.protocol != kProtocol) { otherProtocol.fetch_add(1, std::memory_order_relaxed); return true; }   // heard, but not one to go live with
+        // Who hosts and under which rules first, the stage last: the game's thread takes a neighbour for heard by its stage.
+        heardHost[n].store(hello.host ? 1 : 0, std::memory_order_relaxed); heardRules[n].store(hello.rules, std::memory_order_relaxed);
         if (heardStage[n].load(std::memory_order_relaxed) < hello.stage + 1) heardStage[n].store(static_cast<std::uint8_t>(hello.stage + 1), std::memory_order_relaxed);
         return true;
     }
-    if ((header.kind != kOfShots && header.kind != kOfWorld) || !header.chunks || header.chunks > 31 || header.chunk >= header.chunks || !header.total ||
-        header.total > (header.kind == kOfWorld ? sizeof(World) : sizeof(Shots)) || part > kChunkBytes) return false;
-    const std::uint32_t from = header.chunk * kChunkBytes;
-    if (from + part > header.total || (header.chunk + 1u < header.chunks && part != kChunkBytes) || (header.chunk + 1u == header.chunks && from + part != header.total)) return false;
-    auto& assembly = assemblies[n][header.kind == kOfWorld ? 1 : 0];
-    if (header.sequence < assembly.sequence) return true;   // overtaken
-    if (header.sequence > assembly.sequence || header.total != assembly.total || header.chunks != assembly.chunks) {
-        if (assembly.sequence && assembly.have && assembly.have != (1u << assembly.chunks) - 1u) stats.framesBroken++;
-        assembly.sequence = header.sequence; assembly.total = header.total; assembly.chunks = header.chunks; assembly.have = 0;
-    }
-    std::memcpy(assembly.data + from, payload, part); assembly.have |= 1u << header.chunk;
-    if (assembly.have != (1u << header.chunks) - 1u) return true;
-    assembly.have = 0;   // whole: once
-    if (header.kind == kOfWorld) { static World world; return UnpackWorld(assembly.data, assembly.total, world) && DeliverWorld(world); }
+    if (header.kind != kOfShots && header.kind != kOfWorld) return false;
+    const bool ofWorld = header.kind == kOfWorld; auto& assembly = assemblies[n][ofWorld ? 1 : 0]; bool broke = false;
+    const auto piece = Gather(assembly, header, payload, part, static_cast<std::uint32_t>(ofWorld ? sizeof(World) : sizeof(Shots)), broke);
+    if (broke) stats.framesBroken++;
+    if (piece != Piece::Whole) return piece == Piece::Kept;
+    if (ofWorld) { static World world; return UnpackWorld(assembly.data, assembly.total, world) && first(kOfWorld, DeliverWorld(world, anew(kOfWorld))); }
     static Shots shots;
     if (!UnpackShots(assembly.data, assembly.total, shots)) return false;
     if (localNumber >= 0) shots.controller = static_cast<std::uint32_t>(localNumber);
-    return DeliverShots(shots);
+    return first(kOfShots, DeliverShots(shots, anew(kOfShots)));
 }
 
 // Steam's messages of our channel: each is one datagram of a frame. SteamNetworkingMessage_t: data +0, size +4, the sender's identity +12 (its Steam id +20).
@@ -1634,10 +1619,15 @@ void WriteStatus() {
         std::ofstream status(OwnFolder() / (L"native-" + std::to_wstring(GetCurrentProcessId()) + L".status"), std::ios::trunc);
         const auto at = stage.load(); std::uint32_t answered = 0; const std::uint32_t neighbours = steamPeerCount ? steamPeerCount : peerCount;
         for (std::uint32_t n = 0; n < neighbours; ++n) if (heardStage[n].load()) ++answered;
-        status << (at == kLive ? "LIVE" : at == kCompareOff ? "comparison off, waiting for the neighbours to say the same" : gaveUp.load() ? "gave up: not every player answered" : "waiting for the neighbours' hello")
+        const auto disagreed = static_cast<Discord>(discord.load());
+        const char* waiting = disagreed == Discord::Hosts ? "NOT AGREED: the modules do not name exactly one host" : disagreed == Discord::Rules ? "NOT AGREED: the players' rules differ (-Without)" :
+            "waiting for the neighbours' hello";
+        status << (at == kLive ? "LIVE" : at == kCompareOff ? "comparison off, waiting for the neighbours to say the same" : gaveUp.load() ? (disagreed == Discord::None ? "gave up: not every player answered" : "gave up: the modules did not agree") : waiting)
                << " as " << (host ? "host" : "guest") << ", device " << ownController << "; neighbours answered " << answered << " of " << neighbours
                << ", hellos of another version " << otherProtocol.load() << "; neighbour heard: " << (peerHeard.load() ? "yes" : "NO") << "; sent " << stats.bytesSent / 1024 << " KB, received " << stats.bytesReceived / 1024
-               << " KB; bodies applied " << stats.applied << ", worlds applied " << stats.worldApplied << "; faults " << stats.rejected << ", frames lost in pieces " << stats.framesBroken
+               << " KB; bodies applied " << stats.applied << ", worlds applied " << stats.worldApplied << "; faults " << stats.gameFaults;
+        if (stats.faultRules) status << " (rules switched off after them: " << std::hex << stats.faultRules << std::dec << ")";
+        status << ", datagrams refused " << stats.rejected << ", frames lost in pieces " << stats.framesBroken
                << ", frames over 45 ms " << stats.longFrames << " of " << stats.published << "\n";
     } catch (...) {}
 }
@@ -1661,11 +1651,11 @@ DWORD WINAPI Receive(void*) noexcept {
             std::uint32_t magic = 0; if (got > static_cast<int>(sizeof(FrameHeader))) std::memcpy(&magic, packet, 4);
             taken = n < peerCount && magic == kFrameMagic && TakeChunk(n, reinterpret_cast<const std::uint8_t*>(packet), got);
         } else if (got == sizeof(Body)) {   // whole slots, carried by a process outside
-            Body body; std::memcpy(&body, packet, sizeof(body)); taken = DeliverBody(body);
+            Body body; std::memcpy(&body, packet, sizeof(body)); taken = DeliverBody(body, 0, false);
         } else if (got == sizeof(Shots)) {
-            static Shots shots; std::memcpy(&shots, packet, sizeof(shots)); taken = DeliverShots(shots);
+            static Shots shots; std::memcpy(&shots, packet, sizeof(shots)); taken = DeliverShots(shots, false);
         } else if (got == sizeof(World)) {
-            static World world; std::memcpy(&world, packet, sizeof(world)); taken = DeliverWorld(world);
+            static World world; std::memcpy(&world, packet, sizeof(world)); taken = DeliverWorld(world, false);
         }
         if (taken) peerHeard.store(true, std::memory_order_relaxed); else stats.rejected++;
     }
@@ -1774,8 +1764,13 @@ void Begin(const Setup& setup) {
         if (std::memcmp(reinterpret_cast<void*>(base + kCompare), kCompareEntry.data(), kCompareEntry.size()) != 0 &&
             std::memcmp(reinterpret_cast<void*>(base + kCompare), kCompareEqual.data(), kCompareEqual.size()) != 0) throw static_cast<DWORD>(ERROR_REVISION_MISMATCH);
         ownController = controller; host = setup.host; rules = mask; peerHeard = false;
-        stage = kHere; gaveUp = false; otherProtocol = 0; helloNumber = 0; startedAt = GetTickCount64(); for (auto& heard : heardStage) heard = 0;
-        for (auto& perPeer : assemblies) for (auto& assembly : perPeer) { assembly.sequence = assembly.total = assembly.have = 0; assembly.chunks = 0; } counters[0] = 0; counters[1] = 0; stats = Stats{}; sequence = worldSequence = frame = 0;
+        stage = kHere; gaveUp = false; discord = 0; otherProtocol = 0; helloNumber = 0; startedAt = GetTickCount64();
+        for (std::uint32_t n = 0; n < kMaxPeers; ++n) { heardStage[n] = 0; heardHost[n] = 0; heardRules[n] = 0; peerSession[n] = 0; peerHeardAt[n] = 0; peerAnew[n] = 0; }
+        FILETIME clock{}; GetSystemTimeAsFileTime(&clock);   // this start's number: the clock in tenths of a second, and higher than the last start's
+        session = NextSession(session, (static_cast<std::uint64_t>(clock.dwHighDateTime) << 32 | clock.dwLowDateTime) / 1000000ull);
+        doing = faulted = 0; for (auto& faults : ruleFaults) faults = 0; for (auto& seen : seenSession) seen = 0;
+        for (auto& perPeer : assemblies) for (auto& assembly : perPeer) assembly.Reset();
+        counters[0] = 0; counters[1] = 0; stats = Stats{}; sequence = worldSequence = frame = 0;
         published = Published{}; published.magic = kBodyMagic; publishedWorld = PublishedWorld{}; publishedWorld.magic = kWorldMagic;
         publishedShots = PublishedShots{}; publishedShots.magic = kShotsMagic; shotsSequence = 0; knownProjectiles = Known{}; knownDrops = Known{}; knownEnemyBombs = Known{};
         dropAgeCount = doorMemoryCount = countersHeldUntil = 0; lastCounters[0] = lastCounters[1] = lastCounters[2] = -1;
@@ -1904,10 +1899,7 @@ DWORD End(bool restoreCompare) {
 
 // ---- The installed module: it follows the game's log and starts and stops itself per match -------------------------
 std::atomic<bool> supervising{false}; HANDLE supervisor = nullptr;
-struct MatchLog {
-    bool on = false, expectOwn = false; int own = -1; std::uint32_t number = 0, roster = 0; std::uint64_t changedAt = 0;   // roster: counts the players who have left
-    std::uint64_t remoteIds[8]{}; int remoteDevices[8]{}; int remotes = 0;
-} match;
+MatchLog match;   // the match as the game's log tells it: native_state.hpp
 std::uint64_t logOffset = 0; std::string logCarry;
 
 bool Isolated() { return std::memcmp(reinterpret_cast<const char*>(base + kSaveLeaf), kIsolated, sizeof(kIsolated) - 1) == 0; }
@@ -1918,33 +1910,6 @@ std::filesystem::path LogPath() {
     if (FAILED(SHGetFolderPathW(nullptr, CSIDL_PERSONAL, nullptr, SHGFP_TYPE_CURRENT, documents))) throw static_cast<DWORD>(ERROR_PATH_NOT_FOUND);
     const char* leaf = reinterpret_cast<const char*>(base + kSaveLeaf);
     return std::filesystem::path(documents) / L"My Games" / std::filesystem::path(std::string(leaf, strnlen(leaf, 96))) / L"log.txt";
-}
-
-void TakeLogLine(const std::string& line) {
-    const auto now = GetTickCount64();
-    if (line.find("Start Networked") != std::string::npos) { const auto number = match.number + 1; match = MatchLog{}; match.on = true; match.number = number; match.changedAt = now; return; }
-    if (line.find("Menu Game Init") != std::string::npos || line.find("Leaving current lobby") != std::string::npos) { match.on = false; match.changedAt = now; return; }
-    if (!match.on) return;
-    if (const auto remote = line.find("Adding remote player, UserID = "); remote != std::string::npos) {
-        const auto device = line.find(", device ID = ", remote);
-        if (device != std::string::npos && match.remotes < 8) {
-            match.remoteIds[match.remotes] = std::strtoull(line.c_str() + remote + 31, nullptr, 10);
-            match.remoteDevices[match.remotes++] = static_cast<int>(std::strtol(line.c_str() + device + 14, nullptr, 10));
-        }
-        match.expectOwn = false; match.changedAt = now;
-    } else if (line.find("Adding local player") != std::string::npos) { match.expectOwn = true; match.changedAt = now; }
-    else if (const auto set = line.find("Setting controller ID to "); set != std::string::npos && match.expectOwn && line.find("(Prev: 0)") != std::string::npos) {
-        match.own = static_cast<int>(std::strtol(line.c_str() + set + 25, nullptr, 10)); match.expectOwn = false; match.changedAt = now;
-    } else if (const auto gone = line.find("Input device (ID = "); gone != std::string::npos && line.find(") disconnected", gone) != std::string::npos) {
-        // A player has left; the match goes on for the others. Whoever now has the lowest device number is the host.
-        const int device = static_cast<int>(std::strtol(line.c_str() + gone + 19, nullptr, 10));
-        for (int n = 0; n < match.remotes; ++n) {
-            if (match.remoteDevices[n] != device) continue;
-            for (int k = n + 1; k < match.remotes; ++k) { match.remoteIds[k - 1] = match.remoteIds[k]; match.remoteDevices[k - 1] = match.remoteDevices[k]; }
-            --match.remotes; ++match.roster; match.changedAt = now;
-            break;
-        }
-    }
 }
 
 // What the game has written to its log since the last look. The game keeps the file open: read it shared.
@@ -1958,7 +1923,7 @@ void FollowLog(const std::filesystem::path& path) {
     if (SetFilePointerEx(file, from, nullptr, FILE_BEGIN))
         while (ReadFile(file, buffer, sizeof(buffer), &got, nullptr) && got) {
             logOffset += got; logCarry.append(buffer, got);
-            for (std::size_t end; (end = logCarry.find('\n')) != std::string::npos; logCarry.erase(0, end + 1)) TakeLogLine(logCarry.substr(0, end));
+            for (std::size_t end; (end = logCarry.find('\n')) != std::string::npos; logCarry.erase(0, end + 1)) TakeLogLine(match, logCarry.substr(0, end), GetTickCount64());
             if (logCarry.size() > 8192) logCarry.clear();   // no line of the game's is that long
         }
     CloseHandle(file);
@@ -1966,7 +1931,7 @@ void FollowLog(const std::filesystem::path& path) {
 
 // The state, where the player sees it without looking for a file: the end of the game window's title. It is there from the
 // main menu on ("loaded"), so that a player knows the module is in before a match begins.
-constexpr wchar_t kVersionText[] = L"0.1.2";
+constexpr wchar_t kVersionText[] = L"0.1.3";
 void ShowState(const wchar_t* text) {
     static HWND window = nullptr;
     if (!window || !IsWindow(window)) {
@@ -2012,7 +1977,9 @@ DWORD WINAPI Supervise(void*) noexcept {
                 // Somebody left and others remain: start anew with who is left (the comparison stays off - they have diverged).
                 // Anything else ends this match for the module, and the comparison goes back.
                 const bool goesOn = match.on && startedNumber == match.number && !gaveUp.load() && match.remotes > 0;
-                if (gaveUp.load()) why = L"off in this match - not every player has the module";
+                if (gaveUp.load())
+                    why = discord.load() == static_cast<std::uint8_t>(Discord::Rules) ? L"off in this match - the players' rules differ (-Without)" :
+                          discord.load() == static_cast<std::uint8_t>(Discord::Hosts) ? L"off in this match - the modules did not agree on the host" : L"off in this match - not every player has the module";
                 else if (match.on && startedNumber == match.number) why = L"off - the other players have left";
                 End(!goesOn);
                 if (!goesOn) doneNumber = startedNumber;
