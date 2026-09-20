@@ -19,7 +19,15 @@
     "matchStart": "sets the save read-only, starts the game (0x2f8140), restores the flag, places the players, then loads shared state from a buffer (0x2f6500, pointer and size), checks player count against remote players, binds players to controllers and colours",
     "saveChecksumInFrameCheckRva": "0x50d4a0",
     "participantSaves": "container at Manager+0x4b414 keyed by Manager+0x4c5a8; the desync report (RVA 0x503040, 0x5032d0) prints four shared save user ids and dumps desync_shared_save.dat",
-    "fromRepentogonSignatures": {"Game::RestoreState": "0x2bb790", "GameState::write": "0x5c9340", "Game::SaveState": ["0x2f9000", "0x512b60"], "Game::NetStart": null}
+    "fromRepentogonSignatures": {
+      "Game::RestoreState": "0x2bb790",
+      "GameState::write": "0x5c9340",
+      "Game::SaveState": [
+        "0x2f9000",
+        "0x512b60"
+      ],
+      "Game::NetStart": null
+    }
   },
   "validation": {
     "threeInstancesCompared": true,
@@ -30,5 +38,25 @@
     "hostSaveOnlyRead": true,
     "report": "docs/j460-shared-save.md",
     "summary": "npc-20260920-001232-732906"
+  },
+  "runState": {
+    "file": "gamestate<slot>.dat in the profile folder, rep+gamestate<slot>.dat in Steam Cloud, header ISAACNG_GSR0169, about 57 KB; the file behind the menu's Continue",
+    "writtenAt": "run start, a new floor, Exit game",
+    "loadsOnlyBeside": "the persistent game data it was saved with",
+    "object": "embedded in Manager at +0xfa4; file name at Manager+0x20d60",
+    "saveNowRva": "0x558ed0",
+    "saveNow": "no arguments, works through the global Manager; checks itself that a run is on (Manager+8 == 2), that it is no daily (Game+0x26630 == 0), that there are no network devices and that the player is alive; never called by this project",
+    "gameSaveStateRva": "0x2f9000",
+    "gameSaveStateNote": "called by saveNow with Manager+0xfa4; settles REPENTOGON's ambiguous signature (0x2f9000, not 0x512b60)",
+    "secondSavePathRva": "0x559180",
+    "playerCounters": "Entity_Player: maxHearts 0x1340, redHearts 0x1344, eternalHearts 0x1348, soulHearts 0x134c, blackHearts 0x1350, keys 0x135c, bombs 0x1364, coins 0x1368 - the same offsets as REPENTOGON's J273 layout; the +0xc shift of J460 starts later",
+    "validation": {
+      "joinedFromFiles": "a fourth instance started from copies of the save and the run state entered the run through Continue: seed, floor, difficulty, curse, all 15 rooms, visit counts, hearts, keys, coins and the spent bomb (0 against 1 in a fresh run) agree, game time carried over",
+      "playerPlaceNotInFile": "Continue puts the player at a door, a different one in each of two games",
+      "joinAllowedInContinuedRun": true,
+      "fullPipelineWithJoinedClient": "stepped prediction between two isolated instances, 449 of 449 commands, error 0 on 406 reconciliations, players 0.0 and 0.0 apart at the end",
+      "report": "docs/j460-run-join.md",
+      "summary": "predict-20260920-002456-550696"
+    }
   }
 }

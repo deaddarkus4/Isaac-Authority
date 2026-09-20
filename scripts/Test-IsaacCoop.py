@@ -328,8 +328,11 @@ def run(args):
                     raise RuntimeError(f"The replica did not predict its own player: {len(matched)} matched of {len(own)}")
                 if sum(a > 0 for a in acks) < enough or any(b < a for a, b in zip(acks, acks[1:])) or not capture[0]["predicts"]:
                     raise RuntimeError("The host did not acknowledge consumed commands in order, or the client module does not predict")
-                if footer["predictSnaps"] or matched[-1] > 48:
-                    raise RuntimeError(f"Prediction left the host by {matched[-1]} or was teleported {footer['predictSnaps']} times")
+                # A client that entered the run stands wherever its own game put it, a door after Continue for one: the first
+                # snapshot may teleport its player to the host's place. Any later teleport means prediction broke down.
+                late_snaps = sum(o["mend"] == 3 for o in own[1:])
+                if late_snaps or matched[-1] > 48:
+                    raise RuntimeError(f"Prediction left the host by {matched[-1]} or was teleported {late_snaps} times after the first alignment")
                 local = {}
                 for name, begin, end, player, axis, sign in expected:
                     if player == 1:
@@ -344,6 +347,8 @@ def run(args):
                                predictionErrorMean=round(sum(matched) / len(matched), 3), predictionErrorMedian=round(matched[len(matched) // 2], 3),
                                predictionErrorP95=round(matched[int(len(matched) * 0.95)], 3), predictionErrorMax=round(matched[-1], 3),
                                mendsSettled=footer["predictSettles"], mendsShifted=footer["predictShifts"], mendsSnapped=footer["predictSnaps"],
+                               firstAlignment=dict(mend=("none", "settle", "shift", "snap")[own[0]["mend"]], distance=round(own[0]["error"], 1)),
+                               snapsAfterFirstAlignment=late_snaps,
                                acknowledgedFrames=sum(a > 0 for a in acks), ownUpdatesRemembered=footer["predictRemembered"])
             if args.stepped:
                 if not drive["stepped"] or not capture[0]["stepped"] or not drive["playoutStarts"]:
