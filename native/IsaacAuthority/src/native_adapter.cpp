@@ -130,6 +130,9 @@
 //   copy's touch does nothing anywhere (a copy led along its owner's path stands just outside the machine), a guest's own
 //   touch of a waiting machine is not played here but sent, and the host plays it with the machine's own collision (slot
 //   23, RVA 0x2627e0) for its copy of that player - who pays from the team's counters, which are the host's anyway.
+//   Machines paid with health (variants 2 blood donation, 5 devil beggar, 15 hell game, 17 confessional: the collision
+//   deals the player a blow and plays whatever comes of it) are the exception: a blow to a copy counts nowhere, so the
+//   owner's game plays the touch as well - there the player pays with its own health - and only the outcome is the host's.
 // Every rule of this module can be left out when it starts (the third word of the configuration, a mask in hex), so that
 // a rule that misbehaves in a live run is switched off without a rebuild.
 //
@@ -939,7 +942,8 @@ bool __fastcall OnSlotCollision(void* self, void*, void* collider, std::uint32_t
         return originalSlotCollision(self, collider, low);
     if (At<int>(other + kController) != ownController) { stats.slotTouchesIgnored++; return false; }   // a copy: its owner's game says when it touches
     if (host || !HostRules()) return originalSlotCollision(self, collider, low);                         // the host's own player, or a guest on its own
-    // A guest's own player: the machine is the host's. A touch that would start a waiting machine is sent; the rest is nothing.
+    // A guest's own player: the machine is the host's. A touch that would start a waiting machine is sent; the rest is nothing -
+    // except where the price is health, which only the owner's game can take.
     const auto machine = reinterpret_cast<std::uintptr_t>(self); const auto seed = At<std::uint32_t>(machine + kSeed);
     if (At<std::int32_t>(machine + kSlotState) == 1 && At<std::int16_t>(machine + kSlotTimeout) <= 0 && (seed != touchedSlot || frame - touchedAt >= kSlotTouchEveryFrames)) {
         const auto game = At<std::uintptr_t>(base + kGame); const auto* position = reinterpret_cast<float*>(machine + kPosition);
@@ -947,6 +951,8 @@ bool __fastcall OnSlotCollision(void* self, void*, void* collider, std::uint32_t
                                                  (low & 0xff) | kSlotTouch, {position[0], position[1]}};
         ++takenTotal; touchedSlot = seed; touchedAt = frame; stats.slotTouchesSent++;
     }
+    const auto variant = At<std::uint32_t>(machine + kVariant);
+    if (variant == 2 || variant == 5 || variant == 15 || variant == 17) return originalSlotCollision(self, collider, low);
     return false;
 }
 
