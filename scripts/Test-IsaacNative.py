@@ -6,8 +6,8 @@ Quick Match -> create; guest: Online -> Quick Match; ready in both), then:
     python Test-IsaacNative.py [--no-relay] [--delay-ms N] [--jitter-ms N] [--loss P] [--seconds S]
 
 The module is attached to every game of the pair (each game's log tells which lobby device is its local player). A relay
-reads every game's published player body and sends each new one as a PLR1 datagram to the other games' modules, optionally
-through the impaired path of isaac_link.py. Then a key is held in one game at a time - the windows take the focus - while
+reads every game's published player body and the host's published enemies and sends each new one as a PLR1 or WLN1
+datagram to the other games' modules, optionally through the impaired path of isaac_link.py. Then a key is held in one game at a time - the windows take the focus - while
 both games are sampled: how soon the own player moves, and how far the other side's copy of it is from the owner's."""
 import argparse
 import importlib.util
@@ -29,7 +29,7 @@ import isaac_link as link  # noqa: E402
 
 spec = importlib.util.spec_from_file_location("coop", Path(__file__).with_name("Test-IsaacCoop.py")); coop = importlib.util.module_from_spec(spec); spec.loader.exec_module(coop)
 reader, pair = coop.reader, coop.pair
-PUBLISHED = struct.Struct("<II3I4f"); STATS = struct.Struct("<5I2f")
+PUBLISHED = struct.Struct("<II4I4f"); STATS = struct.Struct("<17I4f"); WORLD_BYTES = 20 + 48 * 32 + 16 * 4
 folder = Path(os.environ["LOCALAPPDATA"]) / "IsaacAuthority"
 release = root / "Binaries/authority-build/Release"
 
@@ -44,7 +44,9 @@ def attach(instances):
         found = re.findall(r"Setting controller ID to (\d+), \(Prev: 0\)", log[local:local + 600]) if start >= 0 and local >= 0 else []
         if not found:
             raise SystemExit(f"{instance['title']}: no running match of the game's own online in its log")
-        (folder / f"native-{pid}.cfg").write_text(found[0], encoding="ascii")
+        # The game that made the lobby is the host: the authority over the enemies.
+        hosting = "Successfully created lobby" in log
+        (folder / f"native-{pid}.cfg").write_text(found[0] + (" host" if hosting else ""), encoding="ascii")
         done = subprocess.run([str(release / "IsaacAuthorityAttach.exe"), "native", str(pid), str(release / "IsaacAuthorityNative.dll")], capture_output=True, text=True)
         result = json.loads(done.stdout)["result"] if done.stdout.strip().startswith("{") else done.stderr.strip()
         if result not in (0, 1247):   # 1247: already attached
@@ -64,7 +66,7 @@ games = []
 for instance in instances:
     descriptor = json.loads((folder / f"native-{instance['pid']}.json").read_text())
     games.append(dict(pid=instance["pid"], title=instance["title"], descriptor=descriptor, process=reader.WindowsProcess(instance["pid"]),
-                      relay=reader.WindowsProcess(instance["pid"]), last=0))
+                      relay=reader.WindowsProcess(instance["pid"]), last=0, lastWorld=0))
 lock = threading.Lock(); stop = threading.Event(); sent = [0]
 
 
@@ -72,6 +74,14 @@ def published(game):
     blob = game["relay"].read(game["descriptor"]["published"], PUBLISHED.size)
     magic, generation, body_magic, controller, sequence, *_ = PUBLISHED.unpack(blob)
     return None if generation & 1 or magic != 0x31524C50 or not sequence else (sequence, blob[8:])
+
+
+def published_world(game):
+    """The host's enemies: read twice around the body, like any seqlock reader."""
+    address = game["descriptor"]["publishedWorld"]
+    first = struct.unpack("<II", game["relay"].read(address, 8)); blob = game["relay"].read(address + 8, WORLD_BYTES)
+    last = struct.unpack("<II", game["relay"].read(address, 8)); sequence = struct.unpack_from("<I", blob, 4)[0]
+    return None if first != last or first[1] & 1 or not sequence else (sequence, blob)
 
 
 def relay():
@@ -94,6 +104,16 @@ def relay():
                 for other in games:
                     if other is not game:
                         paths[(game["pid"], other["pid"])].send(found[1], now)
+            if game["descriptor"]["role"] == "native-host":
+                try:
+                    world = published_world(game)
+                except OSError:
+                    world = None
+                if world and world[0] != game["lastWorld"]:
+                    game["lastWorld"] = world[0]
+                    for other in games:
+                        if other is not game:
+                            paths[(game["pid"], other["pid"])].send(world[1], now)
         for path in paths.values():
             path.flush(now)
         time.sleep(0.002)
@@ -109,7 +129,8 @@ def positions():
 
 
 def stats(game):
-    names = ("published", "received", "applied", "stale", "rejected", "correctionSum", "correctionMax")
+    names = ("published", "received", "applied", "stale", "rejected", "otherRoom", "worldPublished", "worldReceived", "worldApplied", "npcMatched", "npcOnlyHost",
+             "npcOnlyLocal", "npcKilled", "hitPointFixes", "deathsHeld", "npcPaired", "npcRemoved", "correctionSum", "correctionMax", "npcCorrectionSum", "npcCorrectionMax")
     return dict(zip(names, STATS.unpack(game["process"].read(game["descriptor"]["stats"], STATS.size))))
 
 
@@ -149,8 +170,8 @@ def monitor():
         now = [STATS.unpack(process.read(g["descriptor"]["stats"], STATS.size)) for g, process in watch]
         if previous:
             for (g, _), a, b in zip(watch, now, previous):
-                if a[5] - b[5] > 12:
-                    big.append(dict(game=g["title"], during=label[0], corrections=a[2] - b[2], distance=round(a[5] - b[5], 1)))
+                if a[17] - b[17] > 12:
+                    big.append(dict(game=g["title"], during=label[0], corrections=a[2] - b[2], distance=round(a[17] - b[17], 1)))
         previous = now; time.sleep(0.02)
     for _, process in watch:
         process.close()
@@ -168,7 +189,7 @@ if worker:
     worker.join(2)
 after = [stats(g) for g in games]
 report = dict(relay=not args.no_relay, network=dict(delayMs=args.delay_ms, jitterMs=args.jitter_ms, lossPercent=args.loss), datagrams=sent[0], walks=results,
-              modules=[{k: (round(a[k] - b[k], 2) if k != "correctionMax" else round(a[k], 2)) for k in a} for a, b in zip(after, before)])
+              modules=[{k: (round(a[k] - b[k], 2) if not k.endswith("Max") else round(a[k], 2)) for k in a} for a, b in zip(after, before)])
 for w in results:
     print(w)
 print('corrections above 12 px:', big)
