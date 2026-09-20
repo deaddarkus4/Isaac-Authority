@@ -66,12 +66,53 @@
     "chunks": "1 achievements 642 x u8, 2 counters 523 x u32, 3 level counters 14 x u32, 4 collectibles 733 x u8, 5 minibosses 7 x u8, 6 bosses 104 x u8, 7 challenges 46 x u8, 8 cutscene counters 27 x u32, 9 game settings 2 x u32, 10 special seed counters 80 x u8; chunks 1-10 end at byte 4016; the size word is four times the count except for chunk 1",
     "checksumRva": "0x283580 (range) and 0x283410 (algorithm)",
     "checksum": "over bytes [16, length-4): CRC-32 polynomial 0xEDB88320 with the game's own table, built with one logical and seven arithmetic right shifts, seed 0xFEDCBA76 inverted before and after; stored in the last four bytes",
-    "verifiedOn": "four real J460 saves, byte-exact parse and rebuild"
+    "verifiedOn": "a hundred real J460 saves (92 session dumps, 7 isolated instances, the Steam Cloud file), byte-exact parse and rebuild",
+    "bestiary": "chunk 11: header (type, 4 * total entries, map count 4), then maps (number, 4 * entries, entries of key i32 and value u32) stored in the order 4, 2, 3, 1 with entries in ascending key order; a 4-byte word follows before the checksum"
   },
   "lobbySave": {
     "tool": "scripts/isaac_save.py merge --output <file> <host save> <guest save>...",
-    "rule": "every flag and counter becomes the smallest value any participant has; game settings, bestiary and the unchecked word come from the host",
-    "validation": "a file written by the tool from the progressed and the clean save was accepted by the game (no checksum warning, locked characters, win streak 0) and gave the clean save's level: 0 of 15 rooms differ from the clean-save game, no curse; 5 rooms and the curse differ from the host",
+    "source": "read from the game's own builder, not approximated",
+    "gameFlow": {
+      "memberSerializerRva": "0x51b130",
+      "hostStart": "Menu_OnlineLobby::send_game_start 0x4ee080 -> 0x50c560 (members' saves from the map at netmanager+0x1068) -> builder 0x51a450",
+      "clientLoad": "Notify Game Start handler 0x50ca40 -> deserializer 0x51adf0 over Manager+0x14; what the shared save lacks stays the player's own",
+      "checkpointRva": "0x519440",
+      "writeBackRva": "0x519980",
+      "dumpRva": "0x503040"
+    },
+    "rule": {
+      "flags": "achievements, collectibles, minibosses, bosses, challenges: bitwise AND over the members",
+      "counters": "523 counters and 14 level counters: unsigned minimum",
+      "cutsceneCounters": "27: signed minimum",
+      "bestiary": "maps 1 and 2: per key the minimum, a key missing in any member is erased",
+      "notShared": "game settings, special seed counters, bestiary maps 3 and 4; here they come from the first save, the host's"
+    },
+    "wireForm": {
+      "order": "achievements, counters, collectibles, level counters, minibosses, bosses, cutscene counters, challenges, bestiary map 1, map 2, four member ids",
+      "flags": "one bit each, least significant first, in (count >> 3) + 1 bytes (packer 0x51b580, reader 0x51b650): 104 bosses take 14 bytes",
+      "fixedBytes": 2450,
+      "maps": "u32 count, then entries of key i32 and value u32"
+    },
+    "writeBack": {
+      "flags": "own |= shared at the end",
+      "counters": "own += max(0, shared at the end - shared at the start), bestiary maps 1 and 2 alike",
+      "edenTokens": "counter 21: max(0, own + end - start)",
+      "keptOwn": "36 counters (114, 115, 159-172, 212, 385-403) and 12 achievements (242-251, 275, 341) are copied from the player's own save into both checkpoint copies (0x51b720)"
+    },
+    "sessionDumps": {
+      "sharedsave_begin": "the shared save at the match start",
+      "sharedsave_end": "its state at the last checkpoint",
+      "persistentgamedata_begin": "not the save before the session: a copy of the live data at write-back time, the shared context at the end",
+      "persistentgamedata_end": "the player's real save after the write-back",
+      "caveat": "the game writes the shared save dumps from buffers it has already released: 20 of 92 hold other memory, and the first four bytes of a surviving one may be a heap link"
+    },
+    "validation": {
+      "saveFilesRebuiltByteExact": "100 of 100",
+      "sharedDumpsDecodedToExactEnd": "72 of 72 surviving",
+      "startSharedSaveWithinRealSave": "32 of 38; 3 differ only in the first four dump bytes (heap pointers), 2 are sessions with two match starts, 1 is an eden token spent by playing Eden",
+      "notPossible": "byte equality with the game's shared save: the other members' saves are not available",
+      "live": "first version of the tool, progressed + clean save: accepted by the game (no checksum warning, locked characters, win streak 0) and gave the clean save's level: 0 of 15 rooms differ from the clean-save game, no curse; 5 rooms and the curse differ from the host"
+    },
     "report": "docs/j460-lobby-save.md"
   }
 }

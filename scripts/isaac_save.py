@@ -1,24 +1,33 @@
 """Repentance+ persistent game data (persistentgamedata<slot>.dat): read it, and merge several into the save a lobby shares.
 
-The game's own online does not hand out one player's save. What nobody may meet unless everybody has unlocked it - items,
-bosses, the shop's level and the coins donated to it - is settled when the lobby starts, so every participant, the host
-included, plays from the same restricted save. merge() builds that save: every flag and every counter becomes the smallest
-value any participant has. The source files are only read.
+The game's own online does not hand out one player's save. When the host starts the match it builds a shared save out of the
+saves every lobby member reported (J460, RVA 0x51a450) and every client loads it over its own for the match: a flag is set
+only if every member has it, a counter is the smallest any member has, a bestiary entry survives only if every member has it.
+merge() is that rule. The source files are only read.
 
-Layout (J460 loader, RVA 0x526f10): a 16-byte header, one word the loader stores unchecked, chunks of (type, size word,
-element count, elements), the bestiary, and a closing checksum over everything from byte 16 up to itself."""
+File layout (loader RVA 0x526f10): a 16-byte header, one word the loader stores unchecked, chunks of (type, size word,
+element count, elements), the bestiary (chunk 11: four maps of key and value), a trailing word, and a closing checksum over
+everything from byte 16 up to itself."""
 import argparse
 import struct
 import sys
 from pathlib import Path
 
 HEADER = b"ISAACNGSAVE09R  "
-# Bytes per element, by chunk type: achievements, counters, level counters, collectibles, minibosses, bosses, challenges,
-# cutscene counters, game settings, special seed counters. The size word of a chunk is not its length in bytes.
+# Bytes per element, by chunk type. The size word of a chunk is not its length in bytes: it is four times the element
+# count for every chunk but the first, and for the bestiary four times the number of entries.
 WIDTH = {1: 1, 2: 4, 3: 4, 4: 1, 5: 1, 6: 1, 7: 1, 8: 4, 9: 4, 10: 1}
 NAMES = {1: "achievements", 2: "counters", 3: "levelCounters", 4: "collectibles", 5: "minibosses", 6: "bosses", 7: "challenges",
          8: "cutsceneCounters", 9: "gameSettings", 10: "specialSeedCounters"}
-SETTINGS, BESTIARY = 9, 11
+CUTSCENES, SETTINGS, SEEDS, BESTIARY = 8, 9, 10, 11
+# What the game's shared save carries, in the order of its wire form (writer RVA 0x51b130, reader RVA 0x51adf0). Flags are
+# packed one bit each, least significant bit first, into (count >> 3) + 1 bytes (packer RVA 0x51b580) - one byte more than
+# needed when the count is a multiple of eight, as with the 104 bosses. Game settings, special seed counters and bestiary
+# maps 3 and 4 are not part of it: in the game's online every player keeps their own.
+SHARED_ORDER = (1, 2, 4, 3, 5, 6, 8, 7)
+SHARED_MAPS = (1, 2)
+SHARED_COUNTS = {1: 642, 2: 523, 3: 14, 4: 733, 5: 7, 6: 104, 7: 46, 8: 27}
+SHARED_FIXED = sum((count >> 3) + 1 if WIDTH[kind] == 1 else count * 4 for kind, count in SHARED_COUNTS.items())  # 2450 bytes
 MASK = 0xFFFFFFFF
 
 
@@ -45,28 +54,38 @@ def checksum(body):
 
 
 def parse(data):
-    """dict(word, chunks={type: (size word, [elements])}, tail): the tail is the bestiary, kept as bytes."""
+    """dict(word, chunks={type: (size word, [elements])}, bestiary={map: [(key, value), ...]}, trailer)."""
     if len(data) < 24 or data[:16] != HEADER:
         raise ValueError("Not a Repentance+ persistent game data file")
     if checksum(data[16:-4]) != struct.unpack_from("<I", data, len(data) - 4)[0]:
         raise ValueError("Checksum mismatch: the file is damaged or of another game version")
-    at, chunks = 20, {}
+    end, at, chunks = len(data) - 4, 20, {}
     while True:
-        if at + 12 > len(data) - 4:
+        if at + 12 > end:
             raise ValueError("The chunks run past the end of the file")
         kind, size, count = struct.unpack_from("<3I", data, at)
         if kind == BESTIARY:
             break
         if kind != len(chunks) + 1 or kind not in WIDTH:
             raise ValueError(f"Unexpected chunk {kind}")
-        width = WIDTH[kind]; end = at + 12 + count * width
-        if end > len(data) - 4:
+        width = WIDTH[kind]; stop = at + 12 + count * width
+        if stop > end:
             raise ValueError(f"Chunk {kind} runs past the end of the file")
         chunks[kind] = (size, list(struct.unpack_from(f"<{count}{'B' if width == 1 else 'I'}", data, at + 12)))
-        at = end
+        at = stop
     if sorted(chunks) != sorted(WIDTH):
         raise ValueError("A chunk is missing")
-    return dict(word=struct.unpack_from("<I", data, 16)[0], chunks=chunks, tail=bytes(data[at:-4]))
+    at += 12; bestiary = {}
+    for _ in range(count):
+        if at + 8 > end:
+            raise ValueError("The bestiary runs past the end of the file")
+        which, words = struct.unpack_from("<2I", data, at); entries = words // 4; at += 8
+        if which in bestiary or not 1 <= which <= 4 or words % 4 or at + entries * 8 > end:
+            raise ValueError("Unexpected bestiary map")
+        bestiary[which] = [struct.unpack_from("<iI", data, at + n * 8) for n in range(entries)]; at += entries * 8
+    if sorted(bestiary) != [1, 2, 3, 4] or size != 4 * sum(len(entries) for entries in bestiary.values()) or end - at != 4:
+        raise ValueError("Unexpected bestiary layout")
+    return dict(word=struct.unpack_from("<I", data, 16)[0], chunks=chunks, bestiary=bestiary, trailer=bytes(data[at:end]))
 
 
 def build(save):
@@ -74,13 +93,23 @@ def build(save):
     for kind in sorted(save["chunks"]):
         size, elements = save["chunks"][kind]
         body += struct.pack("<3I", kind, size, len(elements)) + struct.pack(f"<{len(elements)}{'B' if WIDTH[kind] == 1 else 'I'}", *elements)
-    body += save["tail"]
+    body += struct.pack("<3I", BESTIARY, 4 * sum(len(entries) for entries in save["bestiary"].values()), len(save["bestiary"]))
+    for which, entries in save["bestiary"].items():  # in the order of the file, which is not ascending
+        body += struct.pack("<2I", which, 4 * len(entries)) + b"".join(struct.pack("<iI", key, value) for key, value in entries)
+    body += save["trailer"]
     return HEADER + body + struct.pack("<I", checksum(body))
 
 
+def _signed(value):
+    return value - (1 << 32) if value & 0x80000000 else value
+
+
 def merge(saves):
-    """The save of a lobby: element by element the smallest value any participant has. Game settings, the bestiary and the
-    unchecked word are nobody's progress and come from the first save, the host's."""
+    """The save of a lobby, as the game's builder (RVA 0x51a450) makes it from the members' saves: flags by AND, counters by
+    the smallest value (cutscene counters compared as signed numbers, as the game does), bestiary maps 1 and 2 by the
+    smallest value of the entries every member has. What the game does not share - settings, special seed counters, bestiary
+    maps 3 and 4, the unchecked word and the trailer - comes from the first save, the host's: here every participant starts
+    from this one file."""
     if not saves:
         raise ValueError("Nothing to merge")
     first = saves[0]; chunks = {}
@@ -88,25 +117,102 @@ def merge(saves):
         others = [save["chunks"][kind] for save in saves[1:]]
         if any(other[0] != size or len(other[1]) != len(elements) for other in others):
             raise ValueError(f"Chunk {kind} has a different layout in one of the saves")
-        chunks[kind] = (size, list(elements) if kind == SETTINGS else [min(values) for values in zip(elements, *(other[1] for other in others))])
-    return dict(word=first["word"], chunks=chunks, tail=first["tail"])
+        rows = list(zip(elements, *(other[1] for other in others)))
+        if kind in (SETTINGS, SEEDS):
+            chunks[kind] = (size, list(elements))
+        elif WIDTH[kind] == 1:
+            chunks[kind] = (size, [1 if all(row) else 0 for row in rows])
+        else:
+            chunks[kind] = (size, [min(row, key=_signed) if kind == CUTSCENES else min(row) for row in rows])
+    bestiary = {}
+    for which, entries in first["bestiary"].items():
+        if which not in SHARED_MAPS:
+            bestiary[which] = list(entries); continue
+        tables = [dict(save["bestiary"][which]) for save in saves]
+        bestiary[which] = [(key, min(table[key] for table in tables)) for key in sorted(tables[0]) if all(key in table for table in tables)]
+    return dict(word=first["word"], chunks=chunks, bestiary=bestiary, trailer=first["trailer"])
+
+
+def decode_shared(raw):
+    """A shared save as the game sends and dumps it (online_logs/sessions/<session>/sharedsave_begin.dat): the shared chunks,
+    bestiary maps 1 and 2, and the Steam ids of up to four members whose saves went into it. The game writes those dumps
+    from buffers it has already released: some hold other memory and do not decode, and the first four bytes (achievements
+    0 to 31) of one that does decode may be the allocator's link rather than flags."""
+    if len(raw) < SHARED_FIXED + 8 + 32:
+        raise ValueError("Too short for a shared save")
+    at, chunks = 0, {}
+    for kind in SHARED_ORDER:
+        count = SHARED_COUNTS[kind]
+        if WIDTH[kind] == 1:
+            chunks[kind] = [(raw[at + (n >> 3)] >> (n & 7)) & 1 for n in range(count)]; at += (count >> 3) + 1
+        else:
+            chunks[kind] = list(struct.unpack_from(f"<{count}I", raw, at)); at += count * 4
+    bestiary = {}
+    for which in SHARED_MAPS:
+        if at + 4 > len(raw):
+            raise ValueError("The shared save ends before its bestiary")
+        entries = struct.unpack_from("<I", raw, at)[0]; at += 4
+        if at + entries * 8 > len(raw):
+            raise ValueError("A bestiary map of the shared save runs past its end")
+        bestiary[which] = [struct.unpack_from("<iI", raw, at + n * 8) for n in range(entries)]; at += entries * 8
+    if at + 32 != len(raw):
+        raise ValueError(f"A shared save of {len(raw)} bytes does not end where its parts do ({at + 32})")
+    return dict(chunks=chunks, bestiary=bestiary, members=list(struct.unpack_from("<4Q", raw, at)))
+
+
+def encode_shared(shared):
+    """The wire form of what decode_shared() returns."""
+    raw = b""
+    for kind in SHARED_ORDER:
+        elements = shared["chunks"][kind]
+        if len(elements) != SHARED_COUNTS[kind]:
+            raise ValueError(f"Chunk {kind} has {len(elements)} elements, the shared save carries {SHARED_COUNTS[kind]}")
+        if WIDTH[kind] == 1:
+            block = bytearray((len(elements) >> 3) + 1)
+            for n, value in enumerate(elements):
+                if value:
+                    block[n >> 3] |= 1 << (n & 7)
+            raw += bytes(block)
+        else:
+            raw += struct.pack(f"<{len(elements)}I", *elements)
+    for which in SHARED_MAPS:
+        entries = shared["bestiary"][which]
+        raw += struct.pack("<I", len(entries)) + b"".join(struct.pack("<iI", key, value) for key, value in entries)
+    return raw + struct.pack("<4Q", *(list(shared.get("members", [])) + [0] * 4)[:4])
+
+
+def shared_view(save):
+    """What a save contributes to a shared save, in the form decode_shared() returns (flags as 0 and 1)."""
+    return dict(chunks={kind: [1 if value else 0 for value in save["chunks"][kind][1]] if WIDTH[kind] == 1 else list(save["chunks"][kind][1])
+                        for kind in SHARED_ORDER},
+                bestiary={which: list(save["bestiary"][which]) for which in SHARED_MAPS})
 
 
 def summary(save):
-    return {NAMES[kind]: dict(elements=len(elements), set=sum(1 for value in elements if value), total=sum(elements))
-            for kind, (_, elements) in save["chunks"].items()}
+    """Numbers of a parsed save, or of a decoded shared save."""
+    rows = {}
+    for kind, chunk in save["chunks"].items():
+        elements = chunk[1] if isinstance(chunk, tuple) else chunk
+        rows[NAMES[kind]] = dict(elements=len(elements), set=sum(1 for value in elements if value), total=sum(elements))
+    for which, entries in save["bestiary"].items():
+        rows[f"bestiaryMap{which}"] = dict(elements=len(entries), set=sum(1 for _, value in entries if value), total=sum(value for _, value in entries))
+    return rows
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     info = commands.add_parser("info", help="what a save has unlocked, in numbers"); info.add_argument("file", type=Path)
-    merged = commands.add_parser("merge", help="the save a lobby shares: the smallest of every flag and counter")
+    dump = commands.add_parser("shared", help="the same for a shared save dumped by the game (sharedsave_begin.dat)"); dump.add_argument("file", type=Path)
+    merged = commands.add_parser("merge", help="the save a lobby shares, by the game's own rule")
     merged.add_argument("--output", type=Path, required=True); merged.add_argument("files", type=Path, nargs="+", help="the host's save first")
     args = parser.parse_args()
-    if args.command == "info":
-        for name, row in summary(parse(args.file.read_bytes())).items():
+    if args.command in ("info", "shared"):
+        shown = parse(args.file.read_bytes()) if args.command == "info" else decode_shared(args.file.read_bytes())
+        for name, row in summary(shown).items():
             print(f"{name:20} {row['set']:4} of {row['elements']:4} set, total {row['total']}")
+        if args.command == "shared":  # Steam ids are nobody's business: only how many
+            print(f"members              {sum(1 for member in shown['members'] if member)}")
         return
     if args.output.exists():
         raise SystemExit("The output file exists; a save is never overwritten")
