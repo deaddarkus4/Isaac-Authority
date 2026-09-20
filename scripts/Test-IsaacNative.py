@@ -4,6 +4,7 @@ Start the games with Start-IsaacNativePair.ps1, bring them through the game's ow
 Quick Match -> create; guest: Online -> Quick Match; ready in both), then:
 
     python Test-IsaacNative.py [--no-relay] [--delay-ms N] [--jitter-ms N] [--loss P] [--seconds S]
+    python Test-IsaacNative.py --play [MINUTES] [--delay-ms N ...]    a person plays; no key is pressed by the test
 
 The module is attached to every game of the pair (each game's log tells which lobby device is its local player). A relay
 reads every game's published player body and the host's published enemies and sends each new one as a PLR1 or WLN1
@@ -57,6 +58,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--no-relay", action="store_true"); parser.add_argument("--delay-ms", type=int, default=0)
 parser.add_argument("--jitter-ms", type=int, default=0); parser.add_argument("--loss", type=float, default=0.0)
 parser.add_argument("--seconds", type=float, default=1.2)
+parser.add_argument("--play", type=float, nargs="?", const=120.0, default=None, metavar="MINUTES",
+                    help="only attach and relay while a person plays; a line of state every ten seconds, until the games close")
 args = parser.parse_args()
 
 instances = json.loads((root / "Binaries/game-instances/native-pair.json").read_text(encoding="utf-8-sig"))
@@ -182,12 +185,32 @@ if not args.no_relay:
     worker = threading.Thread(target=relay, daemon=True); worker.start(); threading.Thread(target=monitor, daemon=True).start(); time.sleep(0.5)
 before = [stats(g) for g in games]
 results = []
-for game, key in ((games[0], "D"), (games[1], "W"), (games[0], "A"), (games[1], "S")):
+if args.play is not None:
+    # No window is touched here: the relay and the modules run, the person plays in whichever window has the focus.
+    deadline = time.monotonic() + args.play * 60; previous = before
+    print(f"playing: relay on for {args.play:g} min or until a game closes (Ctrl+C ends it too)", flush=True)
+    try:
+        while time.monotonic() < deadline:
+            time.sleep(10)
+            now = [stats(g) for g in games]; line = []
+            for g, a, b in zip(games, now, previous):
+                line.append(f"{g['title'][-1]}: bodies {a['applied'] - b['applied']} (max fix {a['correctionMax']:.1f}), enemies matched {a['npcMatched'] - b['npcMatched']}, "
+                            f"paired {a['npcPaired']}, only host {a['npcOnlyHost'] - b['npcOnlyHost']}, removed {a['npcRemoved']}, killed {a['npcKilled']}, held {a['deathsHeld']}, other room {a['otherRoom'] - b['otherRoom']}")
+            print(time.strftime('%H:%M:%S'), ' | '.join(line), flush=True); previous = now
+    except (OSError, KeyboardInterrupt) as error:
+        print('stopped:', type(error).__name__, error, flush=True)
+    games_for_walks = ()
+else:
+    games_for_walks = ((games[0], "D"), (games[1], "W"), (games[0], "A"), (games[1], "S"))
+for game, key in games_for_walks:
     label[0] = f"{game['title'][-1]} holds {key}"; results.append(walk(game, key, args.seconds)); label[0] = "idle"
 stop.set()
 if worker:
     worker.join(2)
-after = [stats(g) for g in games]
+try:
+    after = [stats(g) for g in games]
+except OSError:
+    after = before   # a game was closed
 report = dict(relay=not args.no_relay, network=dict(delayMs=args.delay_ms, jitterMs=args.jitter_ms, lossPercent=args.loss), datagrams=sent[0], walks=results,
               modules=[{k: (round(a[k] - b[k], 2) if not k.endswith("Max") else round(a[k], 2)) for k in a} for a, b in zip(after, before)])
 for w in results:
