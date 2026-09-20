@@ -23,6 +23,13 @@
 // not kill an enemy the host still has - the guest would lose sight of it for good - so on a guest a blow that would kill
 // (Entity_NPC's TakeDamage, slot 8, RVA 0x2d60a0) is cut down to one the enemy just survives; its death comes from the host.
 //
+// Step 4, first event: damage to a player. A character's health is its owner's (the user's model), so the owner's hearts
+// travel with its body and replace the copy's; a blow to a remote player's copy is ignored here (Entity_Player's
+// TakeDamage, slot 8, RVA 0x3729d0) - the neighbour's enemies and shots stand a little differently and would hit a copy
+// the owner never saw hit. When the owner has become a co-op ghost (the byte IsCoopGhost reads, +0x20a9) and the copy has
+// not, the copy takes a blow nothing survives through the game's own TakeDamage, so the game's own death runs. A ghost
+// that comes back to life at its owner is not followed yet, only counted.
+//
 // Whatever carries the published slots to the other games - for now a relay outside, later the game's own connection -
 // delivers them as PLR1 and WLN1 datagrams to this module's loopback socket.
 //
@@ -56,14 +63,18 @@ constexpr std::uintptr_t kPlayerTable = 0x76bdd0, kPlayerUpdate = 0x382af0, kNpc
 constexpr std::uintptr_t kExists = 0x172, kDead = 0x173, kPosition = 0x33c, kVelocity = 0x360, kHitPoints = 0x380, kMaxHitPoints = 0x384, kSeed = 0x3ec;
 // Game at RVA 0x871678: current room +0x18300, its grid index +0x18304; the room's entity list: data +0x125c, count +0x1264.
 constexpr std::uintptr_t kGame = 0x871678, kRoom = 0x18300, kRoomIndex = 0x18304, kListData = 0x125c, kListCount = 0x1264;
-constexpr std::uintptr_t kKill = 0x45dc30, kNpcDamage = 0x2d60a0;
+constexpr std::uintptr_t kKill = 0x45dc30, kNpcDamage = 0x2d60a0, kPlayerDamage = 0x3729d0, kGhost = 0x20a9;
+// Hearts as the game's own getters read them: containers, red, eternal, soul, black mask, two words that follow them,
+// bone (+0x1d88), rotten (+0x1da4), golden (+0x194c).
+constexpr std::uintptr_t kHealth[] = {0x1340, 0x1344, 0x1348, 0x134c, 0x1350, 0x1354, 0x1358, 0x1d88, 0x1da4, 0x194c};
+constexpr int kHealthFields = 10, kDeathRetryFrames = 30;
 constexpr std::array<std::uint8_t, 10> kKillEntry{0x55, 0x8b, 0xec, 0x83, 0xec, 0x28, 0xf3, 0x0f, 0x10, 0x0d};
 constexpr std::uint32_t kBodyMagic = 0x31524c50, kWorldMagic = 0x314e4c57;  // "PLR1", "WLN1"
 constexpr int kControllers = 8, kMaxNpcs = 48, kMaxDeaths = 16, kDeathFrames = 90, kOrphanSnapshots = 20;
 constexpr std::uintptr_t kType = 0x28, kVariant = 0x2c;
 constexpr std::uint64_t kFreshMs = 250;
 #pragma pack(push, 1)
-struct Body { std::uint32_t magic, controller, sequence, room; float position[2], velocity[2]; };
+struct Body { std::uint32_t magic, controller, sequence, room; float position[2], velocity[2]; std::uint32_t ghost; std::int32_t health[kHealthFields]; };
 struct Npc { std::uint32_t seed, type, variant; float position[2], velocity[2], hitPoints; };
 struct World { std::uint32_t magic, sequence, room, count, deaths; Npc npcs[kMaxNpcs]; std::uint32_t died[kMaxDeaths]; };
 // What a reader outside copies: generation is odd while the content is being written.
@@ -72,16 +83,18 @@ struct PublishedWorld { std::uint32_t magic, generation; World world; };
 struct Stats {
     std::uint32_t published, received, applied, stale, rejected, otherRoom;
     std::uint32_t worldPublished, worldReceived, worldApplied, npcMatched, npcOnlyHost, npcOnlyLocal, npcKilled, hitPointFixes, deathsHeld, npcPaired, npcRemoved;
+    std::uint32_t healthFixes, copyDamageIgnored, copyDeaths, copyRevivalsMissed;
     float correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax;
 };
 #pragma pack(pop)
-static_assert(sizeof(Body) == 32 && sizeof(Npc) == 32 && sizeof(World) == 20 + kMaxNpcs * 32 + kMaxDeaths * 4, "wire layout");
+static_assert(sizeof(Body) == 36 + 4 * kHealthFields && sizeof(Npc) == 32 && sizeof(World) == 20 + kMaxNpcs * 32 + kMaxDeaths * 4, "wire layout");
 using WithDevice = int(__thiscall*)(void*, int, void*, void*, void*, int*);
 using PlayerUpdate = void(__thiscall*)(void*);
 using NpcDamage = char(__thiscall*)(void*, float, std::uint32_t, std::uint32_t, void*, int);
 std::uintptr_t base = 0;
-void** slot = nullptr; void** playerSlot = nullptr; void** damageSlot = nullptr;
-WithDevice original = nullptr; PlayerUpdate originalPlayer = nullptr; NpcDamage originalDamage = nullptr;
+void** slot = nullptr; void** playerSlot = nullptr; void** damageSlot = nullptr; void** playerDamageSlot = nullptr;
+WithDevice original = nullptr; PlayerUpdate originalPlayer = nullptr; NpcDamage originalDamage = nullptr, originalPlayerDamage = nullptr;
+std::uint32_t deathTried[8]{};  // per controller: the frame a copy was last sent to its death
 int ownController = -1; bool host = false;
 SRWLOCK lifecycle = SRWLOCK_INIT, inboxLock = SRWLOCK_INIT;
 std::atomic<bool> running{false};
@@ -240,6 +253,8 @@ void AfterUpdate(std::uintptr_t player) noexcept {
             published.body.magic = kBodyMagic; published.body.controller = static_cast<std::uint32_t>(controller); published.body.sequence = ++sequence;
             published.body.room = roomIndex;
             std::memcpy(published.body.position, position, 8); std::memcpy(published.body.velocity, velocity, 8);
+            published.body.ghost = At<std::uint8_t>(player + kGhost);
+            for (int h = 0; h < kHealthFields; ++h) published.body.health[h] = At<std::int32_t>(player + kHealth[h]);
             published.generation++;
             stats.published++;
             if (room) { if (host) PublishWorld(room, roomIndex); else ApplyWorld(room, roomIndex); }
@@ -260,6 +275,21 @@ void AfterUpdate(std::uintptr_t player) noexcept {
         std::memcpy(position, body.position, 8); std::memcpy(velocity, body.velocity, 8);
         AcquireSRWLockExclusive(&inboxLock); inbox[controller].appliedSequence = body.sequence; ReleaseSRWLockExclusive(&inboxLock);
         stats.applied++; stats.correctionSum += distance; if (distance > stats.correctionMax) stats.correctionMax = distance;
+        const bool ghost = At<std::uint8_t>(player + kGhost) != 0;
+        if (body.ghost && !ghost) {
+            if (frame - deathTried[controller] >= kDeathRetryFrames) {
+                deathTried[controller] = frame; stats.copyDeaths++;
+                static std::uint8_t nobody[0x40]{};   // an empty damage source, as the game's own Kill() builds one
+                originalPlayerDamage(reinterpret_cast<void*>(player), 1000.0f, 0, 0, nobody, 0);
+            }
+        } else if (!body.ghost && ghost) {
+            stats.copyRevivalsMissed++;
+        } else if (!ghost) {
+            bool fixed = false;
+            for (int h = 0; h < kHealthFields; ++h)
+                if (At<std::int32_t>(player + kHealth[h]) != body.health[h]) { At<std::int32_t>(player + kHealth[h]) = body.health[h]; fixed = true; }
+            if (fixed) stats.healthFixes++;
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) { stats.rejected++; }
 }
 
@@ -274,6 +304,14 @@ char __fastcall OnNpcDamage(void* self, void*, float damage, std::uint32_t flags
         if (At<float>(entity + kMaxHitPoints) > 0 && damage >= hitPoints) { damage = hitPoints > 0.02f ? hitPoints - 0.01f : 0.0f; stats.deathsHeld++; }
     }
     return originalDamage(self, damage, flagsLow, flagsHigh, source, countdown);
+}
+
+char __fastcall OnPlayerDamage(void* self, void*, float damage, std::uint32_t flagsLow, std::uint32_t flagsHigh, void* source, int countdown) {
+    if (running.load(std::memory_order_acquire) && At<int>(reinterpret_cast<std::uintptr_t>(self) + kController) != ownController) {
+        stats.copyDamageIgnored++;
+        return 0;
+    }
+    return originalPlayerDamage(self, damage, flagsLow, flagsHigh, source, countdown);
 }
 
 bool ValidWorld(const World& world, int got) {
@@ -348,15 +386,18 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
         slot = reinterpret_cast<void**>(base + kManagerTable + 29 * sizeof(void*));
         playerSlot = reinterpret_cast<void**>(base + kPlayerTable + 3 * sizeof(void*));
         damageSlot = reinterpret_cast<void**>(base + kNpcTable + 8 * sizeof(void*));
+        playerDamageSlot = reinterpret_cast<void**>(base + kPlayerTable + 8 * sizeof(void*));
         if (table != base + kManagerTable || *slot != reinterpret_cast<void*>(base + kWithDevice) || *playerSlot != reinterpret_cast<void*>(base + kPlayerUpdate) ||
-            *damageSlot != reinterpret_cast<void*>(base + kNpcDamage) ||
+            *damageSlot != reinterpret_cast<void*>(base + kNpcDamage) || *playerDamageSlot != reinterpret_cast<void*>(base + kPlayerDamage) ||
             std::memcmp(reinterpret_cast<void*>(base + kKill), kKillEntry.data(), kKillEntry.size()) != 0) throw static_cast<DWORD>(ERROR_REVISION_MISMATCH);
         original = reinterpret_cast<WithDevice>(*slot); originalPlayer = reinterpret_cast<PlayerUpdate>(*playerSlot); originalDamage = reinterpret_cast<NpcDamage>(*damageSlot);
+        originalPlayerDamage = reinterpret_cast<NpcDamage>(*playerDamageSlot);
         HMODULE pinned = nullptr;
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&OnInput), &pinned)) throw GetLastError();
         ownController = controller; host = role == "host"; counters[0] = 0; counters[1] = 0; stats = Stats{}; sequence = worldSequence = frame = 0;
         published = Published{}; published.magic = kBodyMagic; publishedWorld = PublishedWorld{}; publishedWorld.magic = kWorldMagic;
         for (auto& box : inbox) box = Inbox{};
+        for (auto& tried : deathTried) tried = 0;
         worldInbox = World{}; worldAt = 0; worldApplied = 0; livedRoom = aliasRoom = 0xffffffff; livedCount = deathCount = aliasCount = orphanCount = 0;
         WSADATA data{};
         if (const int started = WSAStartup(MAKEWORD(2, 2), &data)) throw static_cast<DWORD>(started);
@@ -381,6 +422,14 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
                 ExchangeSlot(playerSlot, reinterpret_cast<void*>(&OnPlayer), reinterpret_cast<void*>(originalPlayer));
             }
         }
+        if (!failure) {
+            failure = ExchangeSlot(playerDamageSlot, reinterpret_cast<void*>(originalPlayerDamage), reinterpret_cast<void*>(&OnPlayerDamage));
+            if (failure) {
+                ExchangeSlot(slot, reinterpret_cast<void*>(&OnInput), reinterpret_cast<void*>(original));
+                ExchangeSlot(playerSlot, reinterpret_cast<void*>(&OnPlayer), reinterpret_cast<void*>(originalPlayer));
+                ExchangeSlot(damageSlot, reinterpret_cast<void*>(&OnNpcDamage), reinterpret_cast<void*>(originalDamage));
+            }
+        }
         if (failure) { running = false; CloseNetwork(); Patch(kCompare, kCompareEntry, kCompareEqual); throw failure; }
         std::ofstream descriptor(folder / (L"native-" + std::to_wstring(GetCurrentProcessId()) + L".json"), std::ios::trunc);
         descriptor << "{\"pid\":" << GetCurrentProcessId() << ",\"role\":\"" << (host ? "native-host" : "native-guest") << "\",\"ownController\":" << ownController
@@ -402,7 +451,8 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStop(void*) noexcept {
         result = ExchangeSlot(slot, reinterpret_cast<void*>(&OnInput), reinterpret_cast<void*>(original));
         const DWORD second = ExchangeSlot(playerSlot, reinterpret_cast<void*>(&OnPlayer), reinterpret_cast<void*>(originalPlayer));
         const DWORD third = ExchangeSlot(damageSlot, reinterpret_cast<void*>(&OnNpcDamage), reinterpret_cast<void*>(originalDamage));
-        if (!result) result = second ? second : third;
+        const DWORD fourth = ExchangeSlot(playerDamageSlot, reinterpret_cast<void*>(&OnPlayerDamage), reinterpret_cast<void*>(originalPlayerDamage));
+        if (!result) result = second ? second : third ? third : fourth;
         CloseNetwork();
         // The comparison stays off on purpose: the games have already diverged, and turning it back on would split the lobby.
     }
