@@ -206,6 +206,9 @@ constexpr std::uint64_t kTearsHeardMs = 3000; constexpr float kHeldFireDelay = 5
 // Pickups: the group of which one may be taken +0x528, price +0x534, shop slot +0x53c, frames left +0x540 (Lua accessors).
 constexpr std::uintptr_t kOptions = 0x528, kShopItemId = 0x53c, kTimeout = 0x540, kPickupMorph = 0x2e30a0;
 constexpr std::array<std::uint8_t, 8> kPickupMorphEntry{0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68, 0x95, 0xB0};
+// The pickup's own setter of its price (it also loads the price tag; the game's restore_entity sets prices with it).
+constexpr std::uintptr_t kPickupSetPrice = 0x2e2570;
+constexpr std::array<std::uint8_t, 8> kPickupSetPriceEntry{0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68, 0x57, 0xB0};
 constexpr std::uint32_t kPickup = 5, kCollectible = 100, kMaxDrops = 64, kAges = 128, kMaxDropSpawns = 16;
 constexpr std::uint32_t kDropMadeHereSnapshots = 6, kDropGoneSnapshots = 20, kDropItemSnapshots = 15;
 constexpr std::uintptr_t kKeys = 0x135c, kBombs = 0x1364, kCoins = 0x1368, kPlayers = 0x1baa8; constexpr std::uint32_t kCountersHoldFrames = 45;
@@ -268,6 +271,7 @@ using SpritePlay = void(__thiscall*)(void*, const char*, bool);
 using GridChange = std::uint32_t(__thiscall*)(void*, std::uint32_t, void*);   // Hurt(damage, source), Destroy(immediate, source)
 using GridDestroy = void(__thiscall*)(void*, std::uint32_t);
 using TearSetScale = void(__thiscall*)(void*, float);
+using PickupSetPrice = void(__thiscall*)(void*, int);
 using PickupMorph = void(__thiscall*)(void*, int, int, int, std::uint32_t, std::uint32_t, std::uint32_t);   // type, variant, subtype, keep price, keep seed, ignore modifiers
 using Spawn = void*(__thiscall*)(void*, std::uint32_t, std::uint32_t, const float*, const float*, void*, std::uint32_t, std::uint32_t);
 std::uintptr_t base = 0;
@@ -642,7 +646,9 @@ void ApplyDrops(std::uintptr_t room, const World& world) {
             const auto& drop = world.drop[n]; taken[n] = true; Learn(knownDrops, seed);
             if (At<std::uint32_t>(entity + kVariant) != drop.variant) continue;   // opened or changed here a moment ago: the owner's taking settles it
             std::memcpy(reinterpret_cast<void*>(entity + kPosition), drop.position, 8); std::memcpy(reinterpret_cast<void*>(entity + kVelocity), drop.velocity, 8);
-            if (At<std::int32_t>(entity + kPrice) != drop.price) At<std::int32_t>(entity + kPrice) = drop.price;
+            if (At<std::int32_t>(entity + kPrice) != drop.price) {   // the shop slot first: the setter looks the price tag up by it
+                At<std::int32_t>(entity + kShopItemId) = drop.shopItemId; reinterpret_cast<PickupSetPrice>(base + kPickupSetPrice)(reinterpret_cast<void*>(entity), drop.price);
+            }
             if (At<std::int32_t>(entity + kTimeout) != drop.timeout) At<std::int32_t>(entity + kTimeout) = drop.timeout;
             if (At<std::int32_t>(entity + kOptions) != drop.options) At<std::int32_t>(entity + kOptions) = drop.options;
             const auto subtype = At<std::uint32_t>(entity + kSubtype);
@@ -671,8 +677,8 @@ void ApplyDrops(std::uintptr_t room, const World& world) {
         const auto entity = reinterpret_cast<std::uintptr_t>(reinterpret_cast<Spawn>(base + kSpawn)(reinterpret_cast<void*>(game), kPickup, drop.variant, drop.position, drop.velocity,
             nullptr, drop.subtype, drop.seed));
         if (!entity || !LivingPickup(entity)) continue;
-        At<std::int32_t>(entity + kPrice) = drop.price; At<std::int32_t>(entity + kTimeout) = drop.timeout;
-        At<std::int32_t>(entity + kOptions) = drop.options; At<std::int32_t>(entity + kShopItemId) = drop.shopItemId;
+        At<std::int32_t>(entity + kTimeout) = drop.timeout; At<std::int32_t>(entity + kOptions) = drop.options; At<std::int32_t>(entity + kShopItemId) = drop.shopItemId;
+        if (At<std::int32_t>(entity + kPrice) != drop.price) reinterpret_cast<PickupSetPrice>(base + kPickupSetPrice)(reinterpret_cast<void*>(entity), drop.price);
         stats.dropsMade++; ++spawned;
     }
 }
@@ -1184,6 +1190,7 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
             std::memcmp(reinterpret_cast<void*>(base + kGridDestroy), kGridDestroyEntry.data(), kGridDestroyEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kTearSetScale), kTearSetScaleEntry.data(), kTearSetScaleEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kPickupMorph), kPickupMorphEntry.data(), kPickupMorphEntry.size()) != 0 ||
+            std::memcmp(reinterpret_cast<void*>(base + kPickupSetPrice), kPickupSetPriceEntry.data(), kPickupSetPriceEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kDoorRefresh), kDoorRefreshEntry.data(), kDoorRefreshEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kKill), kKillEntry.data(), kKillEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kTransition), kTransitionEntry.data(), kTransitionEntry.size()) != 0 ||
