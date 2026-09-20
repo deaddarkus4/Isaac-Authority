@@ -122,6 +122,14 @@ class SaveTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 save.decode_shared(broken)
 
+    def test_difference_names_the_part_and_sets_the_first_bytes_apart(self):
+        first = sample(chunk_1={0: 1, 40: 1}, chunk_2={21: 6}, bestiary={1: [(5, 2), (6, 1)]})
+        second = sample(chunk_1={40: 1, 41: 1}, chunk_2={21: 7}, bestiary={1: [(5, 3), (7, 1)]})
+        one, two = save.shared_view(first), save.shared_view(second)
+        self.assertEqual(save.difference(one, one), {})
+        self.assertEqual(save.difference(one, two), {"firstBytes": [(0, 1, 0)], "achievements": [(41, 0, 1)], "counters": [(21, 6, 7)],
+                                                     "bestiaryMap1": [(5, 2, 3), (6, 1, None), (7, None, 1)]})
+
     def test_summary_counts_what_is_set(self):
         one = sample(chunk_1={0: 1, 9: 1}, chunk_2={1: 40}, bestiary={1: [(3, 2), (4, 0)]})
         rows = save.summary(one)

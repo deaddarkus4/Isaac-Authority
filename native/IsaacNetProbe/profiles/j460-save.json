@@ -97,7 +97,8 @@
       "flags": "own |= shared at the end",
       "counters": "own += max(0, shared at the end - shared at the start), bestiary maps 1 and 2 alike",
       "edenTokens": "counter 21: max(0, own + end - start)",
-      "keptOwn": "36 counters (114, 115, 159-172, 212, 385-403) and 12 achievements (242-251, 275, 341) are copied from the player's own save into both checkpoint copies (0x51b720)"
+      "keptOwn": "36 counters (114, 115, 159-172, 212, 385-403) and 12 achievements (242-251, 275, 341) are copied from the player's own save into both checkpoint copies (0x51b720)",
+      "validation": "31 sessions of the local player: all flags, bestiary and about 515 of 523 counters reproduce exactly; 1-6 elements per session differ - counters 21 and 497-520 and cutscene counters, which the game changes in the real save directly"
     },
     "sessionDumps": {
       "sharedsave_begin": "the shared save at the match start",
@@ -111,7 +112,13 @@
       "sharedDumpsDecodedToExactEnd": "72 of 72 surviving",
       "startSharedSaveWithinRealSave": "32 of 38; 3 differ only in the first four dump bytes (heap pointers), 2 are sessions with two match starts, 1 is an eden token spent by playing Eden",
       "notPossible": "byte equality with the game's shared save: the other members' saves are not available",
-      "live": "first version of the tool, progressed + clean save: accepted by the game (no checksum warning, locked characters, win streak 0) and gave the clean save's level: 0 of 15 rooms differ from the clean-save game, no curse; 5 rooms and the curse differ from the host"
+      "live": "first version of the tool, progressed + clean save: accepted by the game (no checksum warning, locked characters, win streak 0) and gave the clean save's level: 0 of 15 rooms differ from the clean-save game, no curse; 5 rooms and the curse differ from the host",
+      "friendsCopies": {
+        "firstFriend": "a real save written at the end of a session: all 17 earlier shared saves fit within it as well as within the local player's save (one element above: counter 497 in one session)",
+        "secondFriend": "not a save but the shared context of a running session (14 elements from the local player's live data at the end of that session); guess: the game was quit mid-session and wrote its live data to the normal file - on the local machine the normal file was never written during any of 44 sessions",
+        "byteEquality": "not reached: no copy was taken right before a session whose members' saves are all known; closest case differs in 4 of about 2600 elements, all in the expected direction",
+        "tool": "scripts/isaac_save.py compare --shared <sharedsave_begin.dat> <member saves>"
+      }
     },
     "report": "docs/j460-lobby-save.md"
   }

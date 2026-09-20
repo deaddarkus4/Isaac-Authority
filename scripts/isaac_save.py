@@ -188,6 +188,22 @@ def shared_view(save):
                 bestiary={which: list(save["bestiary"][which]) for which in SHARED_MAPS})
 
 
+def difference(expected, actual):
+    """Where two shared views differ: {part: [(index or key, expected, actual), ...]}. Achievements 0 to 31 are reported as
+    the part 'firstBytes': in a dump of the game they are the four bytes a released buffer loses to the allocator."""
+    rows = {}
+    for kind in SHARED_ORDER:
+        for index, (a, b) in enumerate(zip(expected["chunks"][kind], actual["chunks"][kind])):
+            if a != b:
+                rows.setdefault("firstBytes" if kind == 1 and index < 32 else NAMES[kind], []).append((index, a, b))
+    for which in SHARED_MAPS:
+        a, b = dict(expected["bestiary"][which]), dict(actual["bestiary"][which])
+        for key in sorted(set(a) | set(b)):
+            if a.get(key) != b.get(key):
+                rows.setdefault(f"bestiaryMap{which}", []).append((key, a.get(key), b.get(key)))
+    return rows
+
+
 def summary(save):
     """Numbers of a parsed save, or of a decoded shared save."""
     rows = {}
@@ -206,7 +222,19 @@ def main():
     dump = commands.add_parser("shared", help="the same for a shared save dumped by the game (sharedsave_begin.dat)"); dump.add_argument("file", type=Path)
     merged = commands.add_parser("merge", help="the save a lobby shares, by the game's own rule")
     merged.add_argument("--output", type=Path, required=True); merged.add_argument("files", type=Path, nargs="+", help="the host's save first")
+    compared = commands.add_parser("compare", help="a shared save dumped by the game against the merge of its members' saves")
+    compared.add_argument("--shared", type=Path, required=True, help="sharedsave_begin.dat of the session")
+    compared.add_argument("files", type=Path, nargs="+", help="every member's save as it was before the session")
     args = parser.parse_args()
+    if args.command == "compare":
+        shared = decode_shared(args.shared.read_bytes()); named = sum(1 for member in shared["members"] if member)
+        if named != len(args.files):
+            print(f"The shared save names {named} members, {len(args.files)} saves were given: equality cannot be expected")
+        rows = difference(shared_view(merge([parse(path.read_bytes()) for path in args.files])), shared)
+        for part, found in rows.items():
+            print(f"{part:20} {len(found):4} differ, (index or key, merged, game's): {found[:6]}")
+        print("EQUAL" if not rows else "equal but for the first four bytes of the dump" if list(rows) == ["firstBytes"] else "DIFFERENT")
+        return 0 if not rows or list(rows) == ["firstBytes"] else 1
     if args.command in ("info", "shared"):
         shown = parse(args.file.read_bytes()) if args.command == "info" else decode_shared(args.file.read_bytes())
         for name, row in summary(shown).items():
