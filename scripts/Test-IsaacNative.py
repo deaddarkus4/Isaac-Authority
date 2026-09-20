@@ -35,13 +35,16 @@ COUNTERS = ("published", "received", "applied", "stale", "rejected", "otherRoom"
             "npcOnlyLocal", "npcKilled", "hitPointFixes", "deathsHeld", "npcPaired", "npcRemoved",
             "healthFixes", "copyDamageIgnored", "copyDeaths", "copyRevivalsMissed", "roomFollows", "roomFollowFailures", "stateFixes", "npcSpawned", "npcSpawnFailures",
             "clearsHeld", "clearsFromHost", "copyRevivals", "copyTouchesIgnored", "taken", "takenApplied", "takenMissed", "animationFixes", "gridHeld", "gridFixes", "gridMismatch", "fireHeld",
-            "projectilesMade", "projectilesEnded", "projectilesDropped", "tearsSent", "tearsMade", "tearsEnded", "tearsDropped", "fireHolds")
+            "projectilesMade", "projectilesEnded", "projectilesDropped", "tearsSent", "tearsMade", "tearsEnded", "tearsDropped", "fireHolds",
+            "dropsMade", "dropsRemoved", "dropsMorphed", "dropsSkipped", "counterFixes", "doorFixes", "doorMismatch")
+# The module's rules, each of which can be left out (--without): the same bits as in native_adapter.cpp.
+RULES = dict(follow=1, behaviour=2, clear=4, taken=8, grid=16, fire=32, projectiles=64, tears=128, drops=256, counters=512, doors=1024, traps=2048)
 STATS = struct.Struct(f"<{len(COUNTERS)}I4f"); SUM = len(COUNTERS)   # four floats follow: correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax
 folder = Path(os.environ["LOCALAPPDATA"]) / "IsaacAuthority"
 release = root / "Binaries/authority-build/Release"
 
 
-def attach(instances):
+def attach(instances, mask, restart):
     """Tell each game's module which lobby device is its local player - the 'Setting controller ID to N' that follows
     'Adding local player' in the game's own log - and attach it. A game that already runs the module is left as it is."""
     for instance in instances:
@@ -53,7 +56,9 @@ def attach(instances):
             raise SystemExit(f"{instance['title']}: no running match of the game's own online in its log")
         # The game that made the lobby is the host: the authority over the enemies.
         hosting = "Successfully created lobby" in log
-        (folder / f"native-{pid}.cfg").write_text(found[0] + (" host" if hosting else ""), encoding="ascii")
+        (folder / f"native-{pid}.cfg").write_text(f"{found[0]} {'host' if hosting else 'guest'} {mask:x}", encoding="ascii")
+        if restart:   # the same build, other rules: stop the running module first
+            subprocess.run([str(release / "IsaacAuthorityAttach.exe"), "native-stop", str(pid), str(release / "IsaacAuthorityNative.dll")], capture_output=True, text=True)
         done = subprocess.run([str(release / "IsaacAuthorityAttach.exe"), "native", str(pid), str(release / "IsaacAuthorityNative.dll")], capture_output=True, text=True)
         result = json.loads(done.stdout)["result"] if done.stdout.strip().startswith("{") else done.stderr.strip()
         if result not in (0, 1247):   # 1247: already attached
@@ -64,12 +69,17 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--no-relay", action="store_true"); parser.add_argument("--delay-ms", type=int, default=0)
 parser.add_argument("--jitter-ms", type=int, default=0); parser.add_argument("--loss", type=float, default=0.0)
 parser.add_argument("--seconds", type=float, default=1.2)
+parser.add_argument("--without", default="", metavar="RULES", help="comma-separated rules to leave out: " + ", ".join(RULES))
+parser.add_argument("--restart", action="store_true", help="stop the module in each game first, so that it starts again with these rules")
 parser.add_argument("--play", type=float, nargs="?", const=120.0, default=None, metavar="MINUTES",
                     help="only attach and relay while a person plays; a line of state every ten seconds, until the games close")
 args = parser.parse_args()
 
 instances = json.loads((root / "Binaries/game-instances/native-pair.json").read_text(encoding="utf-8-sig"))
-attach(instances)
+left_out = [name for name in args.without.split(",") if name]
+if any(name not in RULES for name in left_out):
+    raise SystemExit("unknown rule; known: " + ", ".join(RULES))
+attach(instances, 0xFFF & ~sum(RULES[name] for name in left_out), args.restart)
 folder = Path(os.environ["LOCALAPPDATA"]) / "IsaacAuthority"
 games = []
 for instance in instances:
@@ -222,7 +232,7 @@ if args.play is not None:
             for g, a, b in zip(games, now, previous):
                 line.append(f"{g['title'][-1]}: FAULTS {a['rejected']}, bodies {a['applied'] - b['applied']} (max fix {a['correctionMax']:.1f}), enemies matched {a['npcMatched'] - b['npcMatched']}, "
                             f"paired {a['npcPaired']}, only host {a['npcOnlyHost'] - b['npcOnlyHost']}, removed {a['npcRemoved']}, killed {a['npcKilled']}, held {a['deathsHeld']}, other room {a['otherRoom'] - b['otherRoom']}; health fixes {a['healthFixes'] - b['healthFixes']}, blows to copies ignored {a['copyDamageIgnored']}, "
-                            f"copy deaths {a['copyDeaths']}, revived {a['copyRevivals']}, revivals missed {a['copyRevivalsMissed'] - b['copyRevivalsMissed']}, taken {a['taken']} / applied from others {a['takenApplied']} / missed {a['takenMissed']} (copies' touches ignored {a['copyTouchesIgnored']}), rooms followed {a['roomFollows']} (failed {a['roomFollowFailures']}), behaviour fixes {a['stateFixes'] - b['stateFixes']}, animations started {a['animationFixes'] - b['animationFixes']}, enemies created {a['npcSpawned']} (failed {a['npcSpawnFailures']}), clears held {a['clearsHeld'] - b['clearsHeld']}, clears from host {a['clearsFromHost']}, grid held {a['gridHeld']} / set from host {a['gridFixes']} / mismatch {a['gridMismatch'] - b['gridMismatch']}, blows to fireplaces held {a['fireHeld']}; projectiles made {a['projectilesMade']} / ended {a['projectilesEnded']} / own dropped {a['projectilesDropped']}, tears sent {a['tearsSent'] - b['tearsSent']} / made {a['tearsMade']} / ended {a['tearsEnded']} / copy's dropped {a['tearsDropped']}, fire holds {a['fireHolds'] - b['fireHolds']}")
+                            f"copy deaths {a['copyDeaths']}, revived {a['copyRevivals']}, revivals missed {a['copyRevivalsMissed'] - b['copyRevivalsMissed']}, taken {a['taken']} / applied from others {a['takenApplied']} / missed {a['takenMissed']} (copies' touches ignored {a['copyTouchesIgnored']}), rooms followed {a['roomFollows']} (failed {a['roomFollowFailures']}), behaviour fixes {a['stateFixes'] - b['stateFixes']}, animations started {a['animationFixes'] - b['animationFixes']}, enemies created {a['npcSpawned']} (failed {a['npcSpawnFailures']}), clears held {a['clearsHeld'] - b['clearsHeld']}, clears from host {a['clearsFromHost']}, grid held {a['gridHeld']} / set from host {a['gridFixes']} / mismatch {a['gridMismatch'] - b['gridMismatch']}, blows to fireplaces held {a['fireHeld']}; projectiles made {a['projectilesMade']} / ended {a['projectilesEnded']} / own dropped {a['projectilesDropped']}, tears sent {a['tearsSent'] - b['tearsSent']} / made {a['tearsMade']} / ended {a['tearsEnded']} / copy's dropped {a['tearsDropped']}, fire holds {a['fireHolds'] - b['fireHolds']}; pickups made {a['dropsMade']} / removed {a['dropsRemoved']} / items set {a['dropsMorphed']} / skipped {a['dropsSkipped']}, counter fixes {a['counterFixes']}, door fixes {a['doorFixes']} (mismatch {a['doorMismatch'] - b['doorMismatch']})")
             print(time.strftime('%H:%M:%S'), ' | '.join(line), flush=True); previous = now
     except (OSError, KeyboardInterrupt) as error:
         print('stopped:', type(error).__name__, error, flush=True)
