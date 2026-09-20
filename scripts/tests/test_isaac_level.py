@@ -48,6 +48,17 @@ class LevelTests(unittest.TestCase):
         self.assertEqual(len(found), 2)
         self.assertTrue(found[0].startswith("startSeed") and found[1].startswith("rooms"))
 
+    def test_fingerprint_is_equal_exactly_when_nothing_differs(self):
+        host = level.snapshot(memory(446746862, 84, ROOMS, curses=1), BASE)
+        visited = level.snapshot(memory(446746862, 85, [room[:5] + (room[5] + 3,) for room in reversed(ROOMS)], curses=1), BASE)
+        self.assertEqual(level.fingerprint(host), level.fingerprint(visited))
+        self.assertEqual(len(level.fingerprint(host)), 64)
+        for other in (memory(446746862, 84, ROOMS), memory(446746862, 84, ROOMS, difficulty=0, curses=1), memory(3433938825, 84, ROOMS, curses=1),
+                      memory(446746862, 84, ROOMS[:-1] + [(71, 1, 71, 1, 15, 0)], curses=1), memory(446746862, 84, ROOMS[:-1], curses=1)):
+            state = level.snapshot(other, BASE)
+            self.assertTrue(level.differences(host, state))
+            self.assertNotEqual(level.fingerprint(host), level.fingerprint(state))
+
     def test_one_seed_with_different_saves_shares_only_some_doors(self):
         # Observed with seed CZH4 8E6W: the miniboss sits left of the start for one save and right of it for the other.
         host = [(84, 1, 2, 1, 11, 1), (83, 6, 2037, 1, 21, 0), (85, 1, 1071, 1, 22, 0), (97, 1, 297, 1, 23, 0)]

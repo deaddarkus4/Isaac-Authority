@@ -125,5 +125,16 @@
       "tool": "scripts/Start-IsaacLobby.ps1 -Saves <host save>,<guest save> [-MergeOnly]",
       "validation": "user's save (90 achievements) and a friend's copy (223) share 86; two instances from the one merged file accepted it (no checksum complaint), typed seed CZH4 8E6W, hard: 0 of 15 rooms differ, same curse; the full stepped-prediction coop pipeline passed on the pair (449 of 449 commands, prediction error 0 over 406 reconciliations, no teleport, hooks restored)"
     }
+  },
+  "lobbyProcess": {
+    "tool": "scripts/isaac_lobby.py host|join; Test-IsaacCoop.py --lobby <host session.json> <client session.json>",
+    "states": "open -> started (membership frozen, tickets out) -> running (every game proved equal) | aborted",
+    "memberSends": "the packed shared part of the save (isaac_save.encode_shared), never the file",
+    "memberPlaysFrom": "isaac_save.overlay: the shared save over the member's own, as the game does at Notify Game Start; settings, special seeds, bestiary maps 3-4 stay the member's",
+    "liveSaveFlags": "PersistentGameData at Manager+0x14: achievements +0x38, collectibles +0xae8, minibosses +0xe00, bosses +0xe07, challenges +0xe6f (offsets of the game's deserializer RVA 0x51adf0)",
+    "proof": "seed, difficulty, isaac_level.fingerprint of the generated level, SHA-256 of the live save's flags; the host's own game is held to the same",
+    "validation": "10 unit tests incl. TCP; real host and member processes on loopback with the running lobby pair: go; latecomer refused 'started'; a guest save the games were not started from -> abort with both members' flags differing; gate refuses swapped games and an aborted match",
+    "notYet": "live pass on fresh instances with --launch; in-process overlay through the game's own deserializer; the ticket's session as the modules' session",
+    "report": "docs/j460-lobby-process.md"
   }
 }

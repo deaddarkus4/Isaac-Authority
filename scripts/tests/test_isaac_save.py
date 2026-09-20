@@ -122,6 +122,26 @@ class SaveTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 save.decode_shared(broken)
 
+    def test_overlay_is_what_a_member_plays_from(self):
+        # As the game does at the match start: the shared save over the member's own, the rest stays the member's.
+        own = sample(word=5, trailer=b"mine", chunk_1={0: 1, 7: 1}, chunk_2={3: 9}, chunk_9={0: 1}, chunk_10={2: 3}, bestiary={1: [(1, 1), (4, 4)], 3: [(9, 9)], 4: [(8, 8)]})
+        other = sample(word=6, chunk_1={7: 1, 8: 1}, chunk_2={3: 4}, chunk_9={1: 7}, bestiary={1: [(1, 5), (2, 2)], 3: [(7, 7)]})
+        shared = save.merge_shared([save.shared_view(own), save.shared_view(other)])
+        sent = save.decode_shared(save.encode_shared(shared))       # what travels is the packed form
+        mine, theirs = save.overlay(own, sent), save.overlay(other, sent)
+        self.assertEqual(save.shared_view(mine), save.shared_view(theirs))
+        self.assertEqual(([n for n, v in enumerate(mine["chunks"][1][1]) if v], mine["chunks"][2][1][3], mine["bestiary"][1]), ([7], 4, [(1, 1)]))
+        self.assertEqual((mine["chunks"][9][1], mine["chunks"][10][1][2], mine["bestiary"][3], mine["bestiary"][4], mine["word"], mine["trailer"]),
+                         ([1, 0], 3, [(9, 9)], [(8, 8)], 5, b"mine"))
+        self.assertEqual((theirs["chunks"][9][1], theirs["bestiary"][3], theirs["word"]), ([0, 7], [(7, 7)], 6))
+        self.assertEqual((list(mine["bestiary"]), save.parse(save.build(mine))), (list(MAP_ORDER), mine))
+        # One file for a whole lobby is the same overlay on the host's save.
+        self.assertEqual(save.merge([own, other]), mine)
+        with self.assertRaises(ValueError):
+            save.merge_shared([])
+        with self.assertRaises(ValueError):
+            save.overlay(own, dict(chunks={**sent["chunks"], 1: sent["chunks"][1][:-1]}, bestiary=sent["bestiary"]))
+
     def test_difference_names_the_part_and_sets_the_first_bytes_apart(self):
         first = sample(chunk_1={0: 1, 40: 1}, chunk_2={21: 6}, bestiary={1: [(5, 2), (6, 1)]})
         second = sample(chunk_1={40: 1, 41: 1}, chunk_2={21: 7}, bestiary={1: [(5, 3), (7, 1)]})

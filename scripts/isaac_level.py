@@ -1,4 +1,6 @@
 """Read-only J460 level layout: run seed, room descriptors and the doors of the current room."""
+import hashlib
+import json
 import struct
 
 GAME_RVA = 0x871678
@@ -135,6 +137,13 @@ def room_differences(a, b):
     first = {(room["grid"], room["dimension"]): place(room) for room in a["rooms"]}
     second = {(room["grid"], room["dimension"]): place(room) for room in b["rooms"]}
     return sorted(cell for cell in set(first) | set(second) if first.get(cell) != second.get(cell))
+
+
+def fingerprint(state):
+    """One value for everything differences() compares: two games may share a run only when it is equal in both."""
+    rooms = sorted(list(place(room)) for room in state["rooms"])
+    run = [state[key] for key in ("startSeed", "stage", "stageType", "difficulty", "curses")]
+    return hashlib.sha256(json.dumps([run, rooms], separators=(",", ":")).encode("ascii")).hexdigest()
 
 
 def differences(a, b):

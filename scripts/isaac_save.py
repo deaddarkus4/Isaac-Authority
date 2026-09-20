@@ -104,33 +104,60 @@ def _signed(value):
     return value - (1 << 32) if value & 0x80000000 else value
 
 
+def shared_view(save):
+    """What a save contributes to a shared save, in the form decode_shared() returns (flags as 0 and 1). This, packed by
+    encode_shared(), is all a lobby member sends to the host - as in the game, never the whole file."""
+    return dict(chunks={kind: [1 if value else 0 for value in save["chunks"][kind][1]] if WIDTH[kind] == 1 else list(save["chunks"][kind][1])
+                        for kind in SHARED_ORDER},
+                bestiary={which: list(save["bestiary"][which]) for which in SHARED_MAPS})
+
+
+def merge_shared(views):
+    """The shared save of a lobby, as the game's builder (RVA 0x51a450) makes it from what the members sent: flags by AND,
+    counters by the smallest value (cutscene counters compared as signed numbers, as the game does), bestiary maps 1 and 2
+    by the smallest value of the entries every member has."""
+    if not views:
+        raise ValueError("Nothing to merge")
+    chunks = {}
+    for kind in SHARED_ORDER:
+        if any(len(view["chunks"][kind]) != SHARED_COUNTS[kind] for view in views):
+            raise ValueError(f"Chunk {kind} has a different layout in one of the saves")
+        rows = list(zip(*(view["chunks"][kind] for view in views)))
+        if WIDTH[kind] == 1:
+            chunks[kind] = [1 if all(row) else 0 for row in rows]
+        else:
+            chunks[kind] = [min(row, key=_signed) if kind == CUTSCENES else min(row) for row in rows]
+    bestiary = {}
+    for which in SHARED_MAPS:
+        tables = [dict(view["bestiary"][which]) for view in views]
+        bestiary[which] = [(key, min(table[key] for table in tables)) for key in sorted(tables[0]) if all(key in table for table in tables)]
+    return dict(chunks=chunks, bestiary=bestiary)
+
+
+def overlay(own, shared):
+    """A member's save for the match: the shared save laid over the member's own, as the game does at 'Notify Game Start'
+    (RVA 0x50ca40 -> 0x51adf0 over Manager+0x14). What the shared save does not carry - settings, special seed counters,
+    bestiary maps 3 and 4, the unchecked word and the trailer - stays the member's own."""
+    chunks = {}
+    for kind, (size, elements) in own["chunks"].items():
+        if kind in shared["chunks"]:
+            if len(shared["chunks"][kind]) != len(elements):
+                raise ValueError(f"Chunk {kind} of the shared save has a different layout")
+            chunks[kind] = (size, list(shared["chunks"][kind]))
+        else:
+            chunks[kind] = (size, list(elements))
+    bestiary = {which: list(shared["bestiary"][which]) if which in shared["bestiary"] else list(entries) for which, entries in own["bestiary"].items()}
+    return dict(word=own["word"], chunks=chunks, bestiary=bestiary, trailer=own["trailer"])
+
+
 def merge(saves):
-    """The save of a lobby, as the game's builder (RVA 0x51a450) makes it from the members' saves: flags by AND, counters by
-    the smallest value (cutscene counters compared as signed numbers, as the game does), bestiary maps 1 and 2 by the
-    smallest value of the entries every member has. What the game does not share - settings, special seed counters, bestiary
-    maps 3 and 4, the unchecked word and the trailer - comes from the first save, the host's: here every participant starts
-    from this one file."""
+    """One file for a whole lobby: the shared save of the given saves laid over the first one, the host's."""
     if not saves:
         raise ValueError("Nothing to merge")
-    first = saves[0]; chunks = {}
-    for kind, (size, elements) in first["chunks"].items():
-        others = [save["chunks"][kind] for save in saves[1:]]
-        if any(other[0] != size or len(other[1]) != len(elements) for other in others):
+    for kind in saves[0]["chunks"]:
+        if any(save["chunks"][kind][0] != saves[0]["chunks"][kind][0] or len(save["chunks"][kind][1]) != len(saves[0]["chunks"][kind][1]) for save in saves[1:]):
             raise ValueError(f"Chunk {kind} has a different layout in one of the saves")
-        rows = list(zip(elements, *(other[1] for other in others)))
-        if kind in (SETTINGS, SEEDS):
-            chunks[kind] = (size, list(elements))
-        elif WIDTH[kind] == 1:
-            chunks[kind] = (size, [1 if all(row) else 0 for row in rows])
-        else:
-            chunks[kind] = (size, [min(row, key=_signed) if kind == CUTSCENES else min(row) for row in rows])
-    bestiary = {}
-    for which, entries in first["bestiary"].items():
-        if which not in SHARED_MAPS:
-            bestiary[which] = list(entries); continue
-        tables = [dict(save["bestiary"][which]) for save in saves]
-        bestiary[which] = [(key, min(table[key] for table in tables)) for key in sorted(tables[0]) if all(key in table for table in tables)]
-    return dict(word=first["word"], chunks=chunks, bestiary=bestiary, trailer=first["trailer"])
+    return overlay(saves[0], merge_shared([shared_view(save) for save in saves]))
 
 
 def decode_shared(raw):
@@ -181,13 +208,6 @@ def encode_shared(shared):
     return raw + struct.pack("<4Q", *(list(shared.get("members", [])) + [0] * 4)[:4])
 
 
-def shared_view(save):
-    """What a save contributes to a shared save, in the form decode_shared() returns (flags as 0 and 1)."""
-    return dict(chunks={kind: [1 if value else 0 for value in save["chunks"][kind][1]] if WIDTH[kind] == 1 else list(save["chunks"][kind][1])
-                        for kind in SHARED_ORDER},
-                bestiary={which: list(save["bestiary"][which]) for which in SHARED_MAPS})
-
-
 def difference(expected, actual):
     """Where two shared views differ: {part: [(index or key, expected, actual), ...]}. Achievements 0 to 31 are reported as
     the part 'firstBytes': in a dump of the game they are the four bytes a released buffer loses to the allocator."""
@@ -222,10 +242,19 @@ def main():
     dump = commands.add_parser("shared", help="the same for a shared save dumped by the game (sharedsave_begin.dat)"); dump.add_argument("file", type=Path)
     merged = commands.add_parser("merge", help="the save a lobby shares, by the game's own rule")
     merged.add_argument("--output", type=Path, required=True); merged.add_argument("files", type=Path, nargs="+", help="the host's save first")
+    laid = commands.add_parser("overlay", help="a member's save for the match: a shared save laid over the member's own")
+    laid.add_argument("--shared", type=Path, required=True, help="the shared save in the game's packed form")
+    laid.add_argument("--output", type=Path, required=True); laid.add_argument("file", type=Path, help="the member's own save")
     compared = commands.add_parser("compare", help="a shared save dumped by the game against the merge of its members' saves")
     compared.add_argument("--shared", type=Path, required=True, help="sharedsave_begin.dat of the session")
     compared.add_argument("files", type=Path, nargs="+", help="every member's save as it was before the session")
     args = parser.parse_args()
+    if args.command == "overlay":
+        if args.output.exists():
+            raise SystemExit("The output file exists; a save is never overwritten")
+        data = build(overlay(parse(args.file.read_bytes()), decode_shared(args.shared.read_bytes()))); parse(data)
+        args.output.write_bytes(data)
+        return 0
     if args.command == "compare":
         shared = decode_shared(args.shared.read_bytes()); named = sum(1 for member in shared["members"] if member)
         if named != len(args.files):

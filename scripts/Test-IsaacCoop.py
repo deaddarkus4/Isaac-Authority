@@ -387,10 +387,18 @@ if __name__ == "__main__":
                         help="closed loop: keys go to the game of --replica-pid (the client, focused) and drive the second player of "
                              "--source-pid (the host, which must keep running without focus)")
     parser.add_argument("--check", action="store_true", help="only report whether both games share the run seed and room")
+    parser.add_argument("--lobby", type=Path, nargs=2, metavar=("HOST_SESSION", "CLIENT_SESSION"),
+                        help="session.json of the host and of the client, written by isaac_lobby.py: attach only games the lobby let into one match")
     parser.add_argument("--restart-runs", action="store_true", help="first hold R in both games to restart their seeded runs")
     parser.add_argument("--binary-directory", type=Path)
     parser.add_argument("--output-directory", type=Path)
     options = parser.parse_args()
+    if options.lobby:
+        lobby = module("isaac_lobby", "isaac_lobby.py")
+        try:
+            options.controller = lobby.admit(*(json.loads(path.read_text(encoding="utf-8")) for path in options.lobby), options.source_pid, options.replica_pid)
+        except ValueError as error:
+            parser.error(f"--lobby: {error}")
     options.predict = options.predict or options.stepped
     options.loop = options.loop or options.predict
     if options.predict and options.controller != 1:

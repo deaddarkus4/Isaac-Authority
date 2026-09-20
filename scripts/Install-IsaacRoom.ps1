@@ -37,7 +37,7 @@ foreach ($role in $modules.Keys) { $installedBase[$role] = if ($modules[$role].S
 $files = @($modules.Values | ForEach-Object { Join-Path $bin ($_ + '.dll') })
 $files += Join-Path $bin 'IsaacAuthorityAttach.exe'
 if ($modules.Contains('host')) { $files += @('Test-IsaacInput.py','isaac_input.py' | ForEach-Object { Join-Path $PSScriptRoot $_ }) }
-if ($Stage -eq 'Coop') { $files += @('Test-IsaacCoop.py','isaac_link.py' | ForEach-Object { Join-Path $PSScriptRoot $_ }) }
+if ($Stage -eq 'Coop') { $files += @('Test-IsaacCoop.py','isaac_link.py','isaac_lobby.py','isaac_save.py' | ForEach-Object { Join-Path $PSScriptRoot $_ }) }
 $files += @('Test-IsaacRoom.py','isaac_level.py','Test-IsaacWorld.py','isaac_world.py','Test-IsaacGamePair.py','Read-IsaacState.py' | ForEach-Object { Join-Path $PSScriptRoot $_ })
 foreach ($file in $files) { if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing file: $file" } }
 New-Item -ItemType Directory -Path $target -Force | Out-Null
