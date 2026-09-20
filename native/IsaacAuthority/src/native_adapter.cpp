@@ -154,20 +154,41 @@
 // Every rule of this module can be left out when it starts (the third word of the configuration, a mask in hex), so that
 // a rule that misbehaves in a live run is switched off without a rebuild.
 //
+// Transport. Until now a process outside read the published slots from both games' memory and carried them over - good for
+// measuring, impossible between two machines. The module can now send by itself: the configuration names the UDP port to
+// listen on and the neighbours (listen=PORT peer=IP:PORT ...), and after every frame the body, the own shots and - on the
+// host - the world go to every neighbour. Shots and world are packed first (only the entries in use: a room's world is
+// one to three kilobytes instead of nineteen) and cut into datagrams of at most 1200 bytes, each with a small header
+// ('IAF1', kind, chunk of chunks, sequence, size); the receiver puts a sequence together and drops one that a newer
+// sequence overtakes. Only datagrams from a named neighbour's address are taken. The game's own connection (Steam or the
+// localhost service) still carries the game's own lockstep messages; this exchange runs beside it.
+// Between Steam clients the same datagrams go through Steam instead of UDP: the game has steam_api.dll loaded, and its
+// ISteamNetworkingMessages sends a message to a user by Steam id, through whatever NAT there is (steampeer=ID64 in the
+// configuration, one per neighbour; channel 7460, so that nothing of the game's own is read away; sending to a user also
+// accepts that user's session, so no callback is needed). The flat C exports are looked up by name at start. The world
+// and the shots go out on every second update of the player - enemies and tears move 30 times a second, the player is
+// updated 60 times - which halves the traffic; the body goes out every time.
+// The own player's input is taken from the keyboard only once a neighbour's module has been heard: two players cannot
+// attach at the same instant, and a module that ran ahead alone would walk its player where the other game's unpatched
+// lockstep does not see it. The comparison of checksums is switched off at once - that alone changes nothing.
+//
 // Whatever carries the published slots to the other games - for now a relay outside, later the game's own connection -
 // delivers them as PLR1 and WLN1 datagrams to this module's loopback socket.
 //
 // %LOCALAPPDATA%\IsaacAuthority\native-<pid>.cfg, written by the harness from the game's own log: the lobby's device number
 // of the local player (2, 3, ...) and, for the game that made the lobby, the word "host".
 #include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include "profile.hpp"
 #include "vtable_slot.hpp"
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -198,7 +219,11 @@ constexpr std::uintptr_t kHealth[] = {0x1340, 0x1344, 0x1348, 0x134c, 0x1350, 0x
 constexpr int kHealthFields = 10, kDeathRetryFrames = 30;
 constexpr std::array<std::uint8_t, 10> kKillEntry{0x55, 0x8b, 0xec, 0x83, 0xec, 0x28, 0xf3, 0x0f, 0x10, 0x0d};
 constexpr std::uint32_t kBodyMagic = 0x31524c50, kWorldMagic = 0x314e4c57;  // "PLR1", "WLN1"
-constexpr int kControllers = 8, kMaxNpcs = 48, kMaxDeaths = 16, kDeathFrames = 90, kOrphanSnapshots = 20;
+constexpr std::uint32_t kFrameMagic = 0x31464149, kChunkBytes = 1184, kMaxPeers = 4;   // "IAF1"
+constexpr std::uint8_t kOfBody = 1, kOfShots = 2, kOfWorld = 3;
+constexpr int kSteamChannel = 7460, kSteamSendFlags = 1 | 32;   // unreliable, no Nagle; restart a broken session by itself
+constexpr int kControllers = 64;   // device numbers grow from match to match within one run of the game: 13 and 14 were seen under Steam
+constexpr int kMaxNpcs = 48, kMaxDeaths = 16, kDeathFrames = 90, kOrphanSnapshots = 20;
 constexpr std::uintptr_t kType = 0x28, kVariant = 0x2c, kSubtype = 0x30, kTarget = 0x334;
 // Entity_NPC, from the Lua property registration of J460.
 constexpr std::uintptr_t kState = 0xb64, kStateFrame = 0x410, kCooldown = 0xba0, kV1 = 0xbb0, kV2 = 0xbb8, kI1 = 0xbc0, kI2 = 0xbc4;
@@ -290,20 +315,22 @@ struct Shots { std::uint32_t magic, controller, sequence, room, count, bombs, pe
 struct Published { std::uint32_t magic, generation; Body body; };
 struct PublishedWorld { std::uint32_t magic, generation; World world; };
 struct PublishedShots { std::uint32_t magic, generation; Shots shots; };
+struct FrameHeader { std::uint32_t magic; std::uint8_t kind, chunk, chunks, reserved; std::uint32_t sequence, total; };
+struct SteamIdentity { std::int32_t type, size; std::uint64_t id; std::uint8_t rest[120]; };   // SteamNetworkingIdentity: type 16 is a Steam id
 struct Stats {
     std::uint32_t published, received, applied, stale, rejected, otherRoom;
     std::uint32_t worldPublished, worldReceived, worldApplied, npcMatched, npcOnlyHost, npcOnlyLocal, npcKilled, hitPointFixes, deathsHeld, npcPaired, npcRemoved;
     std::uint32_t healthFixes, copyDamageIgnored, copyDeaths, copyRevivalsMissed, roomFollows, roomFollowFailures, stateFixes, npcSpawned, npcSpawnFailures, clearsHeld, clearsFromHost;
     std::uint32_t copyRevivals, copyTouchesIgnored, taken, takenApplied, takenMissed, animationFixes, gridHeld, gridFixes, gridMismatch, fireHeld;
     std::uint32_t projectilesMade, projectilesEnded, projectilesDropped, tearsSent, tearsMade, tearsEnded, tearsDropped, fireHolds;
-    std::uint32_t dropsMade, dropsRemoved, dropsMorphed, dropsSkipped, counterFixes, doorFixes, doorMismatch, bombsMade, bombsEnded, bombsDropped, enemyBombsMade, enemyBombsEnded, enemyBombsDropped, hurtTaken, otherFloor, slotFixes, slotsMade, slotTouchesSent, slotTouchesPlayed, slotTouchesIgnored, npcPartsLeft, petsSent, petsSet, petFireHolds, gridBorn, gridRemoved, longFrames, frameMaxMs;
+    std::uint32_t dropsMade, dropsRemoved, dropsMorphed, dropsSkipped, counterFixes, doorFixes, doorMismatch, bombsMade, bombsEnded, bombsDropped, enemyBombsMade, enemyBombsEnded, enemyBombsDropped, hurtTaken, otherFloor, slotFixes, slotsMade, slotTouchesSent, slotTouchesPlayed, slotTouchesIgnored, npcPartsLeft, petsSent, petsSet, petFireHolds, gridBorn, gridRemoved, longFrames, frameMaxMs, bytesSent, bytesReceived, framesBroken;
     float correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax;
 };
 #pragma pack(pop)
 static_assert(sizeof(Taken) == 32 && sizeof(Body) == 64 + 4 * kHealthFields + kMaxTaken * 32 && sizeof(Npc) == 108 && sizeof(Pet) == 32 && sizeof(Cell) == 8 && sizeof(Shot) == 108 && sizeof(Shots) == 28 + kMaxTears * 108 + kMaxPets * 32 &&
               sizeof(Drop) == 44 && sizeof(DoorState) == 12 &&
               sizeof(SlotState) == 64 &&
-              sizeof(Born) == 12 &&
+              sizeof(Born) == 12 && sizeof(FrameHeader) == 16 && sizeof(SteamIdentity) == 136 &&
               sizeof(World) == 80 + kMaxNpcs * 108 + kMaxDeaths * 4 + kMaxCells * 8 + kMaxShots * 108 + kMaxDrops * 44 + kMaxDoors * 12 + kMaxEnemyBombs * 108 + kMaxSlots * 64 +
                                    kMaxBorn * 12 + kGridMapBytes && sizeof(Shots) != sizeof(Body), "wire layout");
 using WithDevice = int(__thiscall*)(void*, int, void*, void*, void*, int*);
@@ -324,13 +351,13 @@ using Spawn = void*(__thiscall*)(void*, std::uint32_t, std::uint32_t, const floa
 std::uintptr_t base = 0;
 void** slot = nullptr; void** playerSlot = nullptr; void** damageSlot = nullptr; void** playerDamageSlot = nullptr;
 WithDevice original = nullptr; PlayerUpdate originalPlayer = nullptr; NpcDamage originalDamage = nullptr, originalPlayerDamage = nullptr;
-std::uint32_t deathTried[8]{};  // per controller: the frame a copy was last sent to its death
-std::uint32_t aliveSeen[8]{};   // per controller: bodies in a row that said the owner lives
+std::uint32_t deathTried[kControllers]{};  // per controller: the frame a copy was last sent to its death
+std::uint32_t aliveSeen[kControllers]{};   // per controller: bodies in a row that said the owner lives
 // Takings: this game's own, numbered from 1; per remote controller the last one dealt with and since when the next is tried.
 void** pickupSlot = nullptr; Collision originalCollision = nullptr; bool applyingTaken = false;
 void** slotSlot = nullptr; Collision originalSlotCollision = nullptr; std::uint32_t touchedSlot = 0, touchedAt = 0;
 struct SlotAge { std::uint32_t seed, age; } slotAges[8]{}; std::uint32_t slotAgeCount = 0;
-Taken takenLog[kMaxTaken]{}; std::uint32_t takenTotal = 0, takenDone[8]{}, takenSince[8]{}; bool takenKnown[8]{};
+Taken takenLog[kMaxTaken]{}; std::uint32_t takenTotal = 0, takenDone[kControllers]{}, takenSince[kControllers]{}; bool takenKnown[kControllers]{};
 // Rooms: the room this game was in a frame ago, its epoch, the newest epoch heard of, and the room being followed to.
 std::uint32_t lastRoom = 0xfffffffe, roomEpoch = 0, heardEpoch = 0, followRoom = 0xfffffffe, followTried = 0; bool following = false;
 int ownController = -1; bool host = false;
@@ -350,6 +377,16 @@ std::uint64_t tearsHeardAt[kControllers]{}; std::uint32_t shotsSequence = 0;
 Inbox inbox[kControllers];
 World worldInbox{}; std::uint64_t worldAt = 0; std::uint32_t worldApplied = 0;
 SOCKET udp = INVALID_SOCKET; HANDLE worker = nullptr; bool winsock = false; unsigned short port = 0;
+sockaddr_in peers[kMaxPeers]{}; std::uint32_t peerCount = 0; std::atomic<bool> peerHeard{false};
+// Steam: the neighbours by id and the four exports of the game's steam_api.dll that carry a datagram to them and back.
+using SteamSend = int(__cdecl*)(void*, const SteamIdentity*, const void*, std::uint32_t, int, int);
+using SteamReceive = int(__cdecl*)(void*, int, void**, int);
+using SteamRelease = void(__cdecl*)(void*);
+SteamIdentity steamPeers[kMaxPeers]{}; std::uint32_t steamPeerCount = 0; void* steamMessages = nullptr;
+SteamSend steamSend = nullptr; SteamReceive steamReceive = nullptr; SteamRelease steamRelease = nullptr;
+// A sequence being put together, per neighbour and kind.
+struct Assembly { std::uint32_t sequence, total, have; std::uint8_t chunks; std::uint8_t data[sizeof(World)]; };
+Assembly assemblies[kMaxPeers][2]{};   // [neighbour][0 shots, 1 world]
 std::uint32_t sequence = 0, worldSequence = 0, frame = 0;
 // The host's memory of the room: who lived a frame ago, and who died lately (seed, frame of death).
 std::uint32_t livedRoom = 0xffffffff, lived[kMaxNpcs]{}, livedCount = 0;
@@ -372,6 +409,9 @@ std::uint8_t entryMap[kGridMapBytes]{}; std::uint32_t entryRoom = 0xffffffff; st
 bool GridHeld(); bool HostRules();
 std::uint32_t rules = kAllRules;
 inline bool On(std::uint32_t rule) { return (rules & rule) != 0; }
+// The module runs and a neighbour's module has been heard. Until then nothing of the game is changed: a module that runs in
+// one game only must leave it exactly the game its unpatched neighbour compares checksums with.
+bool Live();
 // Pickups: the seeds the host's list has brought, for how many snapshots a pickup has been out of step; the counters as
 // they were here a frame ago and until when the host's wait; per door what it was here and for how long it differs.
 std::int32_t lastCounters[3] = {-1, -1, -1}; std::uint32_t countersHeldUntil = 0;
@@ -390,7 +430,7 @@ bool Focused() {
 }
 
 int __fastcall OnInput(void* self, void*, int controller, void* reader, void* in, void* out, int* device) {
-    if (running.load(std::memory_order_acquire) && controller == ownController && Focused()) {
+    if (running.load(std::memory_order_acquire) && controller == ownController && peerHeard.load(std::memory_order_relaxed) && Focused()) {
         counters[0].fetch_add(1, std::memory_order_relaxed);
         return original(self, kKeyboard, reader, in, out, device);
     }
@@ -434,6 +474,63 @@ void AnimationOf(std::uintptr_t entity, char* name) {
     const auto size = At<std::uint32_t>(animation + 0x10), capacity = At<std::uint32_t>(animation + 0x14);
     const char* text = capacity > 0xf ? At<const char*>(animation) : reinterpret_cast<const char*>(animation);
     if (text && size && size < static_cast<std::uint32_t>(kAnimationName)) std::memcpy(name, text, size);
+}
+
+// Only what is in use, in the order of the struct: the header, then every array by its count.
+template <class T> void Put(std::uint8_t*& at, const T* from, std::uint32_t count) { std::memcpy(at, from, count * sizeof(T)); at += count * sizeof(T); }
+template <class T> bool Take(const std::uint8_t*& at, const std::uint8_t* end, T* to, std::uint32_t count, std::uint32_t most) {
+    if (count > most || static_cast<std::size_t>(end - at) < count * sizeof(T)) return false;
+    std::memcpy(to, at, count * sizeof(T)); at += count * sizeof(T); return true;
+}
+
+std::uint32_t PackWorld(const World& world, std::uint8_t* out) {
+    auto* at = out; Put(at, reinterpret_cast<const std::uint8_t*>(&world), static_cast<std::uint32_t>(offsetof(World, npcs)));
+    Put(at, world.npcs, world.count); Put(at, world.died, world.deaths); Put(at, world.grid, world.cells); Put(at, world.shot, world.shots); Put(at, world.drop, world.drops);
+    Put(at, world.door, world.doors); Put(at, world.enemyBomb, world.enemyBombs); Put(at, world.slot, world.slots); Put(at, world.bornCell, world.born);
+    Put(at, world.gridMap, kGridMapBytes);
+    return static_cast<std::uint32_t>(at - out);
+}
+
+bool UnpackWorld(const std::uint8_t* from, std::uint32_t size, World& world) {
+    const auto* at = from; const auto* end = from + size; world = World{};
+    return Take(at, end, reinterpret_cast<std::uint8_t*>(&world), static_cast<std::uint32_t>(offsetof(World, npcs)), static_cast<std::uint32_t>(offsetof(World, npcs))) &&
+        Take(at, end, world.npcs, world.count, kMaxNpcs) && Take(at, end, world.died, world.deaths, kMaxDeaths) && Take(at, end, world.grid, world.cells, kMaxCells) &&
+        Take(at, end, world.shot, world.shots, kMaxShots) && Take(at, end, world.drop, world.drops, kMaxDrops) && Take(at, end, world.door, world.doors, kMaxDoors) &&
+        Take(at, end, world.enemyBomb, world.enemyBombs, kMaxEnemyBombs) && Take(at, end, world.slot, world.slots, kMaxSlots) && Take(at, end, world.bornCell, world.born, kMaxBorn) &&
+        Take(at, end, world.gridMap, kGridMapBytes, kGridMapBytes) && at == end;
+}
+
+std::uint32_t PackShots(const Shots& shots, std::uint8_t* out) {
+    auto* at = out; Put(at, reinterpret_cast<const std::uint8_t*>(&shots), static_cast<std::uint32_t>(offsetof(Shots, shot)));
+    Put(at, shots.shot, shots.count + shots.bombs); Put(at, shots.pet, shots.pets);
+    return static_cast<std::uint32_t>(at - out);
+}
+
+bool UnpackShots(const std::uint8_t* from, std::uint32_t size, Shots& shots) {
+    const auto* at = from; const auto* end = from + size; shots = Shots{};
+    return Take(at, end, reinterpret_cast<std::uint8_t*>(&shots), static_cast<std::uint32_t>(offsetof(Shots, shot)), static_cast<std::uint32_t>(offsetof(Shots, shot))) &&
+        shots.count <= kMaxTears && shots.bombs <= kMaxTears && Take(at, end, shots.shot, shots.count + shots.bombs, kMaxTears) && Take(at, end, shots.pet, shots.pets, kMaxPets) && at == end;
+}
+
+// To every neighbour, in datagrams of at most kChunkBytes. Nothing is sent without neighbours: then a process outside carries the slots.
+void SendAll(std::uint8_t kind, std::uint32_t number, const std::uint8_t* payload, std::uint32_t size) {
+    if ((!peerCount && !steamPeerCount) || !size) return;
+    const std::uint32_t chunks = (size + kChunkBytes - 1) / kChunkBytes;
+    if (chunks > 31) return;
+    std::uint8_t datagram[sizeof(FrameHeader) + kChunkBytes];
+    for (std::uint32_t c = 0; c < chunks; ++c) {
+        const std::uint32_t from = c * kChunkBytes, part = size - from < kChunkBytes ? size - from : kChunkBytes;
+        const FrameHeader header{kFrameMagic, kind, static_cast<std::uint8_t>(c), static_cast<std::uint8_t>(chunks), 0, number, size};
+        std::memcpy(datagram, &header, sizeof(header)); std::memcpy(datagram + sizeof(header), payload + from, part);
+        for (std::uint32_t n = 0; n < peerCount && udp != INVALID_SOCKET; ++n) {
+            sendto(udp, reinterpret_cast<const char*>(datagram), static_cast<int>(sizeof(header) + part), 0, reinterpret_cast<const sockaddr*>(&peers[n]), sizeof(peers[n]));
+            stats.bytesSent += static_cast<std::uint32_t>(sizeof(header) + part);
+        }
+        for (std::uint32_t n = 0; n < steamPeerCount && steamMessages; ++n) {
+            steamSend(steamMessages, &steamPeers[n], datagram, static_cast<std::uint32_t>(sizeof(header) + part), kSteamSendFlags, kSteamChannel);
+            stats.bytesSent += static_cast<std::uint32_t>(sizeof(header) + part);
+        }
+    }
 }
 
 bool Knows(const Known& known, std::uint32_t seed) { for (const auto s : known.seeds) if (s == seed) return true; return false; }
@@ -579,6 +676,7 @@ void PublishShots(std::uintptr_t player, std::uintptr_t room, std::uint32_t room
     stats.petsSent += shots.pets;
     stats.tearsSent += shots.count;
     publishedShots.generation++;
+    if ((peerCount || steamPeerCount) && frame % 2 == 0) { static std::uint8_t packed[sizeof(Shots)]; SendAll(kOfShots, shots.sequence, packed, PackShots(shots, packed)); }
 }
 
 // A remote player's tears over its copy's, and the copy's own fire held while they come.
@@ -725,6 +823,7 @@ void PublishWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t room
     }
     publishedWorld.generation++;
     stats.worldPublished++;
+    if ((peerCount || steamPeerCount) && frame % 2 == 0) { static std::uint8_t packed[sizeof(World)]; SendAll(kOfWorld, world.sequence, packed, PackWorld(world, packed)); }
 }
 
 // Guest: the host's grid over the local one, by the game's own Destroy; poop and TNT on their way by their state.
@@ -1036,7 +1135,7 @@ bool Same(const Shape& a, const Shape& b) {
 
 bool __fastcall OnPickupCollision(void* self, void*, void* collider, std::uint32_t low) {
     const auto other = reinterpret_cast<std::uintptr_t>(collider);
-    if (!running.load(std::memory_order_acquire) || !On(kTaken) || applyingTaken || !other || At<std::uintptr_t>(other) != base + kPlayerTable)
+    if (!Live() || !On(kTaken) || applyingTaken || !other || At<std::uintptr_t>(other) != base + kPlayerTable)
         return originalCollision(self, collider, low);
     if (At<int>(other + kController) != ownController) { stats.copyTouchesIgnored++; return false; }
     const auto pickup = reinterpret_cast<std::uintptr_t>(self); const Shape before = ShapeOf(pickup);
@@ -1053,7 +1152,7 @@ bool __fastcall OnPickupCollision(void* self, void*, void* collider, std::uint32
 
 bool __fastcall OnSlotCollision(void* self, void*, void* collider, std::uint32_t low) {
     const auto other = reinterpret_cast<std::uintptr_t>(collider);
-    if (!running.load(std::memory_order_acquire) || !On(kSlotsRule) || applyingTaken || !other || At<std::uintptr_t>(other) != base + kPlayerTable)
+    if (!Live() || !On(kSlotsRule) || applyingTaken || !other || At<std::uintptr_t>(other) != base + kPlayerTable)
         return originalSlotCollision(self, collider, low);
     if (At<int>(other + kController) != ownController) { stats.slotTouchesIgnored++; return false; }   // a copy: its owner's game says when it touches
     if (host || !HostRules()) return originalSlotCollision(self, collider, low);                         // the host's own player, or a guest on its own
@@ -1190,6 +1289,7 @@ void AfterUpdate(std::uintptr_t player) noexcept {
             for (int h = 0; h < kHealthFields; ++h) published.body.health[h] = At<std::int32_t>(player + kHealth[h]);
             published.generation++;
             stats.published++;
+            if (peerCount || steamPeerCount) SendAll(kOfBody, published.body.sequence, reinterpret_cast<const std::uint8_t*>(&published.body), sizeof(Body));
             if (room) { PublishShots(player, room, roomIndex); if (host) PublishWorld(player, room, roomIndex); else ApplyWorld(player, room, roomIndex); }
             return;
         }
@@ -1242,7 +1342,7 @@ void __fastcall OnPlayer(void* object, void*) {
 }
 
 char __fastcall OnNpcDamage(void* self, void*, float damage, std::uint32_t flagsLow, std::uint32_t flagsHigh, void* source, int countdown) {
-    if (running.load(std::memory_order_acquire) && !host) {
+    if (Live() && !host) {
         const auto entity = reinterpret_cast<std::uintptr_t>(self); const float hitPoints = At<float>(entity + kHitPoints);
         if (At<std::uint32_t>(entity + kType) == kFireplace && On(kFire) && HostRules()) { stats.fireHeld++; return 0; }
         if (At<float>(entity + kMaxHitPoints) > 0 && damage >= hitPoints) { damage = hitPoints > 0.02f ? hitPoints - 0.01f : 0.0f; stats.deathsHeld++; }
@@ -1251,7 +1351,7 @@ char __fastcall OnNpcDamage(void* self, void*, float damage, std::uint32_t flags
 }
 
 char __fastcall OnPlayerDamage(void* self, void*, float damage, std::uint32_t flagsLow, std::uint32_t flagsHigh, void* source, int countdown) {
-    if (running.load(std::memory_order_acquire) && At<int>(reinterpret_cast<std::uintptr_t>(self) + kController) != ownController) {
+    if (Live() && At<int>(reinterpret_cast<std::uintptr_t>(self) + kController) != ownController) {
         stats.copyDamageIgnored++;
         return 0;
     }
@@ -1259,6 +1359,8 @@ char __fastcall OnPlayerDamage(void* self, void*, float damage, std::uint32_t fl
 }
 
 // A guest's own breaking waits for the host's word, as its clearing does.
+bool Live() { return running.load(std::memory_order_acquire) && peerHeard.load(std::memory_order_relaxed); }
+
 bool HostRules() {
     if (!running.load(std::memory_order_acquire) || host) return false;
     const auto game = At<std::uintptr_t>(base + kGame);
@@ -1351,36 +1453,121 @@ bool ValidWorld(const World& world, int got) {
     return true;
 }
 
+std::filesystem::path Folder();
+
+bool DeliverBody(const Body& body) {
+    const bool valid = body.magic == kBodyMagic && body.controller < kControllers && body.sequence &&
+        static_cast<int>(body.controller) != ownController && Finite(body.position) && Finite(body.velocity);
+    if (!valid) return false;
+    AcquireSRWLockExclusive(&inboxLock);
+    if (body.sequence > inbox[body.controller].body.sequence) { inbox[body.controller].body = body; inbox[body.controller].at = GetTickCount64(); inbox[body.controller].arrivedUs = NowUs(); stats.received++; }
+    ReleaseSRWLockExclusive(&inboxLock);
+    return true;
+}
+
+bool DeliverShots(const Shots& shots) {
+    bool valid = shots.magic == kShotsMagic && shots.controller < kControllers && shots.sequence && static_cast<int>(shots.controller) != ownController &&
+        shots.count <= kMaxTears && shots.bombs <= kMaxTears && shots.count + shots.bombs <= kMaxTears && shots.pets <= kMaxPets;
+    for (std::uint32_t n = 0; valid && n < shots.pets; ++n) valid = Finite(shots.pet[n].position) && Finite(shots.pet[n].velocity);
+    for (std::uint32_t n = 0; valid && n < shots.count + shots.bombs; ++n) valid = ValidShot(shots.shot[n]);
+    if (!valid) return false;
+    AcquireSRWLockExclusive(&inboxLock);
+    auto& box = shotsInbox[shots.controller];
+    if (shots.sequence > box.shots.sequence) { box.shots = shots; box.at = GetTickCount64(); }
+    ReleaseSRWLockExclusive(&inboxLock);
+    return true;
+}
+
+bool DeliverWorld(const World& world) {
+    if (host || !ValidWorld(world, sizeof(World))) return false;   // the host takes nobody's world
+    AcquireSRWLockExclusive(&inboxLock);
+    if (world.sequence > worldInbox.sequence) { worldInbox = world; worldAt = GetTickCount64(); stats.worldReceived++; }
+    ReleaseSRWLockExclusive(&inboxLock);
+    return true;
+}
+
+// One datagram of a frame from neighbour n: a whole body, or a chunk of packed shots or of a packed world.
+bool TakeChunk(std::uint32_t n, const std::uint8_t* datagram, int got) {
+    FrameHeader header; std::memcpy(&header, datagram, sizeof(header));
+    const auto* payload = datagram + sizeof(header); const auto part = static_cast<std::uint32_t>(got) - static_cast<std::uint32_t>(sizeof(header));
+    if (header.kind == kOfBody) {
+        if (header.chunks != 1 || part != sizeof(Body)) return false;
+        Body body; std::memcpy(&body, payload, sizeof(body)); return DeliverBody(body);
+    }
+    if ((header.kind != kOfShots && header.kind != kOfWorld) || !header.chunks || header.chunks > 31 || header.chunk >= header.chunks || !header.total ||
+        header.total > (header.kind == kOfWorld ? sizeof(World) : sizeof(Shots)) || part > kChunkBytes) return false;
+    const std::uint32_t from = header.chunk * kChunkBytes;
+    if (from + part > header.total || (header.chunk + 1u < header.chunks && part != kChunkBytes) || (header.chunk + 1u == header.chunks && from + part != header.total)) return false;
+    auto& assembly = assemblies[n][header.kind == kOfWorld ? 1 : 0];
+    if (header.sequence < assembly.sequence) return true;   // overtaken
+    if (header.sequence > assembly.sequence || header.total != assembly.total || header.chunks != assembly.chunks) {
+        if (assembly.sequence && assembly.have && assembly.have != (1u << assembly.chunks) - 1u) stats.framesBroken++;
+        assembly.sequence = header.sequence; assembly.total = header.total; assembly.chunks = header.chunks; assembly.have = 0;
+    }
+    std::memcpy(assembly.data + from, payload, part); assembly.have |= 1u << header.chunk;
+    if (assembly.have != (1u << header.chunks) - 1u) return true;
+    assembly.have = 0;   // whole: once
+    if (header.kind == kOfWorld) { static World world; return UnpackWorld(assembly.data, assembly.total, world) && DeliverWorld(world); }
+    static Shots shots; return UnpackShots(assembly.data, assembly.total, shots) && DeliverShots(shots);
+}
+
+// Steam's messages of our channel: each is one datagram of a frame. SteamNetworkingMessage_t: data +0, size +4, the sender's identity +12 (its Steam id +20).
+void ReceiveFromSteam() {
+    void* messages[32];
+    const int count = steamReceive(steamMessages, kSteamChannel, messages, 32);
+    for (int m = 0; m < count; ++m) {
+        const auto at = reinterpret_cast<std::uintptr_t>(messages[m]);
+        const auto* data = At<const std::uint8_t*>(at); const int size = At<int>(at + 4); const auto sender = At<std::uint64_t>(at + 20);
+        std::uint32_t n = 0;
+        while (n < steamPeerCount && steamPeers[n].id != sender) ++n;
+        if (n == steamPeerCount && steamPeerCount == 1) n = 0;   // one neighbour: Steam delivers only from a user this game sends to, whatever this build's message layout
+        std::uint32_t magic = 0; if (data && size > static_cast<int>(sizeof(FrameHeader))) std::memcpy(&magic, data, 4);
+        if (size > 0) stats.bytesReceived += static_cast<std::uint32_t>(size);
+        if (n < steamPeerCount && magic == kFrameMagic && size <= static_cast<int>(sizeof(FrameHeader) + kChunkBytes) && TakeChunk(n, data, size)) peerHeard.store(true, std::memory_order_relaxed);
+        else stats.rejected++;
+        steamRelease(messages[m]);
+    }
+    if (count <= 0) Sleep(1);
+}
+
+// For a start without a harness: one line every two seconds beside the configuration - is the neighbour heard, how much goes either way.
+void WriteStatus() {
+    static std::uint64_t written = 0; const auto now = GetTickCount64();
+    if (now - written < 2000) return;
+    written = now;
+    try {
+        std::ofstream status(Folder() / (L"native-" + std::to_wstring(GetCurrentProcessId()) + L".status"), std::ios::trunc);
+        status << "neighbour heard: " << (peerHeard.load() ? "yes" : "NO") << "; sent " << stats.bytesSent / 1024 << " KB, received " << stats.bytesReceived / 1024
+               << " KB; bodies applied " << stats.applied << ", worlds applied " << stats.worldApplied << "; faults " << stats.rejected << ", frames lost in pieces " << stats.framesBroken
+               << ", frames over 45 ms " << stats.longFrames << " of " << stats.published << "\n";
+    } catch (...) {}
+}
+
 DWORD WINAPI Receive(void*) noexcept {
     static char packet[sizeof(World)];
     while (running.load(std::memory_order_acquire)) {
+        WriteStatus();
+        if (steamPeerCount) { ReceiveFromSteam(); continue; }
         fd_set set; FD_ZERO(&set); FD_SET(udp, &set); timeval wait{0, 50000};
         if (select(0, &set, nullptr, nullptr, &wait) <= 0) continue;
-        const int got = recv(udp, packet, sizeof(packet), 0);
-        if (got == sizeof(Body)) {
-            Body body; std::memcpy(&body, packet, sizeof(body));
-            const bool valid = body.magic == kBodyMagic && body.controller < kControllers && body.sequence &&
-                static_cast<int>(body.controller) != ownController && Finite(body.position) && Finite(body.velocity);
-            if (!valid) { stats.rejected++; continue; }
-            AcquireSRWLockExclusive(&inboxLock);
-            if (body.sequence > inbox[body.controller].body.sequence) { inbox[body.controller].body = body; inbox[body.controller].at = GetTickCount64(); inbox[body.controller].arrivedUs = NowUs(); stats.received++; }
-            ReleaseSRWLockExclusive(&inboxLock);
+        sockaddr_in sender{}; int senderSize = sizeof(sender);
+        const int got = recvfrom(udp, packet, sizeof(packet), 0, reinterpret_cast<sockaddr*>(&sender), &senderSize);
+        if (got <= 0) continue;
+        stats.bytesReceived += static_cast<std::uint32_t>(got);
+        bool taken = false;
+        if (peerCount) {   // neighbours are named: only their frames count, whoever else may reach the port
+            std::uint32_t n = 0;
+            while (n < peerCount && peers[n].sin_addr.s_addr != sender.sin_addr.s_addr) ++n;
+            std::uint32_t magic = 0; if (got > static_cast<int>(sizeof(FrameHeader))) std::memcpy(&magic, packet, 4);
+            taken = n < peerCount && magic == kFrameMagic && TakeChunk(n, reinterpret_cast<const std::uint8_t*>(packet), got);
+        } else if (got == sizeof(Body)) {   // whole slots, carried by a process outside
+            Body body; std::memcpy(&body, packet, sizeof(body)); taken = DeliverBody(body);
         } else if (got == sizeof(Shots)) {
-            const auto* shots = reinterpret_cast<const Shots*>(packet);
-            bool valid = shots->magic == kShotsMagic && shots->controller < kControllers && shots->sequence && static_cast<int>(shots->controller) != ownController &&
-                shots->count <= kMaxTears && shots->bombs <= kMaxTears && shots->count + shots->bombs <= kMaxTears && shots->pets <= kMaxPets;
-            for (std::uint32_t n = 0; valid && n < shots->pets; ++n) valid = Finite(shots->pet[n].position) && Finite(shots->pet[n].velocity);
-            for (std::uint32_t n = 0; valid && n < shots->count + shots->bombs; ++n) valid = ValidShot(shots->shot[n]);
-            if (!valid) { stats.rejected++; continue; }
-            AcquireSRWLockExclusive(&inboxLock);
-            auto& box = shotsInbox[shots->controller];
-            if (shots->sequence > box.shots.sequence) { std::memcpy(&box.shots, packet, sizeof(Shots)); box.at = GetTickCount64(); }
-            ReleaseSRWLockExclusive(&inboxLock);
-        } else if (!host && ValidWorld(*reinterpret_cast<const World*>(packet), got)) {   // the host takes nobody's world
-            AcquireSRWLockExclusive(&inboxLock);
-            if (reinterpret_cast<const World*>(packet)->sequence > worldInbox.sequence) { std::memcpy(&worldInbox, packet, sizeof(World)); worldAt = GetTickCount64(); stats.worldReceived++; }
-            ReleaseSRWLockExclusive(&inboxLock);
-        } else stats.rejected++;
+            static Shots shots; std::memcpy(&shots, packet, sizeof(shots)); taken = DeliverShots(shots);
+        } else if (got == sizeof(World)) {
+            static World world; std::memcpy(&world, packet, sizeof(world)); taken = DeliverWorld(world);
+        }
+        if (taken) peerHeard.store(true, std::memory_order_relaxed); else stats.rejected++;
     }
     return 0;
 }
@@ -1417,13 +1604,40 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
         wchar_t image[32768]{};
         if (!GetModuleFileNameW(nullptr, image, 32768) || !isaac_probe::AnalyzeBytes(isaac_probe::ReadFile(image)).supported) throw static_cast<DWORD>(ERROR_BAD_EXE_FORMAT);
         base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
-        if (std::memcmp(reinterpret_cast<const char*>(base + kSaveLeaf), kIsolated, sizeof(kIsolated) - 1) != 0) throw static_cast<DWORD>(ERROR_ACCESS_DENIED);
         const auto folder = Folder();
         std::ifstream config(folder / (L"native-" + std::to_wstring(GetCurrentProcessId()) + L".cfg"));
         int controller = -1; std::string role;
         if (!(config >> controller) || controller < 1 || controller >= kControllers) throw static_cast<DWORD>(ERROR_BAD_CONFIGURATION);
         config >> role;
         std::uint32_t mask = kAllRules; if (!(config >> std::hex >> mask)) mask = kAllRules;
+        // Then, in any order: listen=PORT, peer=IP:PORT (up to four), steam - the word without which only an isolated test instance is touched.
+        unsigned short listenOn = 0; bool anywhere = false, outsideTests = false; peerCount = 0; steamPeerCount = 0; steamMessages = nullptr; config.clear();
+        for (std::string word; config >> word;) {
+            if (word == "steam") outsideTests = true;
+            else if (word.rfind("steampeer=", 0) == 0 && steamPeerCount < kMaxPeers) {
+                SteamIdentity identity{}; identity.type = 16; identity.size = 8; identity.id = std::strtoull(word.c_str() + 10, nullptr, 10);
+                if (!identity.id) throw static_cast<DWORD>(ERROR_BAD_CONFIGURATION);
+                steamPeers[steamPeerCount++] = identity;
+            }
+            else if (word.rfind("listen=", 0) == 0) listenOn = static_cast<unsigned short>(std::strtoul(word.c_str() + 7, nullptr, 10));
+            else if (word.rfind("peer=", 0) == 0 && peerCount < kMaxPeers) {
+                const auto colon = word.rfind(':'); if (colon == std::string::npos || colon < 6) throw static_cast<DWORD>(ERROR_BAD_CONFIGURATION);
+                sockaddr_in peer{}; peer.sin_family = AF_INET; peer.sin_port = htons(static_cast<unsigned short>(std::strtoul(word.c_str() + colon + 1, nullptr, 10)));
+                if (inet_pton(AF_INET, word.substr(5, colon - 5).c_str(), &peer.sin_addr) != 1 || !peer.sin_port) throw static_cast<DWORD>(ERROR_BAD_CONFIGURATION);
+                if (peer.sin_addr.s_addr != htonl(INADDR_LOOPBACK)) anywhere = true;
+                peers[peerCount++] = peer;
+            }
+        }
+        if (!outsideTests && std::memcmp(reinterpret_cast<const char*>(base + kSaveLeaf), kIsolated, sizeof(kIsolated) - 1) != 0) throw static_cast<DWORD>(ERROR_ACCESS_DENIED);
+        if (steamPeerCount) {   // the game's own steam_api.dll: nothing is loaded that the game has not loaded
+            const HMODULE steam = GetModuleHandleW(L"steam_api.dll");
+            const auto get = steam ? reinterpret_cast<void*(__cdecl*)()>(GetProcAddress(steam, "SteamAPI_SteamNetworkingMessages_SteamAPI_v002")) : nullptr;
+            steamSend = steam ? reinterpret_cast<SteamSend>(GetProcAddress(steam, "SteamAPI_ISteamNetworkingMessages_SendMessageToUser")) : nullptr;
+            steamReceive = steam ? reinterpret_cast<SteamReceive>(GetProcAddress(steam, "SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel")) : nullptr;
+            steamRelease = steam ? reinterpret_cast<SteamRelease>(GetProcAddress(steam, "SteamAPI_SteamNetworkingMessage_t_Release")) : nullptr;
+            steamMessages = get && steamSend && steamReceive && steamRelease ? get() : nullptr;
+            if (!steamMessages) throw static_cast<DWORD>(ERROR_PROC_NOT_FOUND);
+        }
         const auto table = At<std::uintptr_t>(base + kManager);
         slot = reinterpret_cast<void**>(base + kManagerTable + 29 * sizeof(void*));
         playerSlot = reinterpret_cast<void**>(base + kPlayerTable + 3 * sizeof(void*));
@@ -1450,7 +1664,8 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
         originalPlayerDamage = reinterpret_cast<NpcDamage>(*playerDamageSlot); originalCollision = reinterpret_cast<Collision>(*pickupSlot); originalSlotCollision = reinterpret_cast<Collision>(*slotSlot);
         HMODULE pinned = nullptr;
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&OnInput), &pinned)) throw GetLastError();
-        ownController = controller; host = role == "host"; rules = mask; counters[0] = 0; counters[1] = 0; stats = Stats{}; sequence = worldSequence = frame = 0;
+        ownController = controller; host = role == "host"; rules = mask; peerHeard = false;
+        for (auto& perPeer : assemblies) for (auto& assembly : perPeer) { assembly.sequence = assembly.total = assembly.have = 0; assembly.chunks = 0; } counters[0] = 0; counters[1] = 0; stats = Stats{}; sequence = worldSequence = frame = 0;
         published = Published{}; published.magic = kBodyMagic; publishedWorld = PublishedWorld{}; publishedWorld.magic = kWorldMagic;
         publishedShots = PublishedShots{}; publishedShots.magic = kShotsMagic; shotsSequence = 0; knownProjectiles = Known{}; knownDrops = Known{}; knownEnemyBombs = Known{};
         dropAgeCount = doorMemoryCount = countersHeldUntil = 0; lastCounters[0] = lastCounters[1] = lastCounters[2] = -1;
@@ -1468,7 +1683,8 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
         winsock = true; udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         // A world is some 17 KB thirty times a second: room for a second of them, so that a short stall drops none of the small packets behind them.
         if (udp != INVALID_SOCKET) { int room = 1 << 20; setsockopt(udp, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&room), sizeof(room)); }
-        sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK); int size = sizeof(address);
+        sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(anywhere ? INADDR_ANY : INADDR_LOOPBACK); address.sin_port = htons(listenOn);
+        int size = sizeof(address);
         if (udp == INVALID_SOCKET || bind(udp, reinterpret_cast<sockaddr*>(&address), sizeof(address)) || getsockname(udp, reinterpret_cast<sockaddr*>(&address), &size)) {
             const auto failure = static_cast<DWORD>(WSAGetLastError()); CloseNetwork(); throw failure;
         }
@@ -1541,7 +1757,7 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
         if (failure) { running = false; CloseNetwork(); Patch(kCompare, kCompareEntry, kCompareEqual); throw failure; }
         std::ofstream descriptor(folder / (L"native-" + std::to_wstring(GetCurrentProcessId()) + L".json"), std::ios::trunc);
         descriptor << "{\"pid\":" << GetCurrentProcessId() << ",\"role\":\"" << (host ? "native-host" : "native-guest") << "\",\"ownController\":" << ownController
-                   << ",\"rules\":" << rules
+                   << ",\"rules\":" << rules << ",\"peers\":" << peerCount << ",\"steamPeers\":" << steamPeerCount
                    << ",\"counters\":" << reinterpret_cast<std::uintptr_t>(&counters) << ",\"port\":" << port
                    << ",\"published\":" << reinterpret_cast<std::uintptr_t>(&published) << ",\"publishedBytes\":" << sizeof(published)
                    << ",\"publishedWorld\":" << reinterpret_cast<std::uintptr_t>(&publishedWorld) << ",\"publishedWorldBytes\":" << sizeof(publishedWorld)
