@@ -120,6 +120,10 @@
         "tool": "scripts/isaac_save.py compare --shared <sharedsave_begin.dat> <member saves>"
       }
     },
-    "report": "docs/j460-lobby-save.md"
+    "report": "docs/j460-lobby-save.md",
+    "oneStepLobby": {
+      "tool": "scripts/Start-IsaacLobby.ps1 -Saves <host save>,<guest save> [-MergeOnly]",
+      "validation": "user's save (90 achievements) and a friend's copy (223) share 86; two instances from the one merged file accepted it (no checksum complaint), typed seed CZH4 8E6W, hard: 0 of 15 rooms differ, same curse; the full stepped-prediction coop pipeline passed on the pair (449 of 449 commands, prediction error 0 over 406 reconciliations, no teleport, hooks restored)"
+    }
   }
 }
