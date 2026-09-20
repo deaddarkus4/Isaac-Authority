@@ -32,6 +32,9 @@ New-Item -ItemType Directory -Path $working,$save | Out-Null
 if ($GameArguments -contains '--localhost_match') { New-Item -ItemType Directory -Path (Join-Path $save 'localhost') | Out-Null }
 New-Item -ItemType Junction -Path (Join-Path $working 'resources') -Target (Join-Path $gameDirectory 'resources') | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $working 'mods'),(Join-Path $working 'data') | Out-Null
+# OnlineInputDelay (1..5 frames, the game's default is 3) is how far ahead the game's own online schedules input, that is how
+# long a frame can do without waiting for a neighbour's input. 5: the native module reads the own player from the keyboard
+# directly, so the delay is not felt, and measured frame hitches come from that waiting.
 $options = @"
 [Options]
 SteamCloud=0
@@ -47,6 +50,7 @@ WindowPosY=$WindowPosY
 MusicVolume=0
 SFXVolume=0
 EnableEpicOverlay=0
+OnlineInputDelay=5
 AcceptedPublicBeta_v1.9.7.17=1
 AcceptedDataCollectionDisclaimer=1
 "@

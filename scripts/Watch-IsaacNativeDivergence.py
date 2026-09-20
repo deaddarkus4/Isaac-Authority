@@ -74,7 +74,8 @@ def differences(host, guest):
     for title, key in (("enemies", "enemies"), ("pickups", "pickups"), ("slots", "slots")):
         a, b = host[key], guest[key]
         only_host = sorted(a[s][0] for s in a if s not in b); only_guest = sorted(b[s][0] for s in b if s not in a)
-        if only_host or only_guest:
+        # Enemies born in a fight get another seed in each game and are paired by kind in the module: equal kinds are no difference.
+        if (only_host or only_guest) and not (key == "enemies" and only_host == only_guest):
             found.add(f"{title}: only at host {only_host[:8]}, only at guest {only_guest[:8]}")
         for seed in a.keys() & b.keys():
             if key == "enemies" and (a[seed][0] != b[seed][0] or abs(a[seed][1] - b[seed][1]) > 0.05):
