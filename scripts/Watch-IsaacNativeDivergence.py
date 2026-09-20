@@ -28,7 +28,7 @@ HEARTS = (0x1340, 0x1344, 0x1348, 0x134c, 0x1350, 0x1d88, 0x1da4, 0x194c)
 
 def snapshot(process):
     u32 = lambda a: struct.unpack("<I", process.read(a, 4))[0]
-    game = u32(process.base + level.GAME_RVA); room = u32(game + 0x18300); state = dict(room=u32(game + 0x18304), enemies={}, pickups={}, slots={}, grid={}, players={}, counters=None)
+    game = u32(process.base + level.GAME_RVA); room = u32(game + 0x18300); state = dict(floor=(u32(game), u32(game + 4)), room=u32(game + 0x18304), enemies={}, pickups={}, slots={}, grid={}, players={}, counters=None)
     if not room:
         return state
     descriptor = u32(room + 4); state["clear"] = u32(descriptor + 0x44) & 1 if descriptor else None
@@ -59,6 +59,8 @@ def snapshot(process):
 
 def differences(host, guest):
     """A set of short statements; equal statements across checks are what counts as lasting."""
+    if host["floor"] != guest["floor"]:
+        return {f"FLOORS: host on {host['floor']}, guest on {guest['floor']}"}
     if host["room"] != guest["room"]:
         return {f"rooms: host in {host['room']}, guest in {guest['room']}"}
     found = set()

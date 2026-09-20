@@ -119,6 +119,9 @@
 //   game: it rose in the middle of two fights of twelve) and which feeds the devil deal. The host ignores blows to its
 //   copies, so it would believe that nobody was hurt: every body carries its game's byte, the host raises its own when a
 //   guest's is up, and the guests raise theirs by the host's. Never lowered: the game does that itself.
+// - the floor. A room index means a room of one floor only: every body and the world name the floor (the game's stage and
+//   stage type, Game+0 and +4), and nothing of another floor is applied - neither a place nor the host's lists, which
+//   would empty a room that merely shares the number. Following to another floor is not done yet, only counted.
 // Every rule of this module can be left out when it starts (the third word of the configuration, a mask in hex), so that
 // a rule that misbehaves in a live run is switched off without a rebuild.
 //
@@ -223,7 +226,7 @@ constexpr int kMaxTaken = 8, kTakenRetryFrames = 30, kAliveBodies = 5; constexpr
 struct Taken { std::uint32_t number, room, seed, variant, subtype, low; float position[2]; };
 struct Body {
     std::uint32_t magic, controller, sequence, room; float position[2], velocity[2]; std::uint32_t ghost; std::int32_t health[kHealthFields];
-    std::uint32_t dimension, roomEpoch, host, dying, takenTotal, hurt; Taken taken[kMaxTaken];
+    std::uint32_t dimension, roomEpoch, host, dying, takenTotal, hurt, floor; Taken taken[kMaxTaken];
 };
 struct Npc {
     std::uint32_t seed, type, variant, subtype; float position[2], velocity[2], hitPoints;
@@ -238,7 +241,7 @@ struct Shot {
 struct Drop { std::uint32_t seed, variant, subtype; float position[2], velocity[2]; std::int32_t price, timeout, options, shopItemId; };
 struct DoorState { std::uint16_t cell; std::uint8_t busted, reserved; std::int32_t variant, state; };
 struct World {
-    std::uint32_t magic, sequence, room, count, deaths, clear, cells, shots, drops, dropsTotal, doors, npcTotal, hurt, enemyBombs; std::int32_t coins, bombs, keys;
+    std::uint32_t magic, sequence, room, count, deaths, clear, cells, shots, drops, dropsTotal, doors, npcTotal, hurt, enemyBombs, floor; std::int32_t coins, bombs, keys;
     Npc npcs[kMaxNpcs]; std::uint32_t died[kMaxDeaths]; Cell grid[kMaxCells]; Shot shot[kMaxShots]; Drop drop[kMaxDrops]; DoorState door[kMaxDoors]; Shot enemyBomb[kMaxEnemyBombs];
 };
 // Tears first, then bombs. A bomb in a Shot: height = frames to the explosion, fallingSpeed = radius multiplier,
@@ -254,13 +257,13 @@ struct Stats {
     std::uint32_t healthFixes, copyDamageIgnored, copyDeaths, copyRevivalsMissed, roomFollows, roomFollowFailures, stateFixes, npcSpawned, npcSpawnFailures, clearsHeld, clearsFromHost;
     std::uint32_t copyRevivals, copyTouchesIgnored, taken, takenApplied, takenMissed, animationFixes, gridHeld, gridFixes, gridMismatch, fireHeld;
     std::uint32_t projectilesMade, projectilesEnded, projectilesDropped, tearsSent, tearsMade, tearsEnded, tearsDropped, fireHolds;
-    std::uint32_t dropsMade, dropsRemoved, dropsMorphed, dropsSkipped, counterFixes, doorFixes, doorMismatch, bombsMade, bombsEnded, bombsDropped, enemyBombsMade, enemyBombsEnded, enemyBombsDropped, hurtTaken;
+    std::uint32_t dropsMade, dropsRemoved, dropsMorphed, dropsSkipped, counterFixes, doorFixes, doorMismatch, bombsMade, bombsEnded, bombsDropped, enemyBombsMade, enemyBombsEnded, enemyBombsDropped, hurtTaken, otherFloor;
     float correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax;
 };
 #pragma pack(pop)
-static_assert(sizeof(Taken) == 32 && sizeof(Body) == 60 + 4 * kHealthFields + kMaxTaken * 32 && sizeof(Npc) == 104 && sizeof(Cell) == 8 && sizeof(Shot) == 108 && sizeof(Shots) == 24 + kMaxTears * 108 &&
+static_assert(sizeof(Taken) == 32 && sizeof(Body) == 64 + 4 * kHealthFields + kMaxTaken * 32 && sizeof(Npc) == 104 && sizeof(Cell) == 8 && sizeof(Shot) == 108 && sizeof(Shots) == 24 + kMaxTears * 108 &&
               sizeof(Drop) == 44 && sizeof(DoorState) == 12 &&
-              sizeof(World) == 68 + kMaxNpcs * 104 + kMaxDeaths * 4 + kMaxCells * 8 + kMaxShots * 108 + kMaxDrops * 44 + kMaxDoors * 12 + kMaxEnemyBombs * 108 && sizeof(Shots) != sizeof(Body), "wire layout");
+              sizeof(World) == 72 + kMaxNpcs * 104 + kMaxDeaths * 4 + kMaxCells * 8 + kMaxShots * 108 + kMaxDrops * 44 + kMaxDoors * 12 + kMaxEnemyBombs * 108 && sizeof(Shots) != sizeof(Body), "wire layout");
 using WithDevice = int(__thiscall*)(void*, int, void*, void*, void*, int*);
 using PlayerUpdate = void(__thiscall*)(void*);
 using NpcDamage = char(__thiscall*)(void*, float, std::uint32_t, std::uint32_t, void*, int);
@@ -346,6 +349,9 @@ int __fastcall OnInput(void* self, void*, int controller, void* reader, void* in
     counters[1].fetch_add(1, std::memory_order_relaxed);
     return original(self, controller, reader, in, out, device);
 }
+
+// The floor as one number: the game's stage and stage type.
+std::uint32_t Floor(std::uintptr_t game) { return (*reinterpret_cast<std::uint32_t*>(game) & 0xffff) | (*reinterpret_cast<std::uint32_t*>(game + 4) << 16); }
 
 bool Finite(const float* v) { return std::isfinite(v[0]) && std::isfinite(v[1]); }
 template <class T> T& At(std::uintptr_t address) { return *reinterpret_cast<T*>(address); }
@@ -526,6 +532,7 @@ void PublishWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t room
     if (roomIndex != livedRoom) { livedRoom = roomIndex; livedCount = 0; deathCount = 0; }
     publishedWorld.generation |= 1;   // odd: being written, also after a write that never finished
     auto& world = publishedWorld.world; world.magic = kWorldMagic; world.sequence = ++worldSequence; world.room = roomIndex; world.count = 0;
+    if (const auto game = At<std::uintptr_t>(base + kGame)) world.floor = Floor(game);
     const auto descriptor = At<std::uintptr_t>(room + kDescriptor); world.clear = descriptor ? At<std::uint32_t>(descriptor + kRoomFlags) & 1 : 0;
     world.npcTotal = 0;
     for (std::uint32_t i = 0; i < count; ++i) {
@@ -728,6 +735,7 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
     if (worldInbox.sequence && worldInbox.sequence != worldApplied && GetTickCount64() - worldAt <= kFreshMs) { world = worldInbox; fresh = true; }
     ReleaseSRWLockShared(&inboxLock);
     if (!fresh) return;
+    if (const auto game = At<std::uintptr_t>(base + kGame)) if (world.floor != Floor(game)) { stats.otherFloor++; return; }
     if (world.room != roomIndex) { stats.otherRoom++; return; }
     hostClearRoom.store(world.room); hostClear.store(world.clear); hostHeardAt.store(GetTickCount64());
     if (aliasRoom != roomIndex) { aliasRoom = roomIndex; aliasCount = 0; orphanCount = 0; missingCount = 0; dropAgeCount = 0; doorMemoryCount = 0; }
@@ -912,6 +920,7 @@ void FollowRoom(std::uintptr_t game, std::uint32_t roomIndex) {
     for (const auto& box : inbox) {
         if (!box.body.sequence || GetTickCount64() - box.at > kFreshMs) continue;
         if (box.body.roomEpoch > heardEpoch) heardEpoch = box.body.roomEpoch;
+        if (box.body.floor != Floor(game)) continue;   // another floor: its room numbers are not this floor's
         const bool newer = box.body.roomEpoch > roomEpoch || (box.body.roomEpoch == roomEpoch && box.body.host && !host);
         if (newer && box.body.room != roomIndex && (!found || box.body.roomEpoch > leader.roomEpoch)) { leader = box.body; found = true; }
     }
@@ -938,7 +947,7 @@ void AfterUpdate(std::uintptr_t player) noexcept {
             if (On(kFollow)) FollowRoom(game, roomIndex);
             published.generation |= 1;   // odd: being written, also after a write that never finished
             published.body.magic = kBodyMagic; published.body.controller = static_cast<std::uint32_t>(controller); published.body.sequence = ++sequence;
-            published.body.room = roomIndex;
+            published.body.room = roomIndex; published.body.floor = Floor(game);
             std::memcpy(published.body.position, position, 8); std::memcpy(published.body.velocity, velocity, 8);
             published.body.dimension = At<std::uint32_t>(game + kDimension); published.body.roomEpoch = roomEpoch; published.body.host = host ? 1 : 0;
             published.body.ghost = At<std::uint8_t>(player + kGhost); published.body.dying = At<std::uint8_t>(player + kDead);
@@ -961,6 +970,7 @@ void AfterUpdate(std::uintptr_t player) noexcept {
         if (!body.sequence) return;
         if (!fresh) { stats.stale++; return; }
         // A body of another room is not a position in this one: around a door the two games change rooms a moment apart.
+        if (body.floor != Floor(game)) { stats.otherFloor++; return; }
         if (body.room != roomIndex) { stats.otherRoom++; return; }
         const float dx = body.position[0] - position[0], dy = body.position[1] - position[1], distance = std::sqrt(dx * dx + dy * dy);
         std::memcpy(position, body.position, 8); std::memcpy(velocity, body.velocity, 8);
@@ -1215,6 +1225,8 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
         WSADATA data{};
         if (const int started = WSAStartup(MAKEWORD(2, 2), &data)) throw static_cast<DWORD>(started);
         winsock = true; udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        // A world is some 17 KB thirty times a second: room for a second of them, so that a short stall drops none of the small packets behind them.
+        if (udp != INVALID_SOCKET) { int room = 1 << 20; setsockopt(udp, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&room), sizeof(room)); }
         sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK); int size = sizeof(address);
         if (udp == INVALID_SOCKET || bind(udp, reinterpret_cast<sockaddr*>(&address), sizeof(address)) || getsockname(udp, reinterpret_cast<sockaddr*>(&address), &size)) {
             const auto failure = static_cast<DWORD>(WSAGetLastError()); CloseNetwork(); throw failure;
