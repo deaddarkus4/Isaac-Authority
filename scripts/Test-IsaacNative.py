@@ -34,7 +34,8 @@ PUBLISHED = struct.Struct("<II4I")
 COUNTERS = ("published", "received", "applied", "stale", "rejected", "otherRoom", "worldPublished", "worldReceived", "worldApplied", "npcMatched", "npcOnlyHost",
             "npcOnlyLocal", "npcKilled", "hitPointFixes", "deathsHeld", "npcPaired", "npcRemoved",
             "healthFixes", "copyDamageIgnored", "copyDeaths", "copyRevivalsMissed", "roomFollows", "roomFollowFailures", "stateFixes", "npcSpawned", "npcSpawnFailures",
-            "clearsHeld", "clearsFromHost", "copyRevivals", "copyTouchesIgnored", "taken", "takenApplied", "takenMissed", "animationFixes", "gridHeld", "gridFixes", "gridMismatch", "fireHeld")
+            "clearsHeld", "clearsFromHost", "copyRevivals", "copyTouchesIgnored", "taken", "takenApplied", "takenMissed", "animationFixes", "gridHeld", "gridFixes", "gridMismatch", "fireHeld",
+            "projectilesMade", "projectilesEnded", "projectilesDropped", "tearsSent", "tearsMade", "tearsEnded", "tearsDropped", "fireHolds")
 STATS = struct.Struct(f"<{len(COUNTERS)}I4f"); SUM = len(COUNTERS)   # four floats follow: correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax
 folder = Path(os.environ["LOCALAPPDATA"]) / "IsaacAuthority"
 release = root / "Binaries/authority-build/Release"
@@ -92,6 +93,16 @@ def published_world(game):
     return None if first != last or first[1] & 1 or not sequence else (sequence, blob)
 
 
+def published_shots(game):
+    """A player's own tears: the same seqlock reading; nothing from a module that does not publish them."""
+    address = game["descriptor"].get("publishedShots")
+    if not address:
+        return None
+    first = struct.unpack("<II", game["relay"].read(address, 8)); blob = game["relay"].read(address + 8, game["descriptor"]["publishedShotsBytes"] - 8)
+    last = struct.unpack("<II", game["relay"].read(address, 8)); sequence = struct.unpack_from("<I", blob, 8)[0]
+    return None if first != last or first[1] & 1 or not sequence else (sequence, blob)
+
+
 def relay():
     out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     def to(port):
@@ -112,6 +123,15 @@ def relay():
                 for other in games:
                     if other is not game:
                         paths[(game["pid"], other["pid"])].send(found[1], now)
+            try:
+                shots = published_shots(game)
+            except OSError:
+                shots = None
+            if shots and shots[0] != game.get("lastShots"):
+                game["lastShots"] = shots[0]
+                for other in games:
+                    if other is not game:
+                        paths[(game["pid"], other["pid"])].send(shots[1], now)
             if game["descriptor"]["role"] == "native-host":
                 try:
                     world = published_world(game)
@@ -202,7 +222,7 @@ if args.play is not None:
             for g, a, b in zip(games, now, previous):
                 line.append(f"{g['title'][-1]}: FAULTS {a['rejected']}, bodies {a['applied'] - b['applied']} (max fix {a['correctionMax']:.1f}), enemies matched {a['npcMatched'] - b['npcMatched']}, "
                             f"paired {a['npcPaired']}, only host {a['npcOnlyHost'] - b['npcOnlyHost']}, removed {a['npcRemoved']}, killed {a['npcKilled']}, held {a['deathsHeld']}, other room {a['otherRoom'] - b['otherRoom']}; health fixes {a['healthFixes'] - b['healthFixes']}, blows to copies ignored {a['copyDamageIgnored']}, "
-                            f"copy deaths {a['copyDeaths']}, revived {a['copyRevivals']}, revivals missed {a['copyRevivalsMissed'] - b['copyRevivalsMissed']}, taken {a['taken']} / applied from others {a['takenApplied']} / missed {a['takenMissed']} (copies' touches ignored {a['copyTouchesIgnored']}), rooms followed {a['roomFollows']} (failed {a['roomFollowFailures']}), behaviour fixes {a['stateFixes'] - b['stateFixes']}, animations started {a['animationFixes'] - b['animationFixes']}, enemies created {a['npcSpawned']} (failed {a['npcSpawnFailures']}), clears held {a['clearsHeld'] - b['clearsHeld']}, clears from host {a['clearsFromHost']}, grid held {a['gridHeld']} / set from host {a['gridFixes']} / mismatch {a['gridMismatch'] - b['gridMismatch']}, blows to fireplaces held {a['fireHeld']}")
+                            f"copy deaths {a['copyDeaths']}, revived {a['copyRevivals']}, revivals missed {a['copyRevivalsMissed'] - b['copyRevivalsMissed']}, taken {a['taken']} / applied from others {a['takenApplied']} / missed {a['takenMissed']} (copies' touches ignored {a['copyTouchesIgnored']}), rooms followed {a['roomFollows']} (failed {a['roomFollowFailures']}), behaviour fixes {a['stateFixes'] - b['stateFixes']}, animations started {a['animationFixes'] - b['animationFixes']}, enemies created {a['npcSpawned']} (failed {a['npcSpawnFailures']}), clears held {a['clearsHeld'] - b['clearsHeld']}, clears from host {a['clearsFromHost']}, grid held {a['gridHeld']} / set from host {a['gridFixes']} / mismatch {a['gridMismatch'] - b['gridMismatch']}, blows to fireplaces held {a['fireHeld']}; projectiles made {a['projectilesMade']} / ended {a['projectilesEnded']} / own dropped {a['projectilesDropped']}, tears sent {a['tearsSent'] - b['tearsSent']} / made {a['tearsMade']} / ended {a['tearsEnded']} / copy's dropped {a['tearsDropped']}, fire holds {a['fireHolds'] - b['fireHolds']}")
             print(time.strftime('%H:%M:%S'), ' | '.join(line), flush=True); previous = now
     except (OSError, KeyboardInterrupt) as error:
         print('stopped:', type(error).__name__, error, flush=True)

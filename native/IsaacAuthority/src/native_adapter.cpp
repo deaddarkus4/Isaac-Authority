@@ -82,6 +82,17 @@
 // guest's blows to a fireplace do nothing while the host is heard, and the fireplace travels with the host's enemies
 // whatever its maximum is: its hit points, state and animation are the host's.
 //
+// Shots. An enemy's projectiles are the host's, a player's tears are its owner's: each game rolled them by itself, so a
+// boss's volley was there in one game and not in the other, and a tear's random effect struck for the owner and not for
+// the copy. The host's world lists its living projectiles (Entity_Projectile, table 0x764990), every game lists its own
+// player's living tears (Entity_Tear, table 0x764eac, spawned by that player) in a packet of their own, 'SHT1'. A game that
+// receives a list keeps exactly it: a shot it has is set to the owner's place, flight, size, damage, flags and colour; a
+// shot it lacks is created with the game's own Spawn under the owner's seed; a shot of its own making, which no list
+// names, is removed (the entity's own Remove, slot 10); a shot that is gone at its owner dies here (what the game's Die()
+// does: the dead flag). A shot that ended here first is not created again: the seeds a list has brought are remembered.
+// While its owner sends tears a copy does not shoot: its weapon's fire delay (player +0x13dc, else +0x13e0; +0xc) is held
+// up. Tears of familiars, lasers, knives and bombs are still every game's own.
+//
 // Whatever carries the published slots to the other games - for now a relay outside, later the game's own connection -
 // delivers them as PLR1 and WLN1 datagrams to this module's loopback socket.
 //
@@ -149,6 +160,16 @@ constexpr std::uintptr_t kGrid = 0x24, kGridType = 0x4, kGridVariant = 0x8, kGri
 constexpr std::uintptr_t kRockTable = 0x768738, kPoopTable = 0x768648, kTntTable = 0x769300, kWebTable = 0x769558;
 constexpr std::array<std::uint8_t, 8> kGridDestroyEntry{0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x2C, 0x8B, 0x01};
 constexpr std::uint32_t kGridCells = 448, kMaxCells = 96, kFireplace = 33;
+// Shots: both classes keep height +0x410, falling speed +0x414, falling acceleration +0x418 (the Lua accessors of J460).
+// Projectile: damage +0x41c, scale +0x420, flags +0x438 (64 bits). Tear: scale +0x424 through its own setter (RVA 0x276120),
+// flags +0x428 (128 bits), damage = the entity's collision damage +0x388. Any entity: who spawned it +0x3c8 (a counted
+// reference: only Spawn sets it), colour +0xf0 (the sprite's, 44 bytes).
+constexpr std::uintptr_t kProjectileTable = 0x764990, kTearTable = 0x764eac, kHeight = 0x410, kFallingSpeed = 0x414, kFallingAccel = 0x418;
+constexpr std::uintptr_t kProjectileDamage = 0x41c, kProjectileScale = 0x420, kProjectileFlags = 0x438, kTearScale = 0x424, kTearFlags = 0x428, kTearSetScale = 0x276120;
+constexpr std::uintptr_t kCollisionDamage = 0x388, kSpawner = 0x3c8, kColor = 0xf0, kWeapon = 0x13dc, kWeaponOther = 0x13e0, kFireDelay = 0xc;
+constexpr std::array<std::uint8_t, 8> kTearSetScaleEntry{0x55, 0x8B, 0xEC, 0xF3, 0x0F, 0x10, 0x45, 0x08};
+constexpr std::uint32_t kProjectile = 9, kTear = 2, kShotsMagic = 0x31544853, kMaxShots = 64, kMaxTears = 32, kKnownShots = 256, kMaxShotSpawns = 24;   // "SHT1"
+constexpr std::uint64_t kTearsHeardMs = 3000; constexpr float kHeldFireDelay = 5.0f;
 constexpr int kMaxTaken = 8, kTakenRetryFrames = 30, kAliveBodies = 5; constexpr float kTakenReach = 120.0f;
 #pragma pack(push, 1)
 struct Taken { std::uint32_t number, room, seed, variant, subtype, low; float position[2]; };
@@ -162,19 +183,30 @@ struct Npc {
     char animation[kAnimationName];   // empty: none, or a name too long to carry
 };
 struct Cell { std::uint16_t index, type; std::int32_t state; };
-struct World { std::uint32_t magic, sequence, room, count, deaths, clear, cells; Npc npcs[kMaxNpcs]; std::uint32_t died[kMaxDeaths]; Cell grid[kMaxCells]; };
+struct Shot {
+    std::uint32_t seed, variant, subtype; float position[2], velocity[2], height, fallingSpeed, fallingAccel, scale, damage;
+    std::uint64_t flags[2]; float color[11];
+};
+struct World {
+    std::uint32_t magic, sequence, room, count, deaths, clear, cells, shots;
+    Npc npcs[kMaxNpcs]; std::uint32_t died[kMaxDeaths]; Cell grid[kMaxCells]; Shot shot[kMaxShots];
+};
+struct Shots { std::uint32_t magic, controller, sequence, room, count; Shot shot[kMaxTears]; };
 // What a reader outside copies: generation is odd while the content is being written.
 struct Published { std::uint32_t magic, generation; Body body; };
 struct PublishedWorld { std::uint32_t magic, generation; World world; };
+struct PublishedShots { std::uint32_t magic, generation; Shots shots; };
 struct Stats {
     std::uint32_t published, received, applied, stale, rejected, otherRoom;
     std::uint32_t worldPublished, worldReceived, worldApplied, npcMatched, npcOnlyHost, npcOnlyLocal, npcKilled, hitPointFixes, deathsHeld, npcPaired, npcRemoved;
     std::uint32_t healthFixes, copyDamageIgnored, copyDeaths, copyRevivalsMissed, roomFollows, roomFollowFailures, stateFixes, npcSpawned, npcSpawnFailures, clearsHeld, clearsFromHost;
     std::uint32_t copyRevivals, copyTouchesIgnored, taken, takenApplied, takenMissed, animationFixes, gridHeld, gridFixes, gridMismatch, fireHeld;
+    std::uint32_t projectilesMade, projectilesEnded, projectilesDropped, tearsSent, tearsMade, tearsEnded, tearsDropped, fireHolds;
     float correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax;
 };
 #pragma pack(pop)
-static_assert(sizeof(Taken) == 32 && sizeof(Body) == 56 + 4 * kHealthFields + kMaxTaken * 32 && sizeof(Npc) == 104 && sizeof(Cell) == 8 && sizeof(World) == 28 + kMaxNpcs * 104 + kMaxDeaths * 4 + kMaxCells * 8, "wire layout");
+static_assert(sizeof(Taken) == 32 && sizeof(Body) == 56 + 4 * kHealthFields + kMaxTaken * 32 && sizeof(Npc) == 104 && sizeof(Cell) == 8 && sizeof(Shot) == 108 && sizeof(Shots) == 20 + kMaxTears * 108 &&
+              sizeof(World) == 32 + kMaxNpcs * 104 + kMaxDeaths * 4 + kMaxCells * 8 + kMaxShots * 108 && sizeof(Shots) != sizeof(Body), "wire layout");
 using WithDevice = int(__thiscall*)(void*, int, void*, void*, void*, int*);
 using PlayerUpdate = void(__thiscall*)(void*);
 using NpcDamage = char(__thiscall*)(void*, float, std::uint32_t, std::uint32_t, void*, int);
@@ -184,6 +216,7 @@ using Collision = bool(__thiscall*)(void*, void*, std::uint32_t);
 using SpritePlay = void(__thiscall*)(void*, const char*, bool);
 using GridChange = std::uint32_t(__thiscall*)(void*, std::uint32_t, void*);   // Hurt(damage, source), Destroy(immediate, source)
 using GridDestroy = void(__thiscall*)(void*, std::uint32_t);
+using TearSetScale = void(__thiscall*)(void*, float);
 using Spawn = void*(__thiscall*)(void*, std::uint32_t, std::uint32_t, const float*, const float*, void*, std::uint32_t, std::uint32_t);
 std::uintptr_t base = 0;
 void** slot = nullptr; void** playerSlot = nullptr; void** damageSlot = nullptr; void** playerDamageSlot = nullptr;
@@ -199,9 +232,15 @@ int ownController = -1; bool host = false;
 SRWLOCK lifecycle = SRWLOCK_INIT, inboxLock = SRWLOCK_INIT;
 std::atomic<bool> running{false};
 std::atomic<unsigned> counters[2]{};  // reads of the own player's input answered by the keyboard; all other reads
-Published published{}; PublishedWorld publishedWorld{};
+Published published{}; PublishedWorld publishedWorld{}; PublishedShots publishedShots{};
 Stats stats{};
 struct Inbox { Body body{}; std::uint64_t at = 0; std::uint32_t appliedSequence = 0; };
+struct ShotsInbox { Shots shots{}; std::uint64_t at = 0; std::uint32_t applied = 0; };
+ShotsInbox shotsInbox[kControllers];
+// The seeds a list has brought here: a shot of such a seed that is missing here has ended here, and is not made again.
+struct Known { std::uint32_t seeds[kKnownShots]; std::uint32_t next; };
+Known knownProjectiles{}, knownTears[kControllers]{};
+std::uint64_t tearsHeardAt[kControllers]{}; std::uint32_t shotsSequence = 0;
 Inbox inbox[kControllers];
 World worldInbox{}; std::uint64_t worldAt = 0; std::uint32_t worldApplied = 0;
 SOCKET udp = INVALID_SOCKET; HANDLE worker = nullptr; bool winsock = false; unsigned short port = 0;
@@ -263,6 +302,96 @@ void AnimationOf(std::uintptr_t entity, char* name) {
     if (text && size && size < static_cast<std::uint32_t>(kAnimationName)) std::memcpy(name, text, size);
 }
 
+bool Knows(const Known& known, std::uint32_t seed) { for (const auto s : known.seeds) if (s == seed) return true; return false; }
+void Learn(Known& known, std::uint32_t seed) { if (seed && !Knows(known, seed)) known.seeds[known.next++ % kKnownShots] = seed; }
+
+bool LivingShot(std::uintptr_t entity, bool tear) {
+    return At<std::uintptr_t>(entity) == base + (tear ? kTearTable : kProjectileTable) && At<std::uint8_t>(entity + kExists) && !At<std::uint8_t>(entity + kDead);
+}
+
+void ShotOf(std::uintptr_t entity, bool tear, Shot& shot) {
+    shot = Shot{};
+    shot.seed = At<std::uint32_t>(entity + kSeed); shot.variant = At<std::uint32_t>(entity + kVariant); shot.subtype = At<std::uint32_t>(entity + kSubtype);
+    std::memcpy(shot.position, reinterpret_cast<void*>(entity + kPosition), 8); std::memcpy(shot.velocity, reinterpret_cast<void*>(entity + kVelocity), 8);
+    shot.height = At<float>(entity + kHeight); shot.fallingSpeed = At<float>(entity + kFallingSpeed); shot.fallingAccel = At<float>(entity + kFallingAccel);
+    shot.scale = At<float>(entity + (tear ? kTearScale : kProjectileScale)); shot.damage = At<float>(entity + (tear ? kCollisionDamage : kProjectileDamage));
+    std::memcpy(shot.flags, reinterpret_cast<void*>(entity + (tear ? kTearFlags : kProjectileFlags)), tear ? 16 : 8);
+    std::memcpy(shot.color, reinterpret_cast<void*>(entity + kColor), sizeof(shot.color));
+}
+
+void ShotOnto(std::uintptr_t entity, bool tear, const Shot& shot) {
+    std::memcpy(reinterpret_cast<void*>(entity + kPosition), shot.position, 8); std::memcpy(reinterpret_cast<void*>(entity + kVelocity), shot.velocity, 8);
+    At<float>(entity + kHeight) = shot.height; At<float>(entity + kFallingSpeed) = shot.fallingSpeed; At<float>(entity + kFallingAccel) = shot.fallingAccel;
+    if (tear) {
+        if (At<float>(entity + kTearScale) != shot.scale) reinterpret_cast<TearSetScale>(base + kTearSetScale)(reinterpret_cast<void*>(entity), shot.scale);
+        At<float>(entity + kCollisionDamage) = shot.damage;
+    } else { At<float>(entity + kProjectileScale) = shot.scale; At<float>(entity + kProjectileDamage) = shot.damage; }
+    std::memcpy(reinterpret_cast<void*>(entity + (tear ? kTearFlags : kProjectileFlags)), shot.flags, tear ? 16 : 8);
+    std::memcpy(reinterpret_cast<void*>(entity + kColor), shot.color, sizeof(shot.color));
+}
+
+// This room's shots of one kind (and of one spawner, if given) made exactly the list that came.
+void ApplyShots(std::uintptr_t room, const Shot* shots, std::uint32_t count, bool tear, std::uintptr_t spawner, Known& known,
+                std::uint32_t& made, std::uint32_t& ended, std::uint32_t& dropped) {
+    const auto data = At<std::uintptr_t>(room + kListData); const auto listCount = At<std::uint32_t>(room + kListCount);
+    if (!data || listCount > 4096 || count > kMaxShots) return;
+    bool taken[kMaxShots]{}; std::uintptr_t remove[kMaxShots]; std::uint32_t removeCount = 0;
+    for (std::uint32_t i = 0; i < listCount; ++i) {
+        const auto entity = At<std::uintptr_t>(data + i * sizeof(std::uintptr_t));
+        if (!entity || !LivingShot(entity, tear) || (spawner && At<std::uintptr_t>(entity + kSpawner) != spawner)) continue;
+        const auto seed = At<std::uint32_t>(entity + kSeed); std::uint32_t n = 0;
+        while (n < count && (taken[n] || shots[n].seed != seed)) ++n;
+        if (n < count) { taken[n] = true; ShotOnto(entity, tear, shots[n]); Learn(known, seed); continue; }
+        if (Knows(known, seed)) { At<std::uint8_t>(entity + kDead) = 1; ended++; }   // gone at its owner: what the game's Die() does
+        else if (removeCount < kMaxShots) remove[removeCount++] = entity;             // of this game's own making
+    }
+    for (std::uint32_t r = 0; r < removeCount; ++r) {
+        const auto entity = remove[r]; reinterpret_cast<PlayerUpdate>(At<void**>(entity)[10])(reinterpret_cast<void*>(entity)); dropped++;
+    }
+    const auto game = At<std::uintptr_t>(base + kGame); std::uint32_t spawned = 0;
+    for (std::uint32_t n = 0; n < count && game && spawned < kMaxShotSpawns; ++n) {
+        if (taken[n] || !shots[n].seed || Knows(known, shots[n].seed)) continue;
+        Learn(known, shots[n].seed);
+        const auto entity = reinterpret_cast<std::uintptr_t>(reinterpret_cast<Spawn>(base + kSpawn)(reinterpret_cast<void*>(game), tear ? kTear : kProjectile, shots[n].variant,
+            shots[n].position, shots[n].velocity, reinterpret_cast<void*>(spawner), shots[n].subtype, shots[n].seed));
+        if (entity && LivingShot(entity, tear)) { ShotOnto(entity, tear, shots[n]); made++; ++spawned; }
+    }
+}
+
+// Every game: its own player's living tears.
+void PublishShots(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIndex) {
+    const auto data = At<std::uintptr_t>(room + kListData); const auto count = At<std::uint32_t>(room + kListCount);
+    if (!data || count > 4096) return;
+    publishedShots.generation |= 1;
+    auto& shots = publishedShots.shots; shots.magic = kShotsMagic; shots.controller = static_cast<std::uint32_t>(ownController); shots.sequence = ++shotsSequence;
+    shots.room = roomIndex; shots.count = 0;
+    for (std::uint32_t i = 0; i < count && shots.count < kMaxTears; ++i) {
+        const auto entity = At<std::uintptr_t>(data + i * sizeof(std::uintptr_t));
+        if (entity && LivingShot(entity, true) && At<std::uintptr_t>(entity + kSpawner) == player) ShotOf(entity, true, shots.shot[shots.count++]);
+    }
+    stats.tearsSent += shots.count;
+    publishedShots.generation++;
+}
+
+// A remote player's tears over its copy's, and the copy's own fire held while they come.
+void ApplyTears(std::uintptr_t player, int controller, std::uintptr_t room, std::uint32_t roomIndex) {
+    static Shots shots;   // the game's thread only
+    bool fresh = false; const auto now = GetTickCount64();
+    AcquireSRWLockShared(&inboxLock);
+    const auto& box = shotsInbox[controller];
+    if (box.shots.sequence && box.shots.sequence != box.applied && now - box.at <= kFreshMs) { shots = box.shots; fresh = true; }
+    ReleaseSRWLockShared(&inboxLock);
+    if (fresh && shots.room == roomIndex) {
+        ApplyShots(room, shots.shot, shots.count, true, player, knownTears[controller], stats.tearsMade, stats.tearsEnded, stats.tearsDropped);
+        AcquireSRWLockExclusive(&inboxLock); shotsInbox[controller].applied = shots.sequence; ReleaseSRWLockExclusive(&inboxLock);
+        if (shots.count) tearsHeardAt[controller] = now;
+    }
+    if (tearsHeardAt[controller] && now - tearsHeardAt[controller] <= kTearsHeardMs) {
+        auto weapon = At<std::uintptr_t>(player + kWeapon); if (!weapon) weapon = At<std::uintptr_t>(player + kWeaponOther);
+        if (weapon && At<float>(weapon + kFireDelay) < kHeldFireDelay) { At<float>(weapon + kFireDelay) = kHeldFireDelay; stats.fireHolds++; }
+    }
+}
+
 // 1 rock, 2 poop, 3 TNT, 4 web; 0 for every other cell.
 int GridKind(std::uintptr_t grid) {
     const auto table = At<std::uintptr_t>(grid) - base;
@@ -305,6 +434,11 @@ void PublishWorld(std::uintptr_t room, std::uint32_t roomIndex) {
     world.deaths = 0;
     for (std::uint32_t i = 0; i < kMaxDeaths && i < deathCount; ++i)
         if (frame - deaths[i].frame <= kDeathFrames) world.died[world.deaths++] = deaths[i].seed;
+    world.shots = 0;
+    for (std::uint32_t i = 0; i < count && world.shots < kMaxShots; ++i) {
+        const auto entity = At<std::uintptr_t>(data + i * sizeof(std::uintptr_t));
+        if (entity && LivingShot(entity, false)) ShotOf(entity, false, world.shot[world.shots++]);
+    }
     // The grid. More changed cells than fit: a window over them that moves with every snapshot.
     world.cells = 0; std::uint32_t changed = 0, seen = 0;
     for (std::uint32_t i = 0; i < kGridCells; ++i) { const auto grid = At<std::uintptr_t>(room + kGrid + i * 4); if (grid && GridChanged(grid)) ++changed; }
@@ -442,6 +576,7 @@ void ApplyWorld(std::uintptr_t room, std::uint32_t roomIndex) {
         reinterpret_cast<TriggerClear>(clearTrampoline)(reinterpret_cast<void*>(room), 0); stats.clearsFromHost++;
     }
     ApplyGrid(room, world);
+    ApplyShots(room, world.shot, world.shots, false, 0, knownProjectiles, stats.projectilesMade, stats.projectilesEnded, stats.projectilesDropped);
     stats.worldApplied++; worldApplied = world.sequence;
 }
 
@@ -559,10 +694,11 @@ void AfterUpdate(std::uintptr_t player) noexcept {
             for (int h = 0; h < kHealthFields; ++h) published.body.health[h] = At<std::int32_t>(player + kHealth[h]);
             published.generation++;
             stats.published++;
-            if (room) { if (host) PublishWorld(room, roomIndex); else ApplyWorld(room, roomIndex); }
+            if (room) { PublishShots(player, room, roomIndex); if (host) PublishWorld(room, roomIndex); else ApplyWorld(room, roomIndex); }
             return;
         }
         if (controller < 0 || controller >= kControllers) return;
+        if (room) ApplyTears(player, controller, room, roomIndex);
         Body body{}; bool fresh = false;
         AcquireSRWLockShared(&inboxLock);
         if (inbox[controller].body.sequence && inbox[controller].body.sequence != inbox[controller].appliedSequence) {
@@ -692,8 +828,19 @@ void UnhookClear() {
     }
 }
 
+bool ValidShot(const Shot& shot) {
+    if (!Finite(shot.position) || !Finite(shot.velocity) || !std::isfinite(shot.height) || !std::isfinite(shot.fallingSpeed) || !std::isfinite(shot.fallingAccel) ||
+        !std::isfinite(shot.scale) || !std::isfinite(shot.damage)) return false;
+    for (const float c : shot.color) if (!std::isfinite(c) || std::fabs(c) > 100.0f) return false;
+    // Far outside what a shot can be: the sender read something else (another build's layout), and nothing of it is applied.
+    return std::fabs(shot.position[0]) < 10000.0f && std::fabs(shot.position[1]) < 10000.0f && std::fabs(shot.velocity[0]) < 1000.0f && std::fabs(shot.velocity[1]) < 1000.0f &&
+        shot.height > -5000.0f && shot.height < 1000.0f && std::fabs(shot.fallingSpeed) < 1000.0f && std::fabs(shot.fallingAccel) < 100.0f &&
+        shot.scale >= 0.0f && shot.scale < 50.0f && shot.damage >= 0.0f && shot.damage < 100000.0f;
+}
+
 bool ValidWorld(const World& world, int got) {
-    if (got != sizeof(World) || world.magic != kWorldMagic || !world.sequence || world.count > kMaxNpcs || world.deaths > kMaxDeaths || world.cells > kMaxCells) return false;
+    if (got != sizeof(World) || world.magic != kWorldMagic || !world.sequence || world.count > kMaxNpcs || world.deaths > kMaxDeaths || world.cells > kMaxCells || world.shots > kMaxShots) return false;
+    for (std::uint32_t n = 0; n < world.shots; ++n) if (!ValidShot(world.shot[n])) return false;
     for (std::uint32_t n = 0; n < world.count; ++n)
         if (!Finite(world.npcs[n].position) || !Finite(world.npcs[n].velocity) || !std::isfinite(world.npcs[n].hitPoints) || world.npcs[n].animation[kAnimationName - 1]) return false;
     return true;
@@ -712,6 +859,16 @@ DWORD WINAPI Receive(void*) noexcept {
             if (!valid) { stats.rejected++; continue; }
             AcquireSRWLockExclusive(&inboxLock);
             if (body.sequence > inbox[body.controller].body.sequence) { inbox[body.controller].body = body; inbox[body.controller].at = GetTickCount64(); stats.received++; }
+            ReleaseSRWLockExclusive(&inboxLock);
+        } else if (got == sizeof(Shots)) {
+            const auto* shots = reinterpret_cast<const Shots*>(packet);
+            bool valid = shots->magic == kShotsMagic && shots->controller < kControllers && shots->sequence && static_cast<int>(shots->controller) != ownController &&
+                shots->count <= kMaxTears;
+            for (std::uint32_t n = 0; valid && n < shots->count; ++n) valid = ValidShot(shots->shot[n]);
+            if (!valid) { stats.rejected++; continue; }
+            AcquireSRWLockExclusive(&inboxLock);
+            auto& box = shotsInbox[shots->controller];
+            if (shots->sequence > box.shots.sequence) { std::memcpy(&box.shots, packet, sizeof(Shots)); box.at = GetTickCount64(); }
             ReleaseSRWLockExclusive(&inboxLock);
         } else if (!host && ValidWorld(*reinterpret_cast<const World*>(packet), got)) {   // the host takes nobody's world
             AcquireSRWLockExclusive(&inboxLock);
@@ -772,6 +929,7 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
             std::memcmp(reinterpret_cast<void*>(base + kRevive), kReviveEntry.data(), kReviveEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kSpritePlay), kSpritePlayEntry.data(), kSpritePlayEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kGridDestroy), kGridDestroyEntry.data(), kGridDestroyEntry.size()) != 0 ||
+            std::memcmp(reinterpret_cast<void*>(base + kTearSetScale), kTearSetScaleEntry.data(), kTearSetScaleEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kKill), kKillEntry.data(), kKillEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kTransition), kTransitionEntry.data(), kTransitionEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kSpawn), kSpawnEntry.data(), kSpawnEntry.size()) != 0) throw static_cast<DWORD>(ERROR_REVISION_MISMATCH);
@@ -781,6 +939,8 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
         if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN, reinterpret_cast<LPCWSTR>(&OnInput), &pinned)) throw GetLastError();
         ownController = controller; host = role == "host"; counters[0] = 0; counters[1] = 0; stats = Stats{}; sequence = worldSequence = frame = 0;
         published = Published{}; published.magic = kBodyMagic; publishedWorld = PublishedWorld{}; publishedWorld.magic = kWorldMagic;
+        publishedShots = PublishedShots{}; publishedShots.magic = kShotsMagic; shotsSequence = 0; knownProjectiles = Known{};
+        for (int c = 0; c < kControllers; ++c) { shotsInbox[c] = ShotsInbox{}; knownTears[c] = Known{}; tearsHeardAt[c] = 0; }
         for (auto& box : inbox) box = Inbox{};
         for (auto& tried : deathTried) tried = 0;
         for (int c = 0; c < kControllers; ++c) { aliveSeen[c] = takenDone[c] = takenSince[c] = 0; takenKnown[c] = false; }
@@ -856,6 +1016,7 @@ extern "C" DWORD WINAPI IsaacAuthorityNativeStart(void*) noexcept {
                    << ",\"counters\":" << reinterpret_cast<std::uintptr_t>(&counters) << ",\"port\":" << port
                    << ",\"published\":" << reinterpret_cast<std::uintptr_t>(&published) << ",\"publishedBytes\":" << sizeof(published)
                    << ",\"publishedWorld\":" << reinterpret_cast<std::uintptr_t>(&publishedWorld) << ",\"publishedWorldBytes\":" << sizeof(publishedWorld)
+                   << ",\"publishedShots\":" << reinterpret_cast<std::uintptr_t>(&publishedShots) << ",\"publishedShotsBytes\":" << sizeof(publishedShots)
                    << ",\"stats\":" << reinterpret_cast<std::uintptr_t>(&stats) << ",\"statsBytes\":" << sizeof(stats) << "}\n";
         result = ERROR_SUCCESS;
     } catch (DWORD failure) { result = failure ? failure : ERROR_INVALID_DATA; } catch (...) { result = ERROR_INVALID_DATA; }
