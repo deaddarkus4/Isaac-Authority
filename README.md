@@ -32,7 +32,7 @@
   всего: Online → Friend Match по приглашению с друзьями, у которых он стоит.
 - Если хоть у одного игрока модуля нет — матч остаётся полностью штатным: модуль ничего не меняет, даже сверку
   контрольных сумм, и через минуту перестаёт ждать. Одиночная игра, локальный кооператив и daily не затрагиваются.
-- Состояние видно в заголовке окна игры, начиная с главного меню: `Authority 0.1.1: loaded` — модуль загружен;
+- Состояние видно в заголовке окна игры, начиная с главного меню: `Authority <версия>: loaded` — модуль загружен;
   в матче — `waiting for the other players' module`, `ON, host` / `ON, guest` или `off - причина`.
 - Хост — игрок, которого игра пронумеровала первым (обычно создатель лобби). Вышел хост — хостом становится следующий;
   остались одни — модуль выключается, игра продолжается.
@@ -46,7 +46,7 @@
 powershell -ExecutionPolicy Bypass -File Install-IsaacAuthority.ps1 -Without lead,doors
 ```
 
-Правила: `follow behaviour clear taken grid fire projectiles tears drops counters doors traps bombs hurt slots pets lead`.
+Правила: `follow behaviour clear taken grid fire projectiles tears drops counters doors traps bombs hurt slots pets lead look`.
 
 ## Сборка из исходников
 
