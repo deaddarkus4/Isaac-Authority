@@ -7,6 +7,10 @@
 //
 // Unlike the other modules this one changes code: six bytes at the factory's entry become a jump to a stub that rewrites
 // the argument and runs the six original bytes. It refuses to do that anywhere but in an isolated test instance.
+//
+// It also gives the game's "local user" the identity the localhost lobby knows this game by: the game's window handle with
+// 0xfefefefe above it. With Steam running the local user carries the Steam id instead; the game then files its own save
+// under an id no lobby member has, never finds a save for its own player, and the match never starts (RVA 0x50c400).
 #include "profile.hpp"
 #include <windows.h>
 #include <array>
@@ -18,10 +22,28 @@
 
 namespace {
 constexpr std::uintptr_t kFactory = 0x629370, kSaveLeaf = 0x77e04c;
+// The local user object (its 64-bit id at +8), the GLFW window the game runs in and the word that says it is a Win32 one.
+constexpr std::uintptr_t kLocalUser = 0x873674, kWindow = 0x87999c, kPlatform = 0x873694, kWin32Handle = 0x2b4;
+constexpr std::uint32_t kWin32 = 0x60001, kLocalhostUser = 0xfefefefe;
 constexpr std::array<std::uint8_t, 6> kEntry{0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08};  // push ebx; mov ebx, esp; sub esp, 8
 constexpr char kIsolated[] = "IsaacAuthority-";
 std::uint8_t* stub = nullptr; std::uint8_t* entry = nullptr;
 volatile LONG counters[2]{};  // requests for a service; requests turned into localhost
+std::uint32_t* identity = nullptr; std::uint32_t steamIdentity[2]{};  // kept in memory only, to put it back on Stop
+
+// True when the local user now answers to the id the localhost service gives this game.
+bool Rename(std::uintptr_t base) {
+    const auto user = *reinterpret_cast<std::uint32_t**>(base + kLocalUser);
+    const auto window = *reinterpret_cast<std::uintptr_t*>(base + kWindow);
+    if (!user || !window || *reinterpret_cast<std::uint32_t*>(base + kPlatform) != kWin32) return false;
+    const auto handle = *reinterpret_cast<HWND*>(window + kWin32Handle);
+    DWORD owner = 0;
+    if (!IsWindow(handle) || !GetWindowThreadProcessId(handle, &owner) || owner != GetCurrentProcessId()) return false;
+    steamIdentity[0] = user[2]; steamIdentity[1] = user[3];
+    user[2] = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(handle)); user[3] = kLocalhostUser;
+    identity = user;
+    return true;
+}
 
 void Put(std::uint8_t*& at, std::initializer_list<std::uint8_t> bytes) { for (const auto byte : bytes) *at++ = byte; }
 void Put32(std::uint8_t*& at, std::uint32_t value) { std::memcpy(at, &value, 4); at += 4; }
@@ -70,12 +92,14 @@ extern "C" DWORD WINAPI IsaacAuthorityLocalhostStart(void*) noexcept {
         stub = code;
         const DWORD failure = Write(Jump(), kEntry);
         if (failure) { stub = nullptr; VirtualFree(code, 0, MEM_RELEASE); return failure; }
+        const bool renamed = Rename(base);
         wchar_t local[32768]{}; const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", local, 32768);
         if (n && n < 32768) {
             const auto directory = std::filesystem::path(local) / L"IsaacAuthority"; std::filesystem::create_directories(directory);
             std::ofstream descriptor(directory / (L"localhost-" + std::to_wstring(GetCurrentProcessId()) + L".json"), std::ios::trunc);
             descriptor << "{\"pid\":" << GetCurrentProcessId() << ",\"role\":\"localhost-service\",\"factoryRva\":" << kFactory
-                       << ",\"stub\":" << reinterpret_cast<std::uintptr_t>(stub) << ",\"counters\":" << reinterpret_cast<std::uintptr_t>(&counters) << "}\n";
+                       << ",\"stub\":" << reinterpret_cast<std::uintptr_t>(stub) << ",\"counters\":" << reinterpret_cast<std::uintptr_t>(&counters)
+                       << ",\"localUserRenamed\":" << (renamed ? "true" : "false") << "}\n";
         }
         return ERROR_SUCCESS;
     } catch (...) { return ERROR_INVALID_DATA; }
@@ -84,6 +108,7 @@ extern "C" DWORD WINAPI IsaacAuthorityLocalhostStart(void*) noexcept {
 extern "C" DWORD WINAPI IsaacAuthorityLocalhostStop(void*) noexcept {
     if (!stub) return ERROR_NOT_READY;
     const DWORD failure = Write(kEntry, Jump());
+    if (identity) { identity[2] = steamIdentity[0]; identity[3] = steamIdentity[1]; identity = nullptr; }
     // The stub stays allocated: a thread may still be inside it, and it is 64 bytes.
     if (!failure) stub = nullptr;
     return failure;
