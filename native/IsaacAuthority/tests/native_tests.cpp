@@ -15,7 +15,7 @@ std::unique_ptr<World> Room() {
     world->magic = kWorldMagic; world->sequence = 5; world->room = 84; world->count = 2; world->npcTotal = 2; world->deaths = 1; world->shots = 1; world->drops = 1; world->doors = 1; world->born = 1;
     world->npcs[0].seed = 11; world->npcs[0].hitPoints = 10; std::memcpy(world->npcs[0].animation, "WalkVert", 9); world->npcs[1].seed = 12; world->npcs[1].position[0] = 100;
     world->died[0] = 9; world->shot[0] = Tear(); world->drop[0].seed = 31; world->drop[0].variant = 20; world->door[0].cell = 7; world->door[0].state = 2;
-    world->bornCell[0].index = 40; world->bornCell[0].type = 14; world->gridMap[5] = 0x80; world->coins = 15;
+    world->bornCell[0].index = 40; world->bornCell[0].type = 14; world->bornCell[0].state = 250; world->gridMap[5] = 0x80; world->coins = 15;
     return world;
 }
 

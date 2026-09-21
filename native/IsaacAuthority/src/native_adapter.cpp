@@ -121,7 +121,13 @@
 //   guest's is up, and the guests raise theirs by the host's. Never lowered: the game does that itself.
 // - the floor. A room index means a room of one floor only: every body and the world name the floor (the game's stage and
 //   stage type, Game+0 and +4), and nothing of another floor is applied - neither a place nor the host's lists, which
-//   would empty a room that merely shares the number. Following to another floor is not done yet, only counted.
+//   would empty a room that merely shares the number. A floor is followed as a room is: every body names how many changes
+//   of floor its game has seen, and a game that hears of a newer one from another floor asks its own game for the way
+//   down with the game's own Game::StartStageTransition (RVA 0x2fdc10: not the same stage, animation 0 as a trapdoor's,
+//   no player - the game then takes the first; it only latches the request at Game+0x1ba78, and the game loads the next
+//   floor from the run's seed, which is every game's). Seen live: the host went down, its copy never touched the
+//   guest's trapdoor, and from then on nothing of either game applied to the other. Only the plain way down is followed:
+//   where the floors still differ after it (another path - up, the alternate floors) that is counted and left alone.
 // - slot machines and beggars (Entity_Slot, table 0x764c50; read in the user's running game: state +0x410 is 1 while it
 //   waits and 2 while it plays, the 16 bits at +0x41c count the play down from 30, and the payout is rolled when they
 //   reach 0). The host's world lists them with state, prize, countdown, donations, trigger timer and animation; a guest
@@ -243,6 +249,8 @@ constexpr std::uintptr_t kExists = 0x172, kDead = 0x173, kPosition = 0x33c, kVel
 // Game at RVA 0x871678: current room +0x18300, its grid index +0x18304; the room's entity list: data +0x125c, count +0x1264.
 constexpr std::uintptr_t kGame = 0x871678, kRoom = 0x18300, kRoomIndex = 0x18304, kDimension = 0x1830c, kListData = 0x125c, kListCount = 0x1264;
 constexpr std::uintptr_t kTransition = 0x2fd7c0, kRoomTransition = 0x1b83c;
+constexpr std::uintptr_t kStageTransition = 0x2fdc10, kStageTransitionState = 0x1ba78; constexpr int kFloorRetryFrames = 600;
+constexpr std::array<std::uint8_t, 8> kStageTransitionEntry{0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68, 0xED, 0x32};
 constexpr std::array<std::uint8_t, 6> kTransitionEntry{0x55, 0x8b, 0xec, 0x6a, 0xff, 0x68};
 constexpr int kGridWidth = 13, kFollowRetryFrames = 60; constexpr unsigned kFade = 1;
 constexpr std::uintptr_t kKill = 0x45dc30, kNpcDamage = 0x2d60a0, kPlayerDamage = 0x3729d0, kGhost = 0x20a9;
@@ -286,7 +294,7 @@ constexpr std::array<std::uint8_t, 8> kReviveEntry{0x55, 0x8B, 0xEC, 0x83, 0xE4,
 constexpr std::uintptr_t kGrid = 0x24, kGridType = 0x4, kGridVariant = 0x8, kGridState = 0xc, kGridSprite = 0x40, kGridDestroy = 0x45de20;
 constexpr std::uintptr_t kRockTable = 0x768738, kPoopTable = 0x768648, kTntTable = 0x769300, kWebTable = 0x769558;
 constexpr std::array<std::uint8_t, 8> kGridDestroyEntry{0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x2C, 0x8B, 0x01};
-constexpr std::uint32_t kGridCells = 448, kFireplace = 33, kGridGoneSnapshots = 10, kMaxGridSpawns = 8;
+constexpr std::uint32_t kGridCells = 448, kGridDecoration = 1, kFireplace = 33, kGridGoneSnapshots = 10, kMaxGridSpawns = 8;
 static_assert(kGridMapBytes * 8 == kGridCells, "a bit of the map for every cell");
 constexpr std::uintptr_t kGridSeed = 0x14, kSpawnGrid = 0x3ebca0, kRemoveGrid = 0x41e930;   // the cell's description starts at +4: its seed is description +0x10
 constexpr std::array<std::uint8_t, 8> kSpawnGridEntry{0x55, 0x8B, 0xEC, 0x53, 0x56, 0x8B, 0x75, 0x08}, kRemoveGridEntry{0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x8B, 0x55};
@@ -341,7 +349,7 @@ struct Stats {
     std::uint32_t healthFixes, copyDamageIgnored, copyDeaths, copyRevivalsMissed, roomFollows, roomFollowFailures, stateFixes, npcSpawned, npcSpawnFailures, clearsHeld, clearsFromHost;
     std::uint32_t copyRevivals, copyTouchesIgnored, taken, takenApplied, takenMissed, animationFixes, gridHeld, gridFixes, gridMismatch, fireHeld;
     std::uint32_t projectilesMade, projectilesEnded, projectilesDropped, tearsSent, tearsMade, tearsEnded, tearsDropped, fireHolds;
-    std::uint32_t dropsMade, dropsRemoved, dropsMorphed, dropsSkipped, counterFixes, doorFixes, doorMismatch, bombsMade, bombsEnded, bombsDropped, enemyBombsMade, enemyBombsEnded, enemyBombsDropped, hurtTaken, otherFloor, slotFixes, slotsMade, slotTouchesSent, slotTouchesPlayed, slotTouchesIgnored, npcPartsLeft, petsSent, petsSet, petFireHolds, gridBorn, gridRemoved, longFrames, frameMaxMs, bytesSent, bytesReceived, framesBroken, copyHitsPlayed, gameFaults, faultRules;
+    std::uint32_t dropsMade, dropsRemoved, dropsMorphed, dropsSkipped, counterFixes, doorFixes, doorMismatch, bombsMade, bombsEnded, bombsDropped, enemyBombsMade, enemyBombsEnded, enemyBombsDropped, hurtTaken, otherFloor, slotFixes, slotsMade, slotTouchesSent, slotTouchesPlayed, slotTouchesIgnored, npcPartsLeft, petsSent, petsSet, petFireHolds, gridBorn, gridRemoved, longFrames, frameMaxMs, bytesSent, bytesReceived, framesBroken, copyHitsPlayed, gameFaults, faultRules, floorFollows, floorFollowFailures, floorsElsewhere;
     float correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax;
 };
 #pragma pack(pop)
@@ -350,6 +358,7 @@ using WithDevice = int(__thiscall*)(void*, int, void*, void*, void*, int*);
 using PlayerUpdate = void(__thiscall*)(void*);
 using NpcDamage = char(__thiscall*)(void*, float, std::uint32_t, std::uint32_t, void*, int);
 using Transition = void(__thiscall*)(void*, int, int, unsigned, void*, int);
+using StageTransition = void(__thiscall*)(void*, char, int, void*);   // the same stage again, animation 0..6, the player (none: the first)
 using TriggerClear = void(__thiscall*)(void*, char);
 using Collision = bool(__thiscall*)(void*, void*, std::uint32_t);
 using SpritePlay = void(__thiscall*)(void*, const char*, bool);
@@ -373,6 +382,8 @@ struct SlotAge { std::uint32_t seed, age; } slotAges[8]{}; std::uint32_t slotAge
 Taken takenLog[kMaxTaken]{}; std::uint32_t takenTotal = 0, takenDone[kControllers]{}, takenSince[kControllers]{}; bool takenKnown[kControllers]{};
 // Rooms: the room this game was in a frame ago, its epoch, the newest epoch heard of, and the room being followed to.
 std::uint32_t lastRoom = 0xfffffffe, roomEpoch = 0, heardEpoch = 0, followRoom = 0xfffffffe, followTried = 0; bool following = false;
+// Floors: the floor this game was on a frame ago, its epoch, the newest epoch heard of, and the floor being followed to.
+std::uint32_t lastFloor = 0xffffffff, floorEpoch = 0, heardFloorEpoch = 0, followFloor = 0xffffffff, floorTried = 0; bool followingFloor = false;
 int ownController = -1; bool host = false;
 // The tester's help (see the head of this file): allowed at all, and what of it is on. The game's thread only.
 bool cheating = false, cheatGod = false, cheatDamage = false; constexpr float kCheatDamage = 20.0f;
@@ -821,12 +832,15 @@ void PublishWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t room
         if (entering) { entryMap[i / 8] |= static_cast<std::uint8_t>(1u << (i % 8)); continue; }
         if (!(entryMap[i / 8] >> (i % 8) & 1) && world.born < kMaxBorn)
             world.bornCell[world.born++] = Born{static_cast<std::uint16_t>(i), static_cast<std::uint16_t>(At<std::uint32_t>(grid + kGridType)), At<std::uint32_t>(grid + kGridVariant),
-                                                At<std::uint32_t>(grid + kGridSeed)};
+                                                At<std::uint32_t>(grid + kGridSeed), At<std::int32_t>(grid + kGridState)};
     }
     publishedWorld.generation++;
     stats.worldPublished++;
     if ((peerCount || steamPeerCount) && frame % 2 == 0) { static std::uint8_t packed[sizeof(World)]; SendAll(kOfWorld, world.sequence, packed, PackWorld(world, packed)); }
 }
+
+// Broken for good: a rock in state 2, poop from 1000, TNT from 4, a web from 1 (the states ApplyGrid breaks at).
+bool GridBroken(int kind, std::int32_t state) { return kind == 1 ? state == 2 : state >= (kind == 2 ? 1000 : kind == 3 ? 4 : 1); }
 
 // Guest: the host's grid over the local one, by the game's own Destroy; poop and TNT on their way by their state.
 void ApplyGrid(std::uintptr_t room, const World& world) {
@@ -921,7 +935,18 @@ void ApplyGridCells(std::uintptr_t room, std::uint32_t roomIndex, const World& w
     std::uint32_t spawned = 0;
     for (std::uint32_t b = 0; b < world.born && b < kMaxBorn && spawned < kMaxGridSpawns; ++b) {
         const auto& born = world.bornCell[b];
-        if (born.index >= kGridCells || At<std::uintptr_t>(room + kGrid + born.index * 4)) continue;   // taken: the map below settles what stands there
+        if (born.index >= kGridCells) continue;
+        // The game's own SpawnGridEntity does not mind what stands in the cell (RVA 0x3ebca0, read in its decompilation): it
+        // deletes that and puts the new cell there - which is how the host's boss laid its poop over a decoration, and a new
+        // one over the rubble of the last. This used to leave any taken cell alone: seen live, a guest kept the decoration
+        // where the host had poop, and rubble where the host had new poop (the states only ever break a cell, never mend
+        // it). So: over a decoration, and over a cell of the same kind that is broken while the host's is not. A cell of
+        // the same kind otherwise is the twin, whatever its seed - the guest's own boss lays its poop in the same cells.
+        if (const auto standing = At<std::uintptr_t>(room + kGrid + born.index * 4)) {
+            const int kind = GridKind(standing); const auto type = At<std::uint32_t>(standing + kGridType);
+            if (!kind && type != kGridDecoration) continue;   // a pit, spikes, a door: not this module's to replace
+            if (kind && type == born.type && !(GridBroken(kind, At<std::int32_t>(standing + kGridState)) && !GridBroken(kind, born.state))) continue;
+        }
         applyingGrid = true;
         const auto made = reinterpret_cast<SpawnGrid>(base + kSpawnGrid)(reinterpret_cast<void*>(room), born.index, born.type, born.variant, born.seed ? born.seed : 1, 0);
         applyingGrid = false; ++spawned;
@@ -1303,6 +1328,39 @@ bool RequestRoom(std::uintptr_t game, std::uint32_t index, int direction, std::u
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+bool RequestFloor(std::uintptr_t game) {
+    __try { reinterpret_cast<StageTransition>(base + kStageTransition)(reinterpret_cast<void*>(game), 0, 0, nullptr); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Once a frame, with the local player, before the rooms: keep this game's epoch of floors, and go down after whoever
+// went down later than this game did. Only a strictly newer epoch is followed: a way that led to another floor than the
+// leader's is not tried again, or every try would take this game one more floor down.
+void FollowFloor(std::uintptr_t game) {
+    const auto floor = Floor(game);
+    if (floor != lastFloor) {
+        if (followingFloor) { if (floor != followFloor) stats.floorsElsewhere++; followingFloor = false; }   // arrived where it was led - or not
+        else if (lastFloor != 0xffffffff) floorEpoch = (floorEpoch > heardFloorEpoch ? floorEpoch : heardFloorEpoch) + 1;
+        lastFloor = floor;
+    }
+    // A request that came to nothing - the latch is free again and the floor is the old one - may be made once more.
+    if (followingFloor && !At<std::uint32_t>(game + kStageTransitionState) && frame - floorTried >= static_cast<std::uint32_t>(kFloorRetryFrames)) followingFloor = false;
+    Body leader{}; bool found = false;
+    AcquireSRWLockShared(&inboxLock);
+    for (const auto& box : inbox) {
+        if (!box.body.sequence || GetTickCount64() - box.at > kFreshMs) continue;
+        if (box.body.floorEpoch > heardFloorEpoch) heardFloorEpoch = box.body.floorEpoch;
+        if (box.body.floorEpoch > floorEpoch && box.body.floor != floor && (!found || box.body.floorEpoch > leader.floorEpoch)) { leader = box.body; found = true; }
+    }
+    ReleaseSRWLockShared(&inboxLock);
+    if (!found || followingFloor || At<std::uint32_t>(game + kStageTransitionState) != 0 || At<std::uint32_t>(game + kRoomTransition) != 0 ||
+        (floorTried && frame - floorTried < static_cast<std::uint32_t>(kFloorRetryFrames))) return;
+    floorTried = frame ? frame : 1;
+    if (RequestFloor(game) && At<std::uint32_t>(game + kStageTransitionState) != 0) {
+        followingFloor = true; followFloor = leader.floor; floorEpoch = leader.floorEpoch; stats.floorFollows++;
+    } else stats.floorFollowFailures++;
+}
+
 // Once a frame, with the local player: keep this game's epoch, and follow whoever changed room after this game did.
 void FollowRoom(std::uintptr_t game, std::uint32_t roomIndex) {
     if (roomIndex != lastRoom) {
@@ -1408,12 +1466,13 @@ void AfterUpdate(std::uintptr_t player) noexcept {
             Handshake();
             if (cheating) TesterKeys(room);
             if ((peerCount || steamPeerCount) && stage.load(std::memory_order_relaxed) == kHere) return;   // only hellos until every neighbour has answered
-            if (On(kFollow) && Live()) FollowRoom(game, roomIndex);
+            if (On(kFollow) && Live()) { FollowFloor(game); FollowRoom(game, roomIndex); }
             published.generation |= 1;   // odd: being written, also after a write that never finished
             published.body.magic = kBodyMagic; published.body.controller = static_cast<std::uint32_t>(controller); published.body.sequence = ++sequence;
             published.body.room = roomIndex; published.body.floor = Floor(game);
             std::memcpy(published.body.position, position, 8); std::memcpy(published.body.velocity, velocity, 8);
             published.body.dimension = At<std::uint32_t>(game + kDimension); published.body.roomEpoch = roomEpoch; published.body.host = host ? 1 : 0;
+            published.body.floorEpoch = floorEpoch;
             published.body.ghost = At<std::uint8_t>(player + kGhost); published.body.dying = At<std::uint8_t>(player + kDead);
             published.body.takenTotal = takenTotal; std::memcpy(published.body.taken, takenLog, sizeof(takenLog));
             published.body.hurt = room ? At<std::uint8_t>(room + kRoomHurt) : 0;
@@ -1838,6 +1897,7 @@ void Begin(const Setup& setup) {
             std::memcmp(reinterpret_cast<void*>(base + kDoorRefresh), kDoorRefreshEntry.data(), kDoorRefreshEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kKill), kKillEntry.data(), kKillEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kTransition), kTransitionEntry.data(), kTransitionEntry.size()) != 0 ||
+            std::memcmp(reinterpret_cast<void*>(base + kStageTransition), kStageTransitionEntry.data(), kStageTransitionEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kSpawn), kSpawnEntry.data(), kSpawnEntry.size()) != 0) throw static_cast<DWORD>(ERROR_REVISION_MISMATCH);
         original = reinterpret_cast<WithDevice>(*slot); originalPlayer = reinterpret_cast<PlayerUpdate>(*playerSlot); originalDamage = reinterpret_cast<NpcDamage>(*damageSlot);
         originalPlayerDamage = reinterpret_cast<NpcDamage>(*playerDamageSlot); originalCollision = reinterpret_cast<Collision>(*pickupSlot); originalSlotCollision = reinterpret_cast<Collision>(*slotSlot);
@@ -1867,6 +1927,7 @@ void Begin(const Setup& setup) {
         takenTotal = 0; applyingTaken = false; applyingGrid = false; entryRoom = cellGoneRoom = 0xffffffff; touchedSlot = touchedAt = slotAgeCount = 0;
         hostClearRoom = 0xfffffffe; hostClear = 0; hostHeardAt = 0;
         lastRoom = followRoom = 0xfffffffe; roomEpoch = heardEpoch = followTried = 0; following = false;
+        lastFloor = followFloor = 0xffffffff; floorEpoch = heardFloorEpoch = floorTried = 0; followingFloor = false;
         worldInbox = World{}; worldAt = 0; worldApplied = 0; livedRoom = aliasRoom = 0xffffffff; livedCount = deathCount = aliasCount = orphanCount = missingCount = 0;
         WSADATA data{};
         if (const int started = WSAStartup(MAKEWORD(2, 2), &data)) throw static_cast<DWORD>(started);

@@ -27,6 +27,7 @@ struct Body {
     std::uint32_t magic, controller, sequence, room; float position[2], velocity[2]; std::uint32_t ghost; std::int32_t health[kHealthFields];
     std::uint32_t dimension, roomEpoch, host, dying, takenTotal, hurt, floor; Taken taken[kMaxTaken];
     std::uint32_t hits; std::int32_t headFrameDelay;   // blows that landed on the owner so far; the owner's blink
+    std::uint32_t floorEpoch;                          // how many changes of floor this game has seen, as roomEpoch counts rooms
 };
 struct Npc {
     std::uint32_t seed, type, variant, subtype; float position[2], velocity[2], hitPoints;
@@ -41,7 +42,7 @@ struct Npc {
     std::uint32_t gridCollision, entityCollision; std::int32_t renderZ;
 };
 struct Cell { std::uint16_t index, type; std::int32_t state; };
-struct Born { std::uint16_t index, type; std::uint32_t variant, seed; };
+struct Born { std::uint16_t index, type; std::uint32_t variant, seed; std::int32_t state; };   // state: a guest's cell that is broken further than this is not this cell
 struct Shot {
     std::uint32_t seed, variant, subtype; float position[2], velocity[2], height, fallingSpeed, fallingAccel, scale, damage;
     std::uint64_t flags[2]; float color[11];
@@ -61,10 +62,10 @@ struct Shots { std::uint32_t magic, controller, sequence, room, count, bombs, pe
 struct FrameHeader { std::uint32_t magic; std::uint8_t kind, chunk, chunks, reserved; std::uint32_t sequence, total, session; };
 struct Hello { std::uint32_t magic, protocol, rules; std::uint8_t controller, host, stage, reserved; };
 #pragma pack(pop)
-static_assert(sizeof(Taken) == 32 && sizeof(Body) == 72 + 4 * kHealthFields + kMaxTaken * 32 && sizeof(Npc) == 124 && sizeof(Pet) == 32 && sizeof(Cell) == 8 && sizeof(Shot) == 108 && sizeof(Shots) == 28 + kMaxTears * 108 + kMaxPets * 32 &&
-              sizeof(Drop) == 44 && sizeof(DoorState) == 12 && sizeof(SlotState) == 64 && sizeof(Born) == 12 && sizeof(FrameHeader) == 20 && sizeof(Hello) == 16 &&
+static_assert(sizeof(Taken) == 32 && sizeof(Body) == 76 + 4 * kHealthFields + kMaxTaken * 32 && sizeof(Npc) == 124 && sizeof(Pet) == 32 && sizeof(Cell) == 8 && sizeof(Shot) == 108 && sizeof(Shots) == 28 + kMaxTears * 108 + kMaxPets * 32 &&
+              sizeof(Drop) == 44 && sizeof(DoorState) == 12 && sizeof(SlotState) == 64 && sizeof(Born) == 16 && sizeof(FrameHeader) == 20 && sizeof(Hello) == 16 &&
               sizeof(World) == 80 + kMaxNpcs * 124 + kMaxDeaths * 4 + kMaxCells * 8 + kMaxShots * 108 + kMaxDrops * 44 + kMaxDoors * 12 + kMaxEnemyBombs * 108 + kMaxSlots * 64 +
-                                   kMaxBorn * 12 + kGridMapBytes && sizeof(Shots) != sizeof(Body) && sizeof(FrameHeader) + kChunkBytes <= 1200 &&
+                                   kMaxBorn * 16 + kGridMapBytes && sizeof(Shots) != sizeof(Body) && sizeof(FrameHeader) + kChunkBytes <= 1200 &&
               sizeof(World) <= kMaxChunks * kChunkBytes, "wire layout");
 
 inline bool Finite(const float* v) { return std::isfinite(v[0]) && std::isfinite(v[1]); }
