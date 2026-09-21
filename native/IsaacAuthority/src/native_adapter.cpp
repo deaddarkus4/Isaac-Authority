@@ -160,6 +160,11 @@
 // - a copy is placed ahead by the age of its body. The two games' frames are not in step, so a body is anything from
 //   fresh to a frame old when it is applied, and a copy placed exactly where its owner was jitters by up to a frame of
 //   its movement. It is placed at the owner's place plus the owner's velocity times the body's age in frames (at most 2).
+// A tester's help, for getting through floors to what is to be tried (the word "cheats" in the configuration, which the
+// harness gives to the host's game alone): the own player takes no damage (F6 turns that off and on), every blow to an
+// enemy in this game counts twentyfold (F7), and F8 kills the room's enemies with the game's own Kill - on the host only,
+// whose enemies they are, so that the guests see them die as they see any death. All of it on hooks that are there
+// anyway. It exists in an isolated test instance only: the installed module, in a game of Steam's, never reads the word.
 // Every rule of this module can be left out when it starts (the third word of the configuration, a mask in hex), so that
 // a rule that misbehaves in a live run is switched off without a rebuild.
 //
@@ -369,6 +374,8 @@ Taken takenLog[kMaxTaken]{}; std::uint32_t takenTotal = 0, takenDone[kController
 // Rooms: the room this game was in a frame ago, its epoch, the newest epoch heard of, and the room being followed to.
 std::uint32_t lastRoom = 0xfffffffe, roomEpoch = 0, heardEpoch = 0, followRoom = 0xfffffffe, followTried = 0; bool following = false;
 int ownController = -1; bool host = false;
+// The tester's help (see the head of this file): allowed at all, and what of it is on. The game's thread only.
+bool cheating = false, cheatGod = false, cheatDamage = false; constexpr float kCheatDamage = 20.0f;
 // Blows that landed on the own player; per copy, how many of its owner's this game has played, and whether that count is known yet.
 std::uint32_t ownHits = 0, hitsPlayed[kControllers]{}; bool hitsKnown[kControllers]{};
 SRWLOCK lifecycle = SRWLOCK_INIT, inboxLock = SRWLOCK_INIT;
@@ -1351,6 +1358,23 @@ void Handshake() {
     }
 }
 
+// The tester's keys, once per update of the own player and only while this window has the focus: F6 no damage to the own
+// player, F7 twentyfold damage to enemies, F8 (the host) kills the room's enemies with the game's own Kill.
+void TesterKeys(std::uintptr_t room) {
+    static bool held[3]{}; const int keys[3] = {VK_F6, VK_F7, VK_F8}; bool pressed[3]{};
+    for (int k = 0; k < 3; ++k) { const bool down = Focused() && (GetAsyncKeyState(keys[k]) & 0x8000) != 0; pressed[k] = down && !held[k]; held[k] = down; }
+    if (pressed[0]) cheatGod = !cheatGod;
+    if (pressed[1]) cheatDamage = !cheatDamage;
+    if (!pressed[2] || !host || !room) return;
+    const auto data = At<std::uintptr_t>(room + kListData); const auto count = At<std::uint32_t>(room + kListCount);
+    std::uintptr_t doomed[kMaxNpcs]; std::uint32_t doomedCount = 0;
+    for (std::uint32_t i = 0; data && count <= 4096 && i < count && doomedCount < static_cast<std::uint32_t>(kMaxNpcs); ++i) {
+        const auto entity = At<std::uintptr_t>(data + i * sizeof(std::uintptr_t));
+        if (entity && LivingNpc(entity) && At<float>(entity + kMaxHitPoints) > 0 && At<std::uint32_t>(entity + kType) != kFireplace) doomed[doomedCount++] = entity;
+    }
+    for (std::uint32_t d = 0; d < doomedCount; ++d) reinterpret_cast<PlayerUpdate>(base + kKill)(reinterpret_cast<void*>(doomed[d]));   // after the walk: killing moves the list
+}
+
 // The game's thread, after an exception under AfterUpdate. The game goes on, as it did before, but what happened is no
 // longer hidden among refused datagrams, and it is held against the rule that was at work: a rule that reads a wrong
 // place faults on every frame, each time in the middle of the game's own code, and nothing good comes of the next one.
@@ -1382,6 +1406,7 @@ void AfterUpdate(std::uintptr_t player) noexcept {
             }
             lastFrameUs = nowUs;
             Handshake();
+            if (cheating) TesterKeys(room);
             if ((peerCount || steamPeerCount) && stage.load(std::memory_order_relaxed) == kHere) return;   // only hellos until every neighbour has answered
             if (On(kFollow) && Live()) FollowRoom(game, roomIndex);
             published.generation |= 1;   // odd: being written, also after a write that never finished
@@ -1462,6 +1487,7 @@ void __fastcall OnPlayer(void* object, void*) {
 }
 
 char __fastcall OnNpcDamage(void* self, void*, float damage, std::uint32_t flagsLow, std::uint32_t flagsHigh, void* source, int countdown) {
+    if (cheating && cheatDamage && running.load(std::memory_order_acquire)) damage *= kCheatDamage;   // the tester's help
     if (Live() && !host) {
         const auto entity = reinterpret_cast<std::uintptr_t>(self); const float hitPoints = At<float>(entity + kHitPoints);
         if (At<std::uint32_t>(entity + kType) == kFireplace && On(kFire) && HostRules()) { stats.fireHeld++; return 0; }
@@ -1475,6 +1501,7 @@ char __fastcall OnPlayerDamage(void* self, void*, float damage, std::uint32_t fl
         stats.copyDamageIgnored++;
         return 0;
     }
+    if (cheating && cheatGod && running.load(std::memory_order_acquire) && At<int>(reinterpret_cast<std::uintptr_t>(self) + kController) == ownController) return 0;   // the tester's help
     const char landed = originalPlayerDamage(self, damage, flagsLow, flagsHigh, source, countdown);
     if (landed && running.load(std::memory_order_acquire) && At<int>(reinterpret_cast<std::uintptr_t>(self) + kController) == ownController) ++ownHits;
     return landed;
@@ -1678,7 +1705,8 @@ void WriteStatus() {
         status << (at == kLive ? "LIVE" : at == kCompareOff ? "comparison off, waiting for the neighbours to say the same" : gaveUp.load() ? (disagreed == Discord::None ? "gave up: not every player answered" : "gave up: the modules did not agree") : waiting)
                << " as " << (host ? "host" : "guest") << ", device " << ownController << "; neighbours answered " << answered << " of " << neighbours
                << ", hellos of another version " << otherProtocol.load() << "; neighbour heard: " << (peerHeard.load() ? "yes" : "NO") << "; sent " << stats.bytesSent / 1024 << " KB, received " << stats.bytesReceived / 1024
-               << " KB; bodies applied " << stats.applied << ", worlds applied " << stats.worldApplied << "; faults " << stats.gameFaults;
+               << " KB" << (cheating ? (cheatGod ? (cheatDamage ? "; TESTER'S HELP: no damage, x20" : "; TESTER'S HELP: no damage") : cheatDamage ? "; TESTER'S HELP: x20" : "; TESTER'S HELP: all off") : "")
+               << "; bodies applied " << stats.applied << ", worlds applied " << stats.worldApplied << "; faults " << stats.gameFaults;
         if (stats.faultRules) status << " (rules switched off after them: " << std::hex << stats.faultRules << std::dec << ")";
         status << ", datagrams refused " << stats.rejected << ", frames lost in pieces " << stats.framesBroken
                << ", frames over 45 ms " << stats.longFrames << " of " << stats.published << "\n";
@@ -1740,7 +1768,7 @@ std::filesystem::path OwnFolder() {
 
 // What a start needs to know: who the own player is, whose world it is, the rules, and how the neighbours are reached.
 struct Setup {
-    int controller = -1; bool host = false; std::uint32_t mask = kAllRules; unsigned short listenOn = 0; bool anywhere = false, outsideTests = false;
+    int controller = -1; bool host = false; std::uint32_t mask = kAllRules; unsigned short listenOn = 0; bool anywhere = false, outsideTests = false, cheats = false;
     sockaddr_in peers[kMaxPeers]{}; std::uint32_t peerCount = 0; SteamIdentity steamPeers[kMaxPeers]{}; std::uint32_t steamPeerCount = 0;
     int peerControllers[kMaxPeers] = {-1, -1, -1, -1};   // this game's device number of each neighbour's player, where known
 };
@@ -1750,6 +1778,7 @@ struct Setup {
 void ReadWords(std::istream& config, Setup& setup) {
     for (std::string word; config >> word;) {
         if (word == "steam") setup.outsideTests = true;
+        else if (word == "cheats") setup.cheats = true;
         else if (word.rfind("steampeer=", 0) == 0 && setup.steamPeerCount < kMaxPeers) {
             SteamIdentity identity{}; identity.type = 16; identity.size = 8; identity.id = std::strtoull(word.c_str() + 10, nullptr, 10);
             if (!identity.id) throw static_cast<DWORD>(ERROR_BAD_CONFIGURATION);
@@ -1817,6 +1846,8 @@ void Begin(const Setup& setup) {
         if (std::memcmp(reinterpret_cast<void*>(base + kCompare), kCompareEntry.data(), kCompareEntry.size()) != 0 &&
             std::memcmp(reinterpret_cast<void*>(base + kCompare), kCompareEqual.data(), kCompareEqual.size()) != 0) throw static_cast<DWORD>(ERROR_REVISION_MISMATCH);
         ownController = controller; host = setup.host; rules = mask; peerHeard = false;
+        // The tester's help: in an isolated test instance only, whatever the configuration says elsewhere.
+        cheating = setup.cheats && std::memcmp(reinterpret_cast<const char*>(base + kSaveLeaf), kIsolated, sizeof(kIsolated) - 1) == 0; cheatGod = cheatDamage = cheating;
         stage = kHere; gaveUp = false; discord = 0; otherProtocol = 0; helloNumber = 0; startedAt = GetTickCount64();
         for (std::uint32_t n = 0; n < kMaxPeers; ++n) { heardStage[n] = 0; heardHost[n] = 0; heardRules[n] = 0; peerSession[n] = 0; peerHeardAt[n] = 0; peerAnew[n] = 0; }
         FILETIME clock{}; GetSystemTimeAsFileTime(&clock);   // this start's number: the clock in tenths of a second, and higher than the last start's

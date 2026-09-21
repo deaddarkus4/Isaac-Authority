@@ -49,7 +49,7 @@ FIRST_PORT = 27460   # the local pair: one port per game
 release = root / "Binaries/authority-build/Release"
 
 
-def attach(instances, mask, restart, carried, auto, installed):
+def attach(instances, mask, restart, carried, auto, installed, cheats):
     """Tell each game's module which lobby device is its local player - the 'Setting controller ID to N' that follows
     'Adding local player' in the game's own log - and attach it. A game that already runs the module is left as it is."""
     for instance in instances:
@@ -66,6 +66,9 @@ def attach(instances, mask, restart, carried, auto, installed):
         network = "" if carried else f" listen={ports[pid]} " + " ".join(f"peer=127.0.0.1:{port}" for other, port in ports.items() if other != pid)
         # Installed or --auto: the module reads the game's log by itself - device, host and the end of the match; it is told
         # only that this test instance may be touched, the rules, and the way to the neighbours (no Steam here).
+        # --cheats: the tester's help of the module, for the host's game alone (no damage to its player, twentyfold damage to enemies;
+        # F6 and F7 turn them off and on, F8 kills the room's enemies). The module takes the word in an isolated test instance only.
+        network += " cheats" if cheats and hosting else ""
         (folder / f"native-{pid}.cfg").write_text(f"auto {mask:x}{network}" if auto or installed else f"{found[0]} {'host' if hosting else 'guest'} {mask:x}{network}", encoding="ascii")
         if installed:   # the game has loaded the module itself, through the version.dll beside it
             continue
@@ -85,6 +88,7 @@ parser.add_argument("--installed", action="store_true", help="attach nothing: th
 parser.add_argument("--jitter-ms", type=int, default=0); parser.add_argument("--loss", type=float, default=0.0)
 parser.add_argument("--seconds", type=float, default=1.2)
 parser.add_argument("--without", default="", metavar="RULES", help="comma-separated rules to leave out: " + ", ".join(RULES))
+parser.add_argument("--cheats", action="store_true", help="the tester's help in the host's game only: its player takes no damage, enemies take twentyfold (F6, F7 toggle; F8 kills the room's enemies)")
 parser.add_argument("--restart", action="store_true", help="stop the module in each game first, so that it starts again with these rules")
 parser.add_argument("--play", type=float, nargs="?", const=120.0, default=None, metavar="MINUTES",
                     help="only attach and relay while a person plays; a line of state every ten seconds, until the games close")
@@ -94,7 +98,7 @@ instances = json.loads((root / "Binaries/game-instances/native-pair.json").read_
 left_out = [name for name in args.without.split(",") if name]
 if any(name not in RULES for name in left_out):
     raise SystemExit("unknown rule; known: " + ", ".join(RULES))
-attach(instances, 0x3FFFF & ~sum(RULES[name] for name in left_out), args.restart, args.carried, args.auto, args.installed)
+attach(instances, 0x3FFFF & ~sum(RULES[name] for name in left_out), args.restart, args.carried, args.auto, args.installed, args.cheats)
 folder = Path(os.environ["LOCALAPPDATA"]) / "IsaacAuthority"
 games = []
 for instance in instances:
