@@ -19,7 +19,9 @@ constexpr std::uint8_t kOfBody = 1, kOfShots = 2, kOfWorld = 3, kOfHello = 4;
 //    deal is the host's (its kind rides with the door, the seed its room was made from with the world).
 // 7: whether the host's enemy is shown at all rides in its record (kNpcHidden in linked): a guest that does not know the bit
 //    would take a hidden enemy for a part of something.
-constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 7;   // "HEL1"
+// 8: a match of live modules takes no newcomer in, at every member alike (one member that still did would stand alone before
+//    a player nobody else has), and a pedestal gives a copy the item it gave the owner.
+constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 8;   // "HEL1"
 constexpr std::uint32_t kGridCollisionClasses = 8, kEntityCollisionClasses = 5;   // the game's enums: GRIDCOLL_NONE..PITSONLY, ENTCOLL_NONE..ALL
 constexpr std::uint32_t kNpcParts = 3, kNpcHidden = 4;                              // in Npc::linked
 constexpr std::uint8_t kDevilRoom = 14, kAngelRoom = 15;                           // the game's RoomType of the two deals

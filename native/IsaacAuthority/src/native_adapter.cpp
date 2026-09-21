@@ -474,6 +474,8 @@ struct Stats {
     // A guest's twins: shown or hidden by the host's word; flames sized to the host's hit points; deaths held back right before the twin's update.
     std::uint32_t visibleFixes, flameFixes, deathsHeldAtUpdate;
     std::uint32_t copyGhostRevivals;   // copies brought back from the ghost by their owner's word, with the game's own RevivePlayerGhost
+    // Pedestals given the owner's item before its copy took from them; newcomers held outside a match the modules have changed.
+    std::uint32_t takenItemFixes, joinsHeld;
     float correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax;
 };
 #pragma pack(pop)
@@ -563,6 +565,9 @@ sockaddr_in peers[kMaxPeers]{}; std::uint32_t peerCount = 0; std::atomic<bool> p
 std::atomic<std::uint8_t> stage{kHere}, heardStage[kMaxPeers]{}, heardHost[kMaxPeers]{}, discord{0}; std::atomic<std::uint32_t> heardRules[kMaxPeers]{}, otherProtocol{0};
 std::uint64_t startedAt = 0; std::uint32_t helloNumber = 0;
 std::atomic<bool> gaveUp{false};
+// The modules have been live in this match: its games are no longer the one game the lockstep believes in. Until the match
+// is over for the module; a change of players in between does not take it back.
+std::atomic<bool> matchChanged{false};
 // Starts. This module's own number (kept from start to start: the next is always higher), and on the receiving thread per
 // neighbour the start its frames are of, when it was last heard, and of which kinds the first frame of that start is still
 // to come - that one is taken whatever its sequence.
@@ -1582,7 +1587,13 @@ void ApplyTaken(std::uintptr_t player, int controller, const Body& body, std::ui
     while (takenDone[controller] < body.takenTotal) {
         const std::uint32_t number = takenDone[controller] + 1; const Taken* taken = nullptr;
         for (const auto& t : body.taken) if (t.number == number) taken = &t;
-        if (!taken || taken->room != roomIndex) { takenDone[controller] = number; takenSince[controller] = 0; stats.takenMissed++; continue; }
+        if (!taken) { takenDone[controller] = number; takenSince[controller] = 0; stats.takenMissed++; continue; }
+        if (taken->room != roomIndex) {
+            // Taken in a room this game is not in. While its owner still stands there it waits for this game to come after it;
+            // an owner that has gone on took it in a room this game has left, or never saw - that one is lost here.
+            if (body.room == taken->room) return;
+            takenDone[controller] = number; takenSince[controller] = 0; stats.takenMissed++; continue;
+        }
         if (taken->low & kSlotTouch) {
             // A touch of a machine. Most machines are the host's: it alone plays the touch, once, whatever comes of it. A donation
             // machine is played by every game: in order, and again while the machine here still plays the donation before.
@@ -1600,20 +1611,31 @@ void ApplyTaken(std::uintptr_t player, int controller, const Body& body, std::ui
         if (!On(kTaken)) { takenDone[controller] = number; takenSince[controller] = 0; continue; }
         if (!takenSince[controller]) takenSince[controller] = frame ? frame : 1;
         const auto data = At<std::uintptr_t>(room + kListData); const auto count = At<std::uint32_t>(room + kListCount);
-        std::uintptr_t found = 0; float foundDistance = 0;
+        // The twin: of the owner's seed first - and where several share a seed (Diplopia copies the seed with the pedestal)
+        // the one that still holds something, then the nearest to where the owner's stood; without the seed, by kind and place.
+        std::uintptr_t found = 0; float foundDistance = 0; int foundRank = 0;
         for (std::uint32_t i = 0; data && count <= 4096 && i < count; ++i) {
             const auto entity = At<std::uintptr_t>(data + i * sizeof(std::uintptr_t));
             if (!entity || At<std::uintptr_t>(entity) != base + kPickupTable || !At<std::uint8_t>(entity + kExists) || At<std::uint8_t>(entity + kDead)) continue;
             const auto variant = At<std::uint32_t>(entity + kVariant), subtype = At<std::uint32_t>(entity + kSubtype);
             if (variant != taken->variant) continue;
-            if (At<std::uint32_t>(entity + kSeed) == taken->seed) { found = entity; break; }
-            if (subtype != taken->subtype && !(variant == 100 && subtype != 0)) continue;   // a pedestal may hold another item here
+            const bool ofSeed = At<std::uint32_t>(entity + kSeed) == taken->seed;
+            if (!ofSeed && subtype != taken->subtype && !(variant == kCollectible && subtype != 0)) continue;   // a pedestal may hold another item here
             const auto* position = reinterpret_cast<float*>(entity + kPosition);
             const float dx = position[0] - taken->position[0], dy = position[1] - taken->position[1], distance = dx * dx + dy * dy;
-            if (distance <= kTakenReach * kTakenReach && (!found || distance < foundDistance)) { found = entity; foundDistance = distance; }
+            if (!ofSeed && distance > kTakenReach * kTakenReach) continue;
+            const int rank = (ofSeed ? 2 : 0) + (variant != kCollectible || subtype != 0 ? 1 : 0);
+            if (!found || rank > foundRank || (rank == foundRank && distance < foundDistance)) { found = entity; foundDistance = distance; foundRank = rank; }
         }
         bool done = false;
         if (found) {
+            // A pedestal gives its copy what it gave its owner. The games roll a pedestal's item each by itself, and one that
+            // cycles (Tainted Isaac's) shows another item every second: seen live, a player took a different item in every game.
+            if (taken->variant == kCollectible && taken->subtype && At<std::uint32_t>(found + kSubtype) != taken->subtype) {
+                doing = kTaken;
+                reinterpret_cast<PickupMorph>(base + kPickupMorph)(reinterpret_cast<void*>(found), static_cast<int>(kPickup), static_cast<int>(kCollectible), static_cast<int>(taken->subtype), 1, 1, 1);
+                doing = 0; stats.takenItemFixes++;
+            }
             const Shape before = ShapeOf(found);
             At<std::int32_t>(found + kWait) = 0;   // the owner's game has decided: no waiting here
             doing = kTaken;
@@ -1709,7 +1731,7 @@ void Handshake() {
     const std::uint32_t neighbours = steamPeerCount ? steamPeerCount : peerCount;
     std::uint8_t now = stage.load(std::memory_order_relaxed);
     if (!neighbours) {   // the slots are carried by a process outside: no hellos, and the comparison is off since the start
-        if (now != kLive && peerHeard.load(std::memory_order_relaxed)) stage.store(kLive, std::memory_order_relaxed);
+        if (now != kLive && peerHeard.load(std::memory_order_relaxed)) { stage.store(kLive, std::memory_order_relaxed); matchChanged.store(true, std::memory_order_relaxed); }
         return;
     }
     if (gaveUp.load(std::memory_order_relaxed)) return;
@@ -1724,7 +1746,7 @@ void Handshake() {
     const std::uint8_t before = now;
     if (disagreed == Discord::None) now = NextStage(now, heard, neighbours);
     if (before == kHere && now != kHere && Patch(kCompare, kCompareEqual, kCompareEntry)) { gaveUp.store(true, std::memory_order_relaxed); stats.gameFaults++; return; }
-    if (now != before) stage.store(now, std::memory_order_relaxed);
+    if (now != before) { stage.store(now, std::memory_order_relaxed); if (now == kLive) matchChanged.store(true, std::memory_order_relaxed); }
     if (now == kHere && GetTickCount64() - startedAt > kHelloPatienceMs) { gaveUp.store(true, std::memory_order_relaxed); return; }   // not a match of modules
     if (now != before || frame % kHelloEveryFrames == 0) {
         const Hello hello{kHelloMagic, kProtocol, rules, static_cast<std::uint8_t>(ownController), static_cast<std::uint8_t>(host ? 1 : 0), now, 0};
@@ -1814,7 +1836,12 @@ void AfterUpdate(std::uintptr_t player) noexcept {
         if (ownerSession != seenSession[controller]) { seenSession[controller] = ownerSession; takenKnown[controller] = false; hitsKnown[controller] = false; }
         // A body of another room is not a position in this one: around a door the two games change rooms a moment apart.
         if (body.floor != Floor(game)) { stats.otherFloor++; return; }
-        if (body.room != roomIndex) { stats.otherRoom++; return; }
+        if (body.room != roomIndex) {
+            // No place in this room - but what its owner took in this room before it went on is taken here as well (it used
+            // to be lost: the owner walks in, takes and leaves while a game with a ping is still on its way in and out).
+            if (room && (On(kTaken) || On(kSlotsRule))) ApplyTaken(player, controller, body, room, roomIndex);
+            stats.otherRoom++; return;
+        }
         const auto age = arrivedUs && On(kLead) ? NowUs() - arrivedUs : 0; const float lead = age > 66666 ? 2.0f : static_cast<float>(age) / 33333.0f;   // in frames
         const float place[2]{body.position[0] + body.velocity[0] * lead, body.position[1] + body.velocity[1] * lead};
         const float dx = place[0] - position[0], dy = place[1] - position[1], distance = std::sqrt(dx * dx + dy * dy);
@@ -2080,8 +2107,33 @@ void GuardedRefuseJoins(std::uintptr_t net) noexcept {
     __except (EXCEPTION_EXECUTE_HANDLER) { TakeFault(); }
 }
 
+// A match the modules have been live in takes nobody in. The game's entry is a lockstep's: every member adds the newcomer
+// at one frame, the lobby's owner sends its GameState, and everybody - the members too - loads it and counts on from that
+// frame. The modules' games count their frames apart (nobody waits for input), and the members' modules stop for the
+// change of players - so the game went back to waiting for input it could not get, and the modules' handshake, which runs
+// from a player's update, could not move in a game that stood. Seen live twice, four players through Steam: a black
+// screen for everybody until all but one had left; and once only the guests had the newcomer in their queues. Until the
+// entry is made to work among live modules the newcomer waits in the lobby, at every member alike: the queue is emptied
+// with the game's own erase before the game looks at it. A host left alone has no module running and takes players in as
+// the game always did - that way in was seen to work (0.1.4).
+void HoldJoins(std::uintptr_t net) {
+    const auto manager = At<std::uintptr_t>(base + kIsaacManager);
+    if (!manager || manager + kNetManager != net || !At<std::uint32_t>(net + kPendingJoins + 4)) return;
+    std::uint64_t queued[kMaxJoinPlayers]; const auto waiting = KeysOfMap(net + kPendingJoins, queued, kMaxJoinPlayers);
+    for (std::uint32_t n = 0; n < waiting; ++n) {
+        reinterpret_cast<EraseJoin>(base + kEraseJoin)(reinterpret_cast<void*>(net + kPendingJoins), &queued[n]);
+        stats.joinsHeld++;
+    }
+}
+
+void GuardedHoldJoins(std::uintptr_t net) noexcept {
+    __try { doing = kJoin; HoldJoins(net); doing = 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { TakeFault(); }
+}
+
 void __fastcall OnProcessJoins(void* net, void*, std::uint32_t forced) {
-    if (Live() && On(kJoin)) GuardedRefuseJoins(reinterpret_cast<std::uintptr_t>(net));
+    if (matchChanged.load(std::memory_order_relaxed)) GuardedHoldJoins(reinterpret_cast<std::uintptr_t>(net));
+    else if (Live() && On(kJoin)) GuardedRefuseJoins(reinterpret_cast<std::uintptr_t>(net));   // the unlocks' rule: for the entry among live modules, when there is one
     reinterpret_cast<ProcessJoins>(joinsTrampoline)(net, forced);
 }
 
@@ -2423,6 +2475,7 @@ void WriteStatus() {
                    << " / too late to be played " << stats.inputsStale << " / jumped over " << stats.inputsSkipped << (inputsDistrusted.load() ? "; REMOTE INPUT NOT TRUSTED: the game waits as it always did" : "");
         if (stats.joinsAdmitted || stats.joinsRefused || stats.joinsUnjudged)
             status << ", newcomers let in " << stats.joinsAdmitted << " / refused " << stats.joinsRefused << " (the last one's save lacked " << stats.joinLacking << " of the session's unlocks) / not judged " << stats.joinsUnjudged;
+        if (stats.joinsHeld) status << ", NEWCOMERS HELD IN THE LOBBY (a match of live modules takes nobody in) " << stats.joinsHeld;
         if (stats.npcFaults) status << ", enemies whose update threw " << stats.npcFaults << " (kinds left to their own behaviour: " << stats.ownBehaviourKinds << ")";
         if (host) status << "; neighbours' blows played " << stats.blowsPlayed << " / with no target here " << stats.blowsMissed << " / never come " << stats.blowsLost << ", copies' blows that counted for nothing "
                          << stats.copyBlowsIgnored;
@@ -2432,7 +2485,7 @@ void WriteStatus() {
                     << " of " << stats.worldReceived << " (cushion " << stats.worldCushion << " frames, clock started anew " << stats.worldsRebased << " times); deal: own rolls held " << stats.dealsHeld << ", doors made by the host's word "
                     << stats.dealDoorsMade << " (failed " << stats.dealDoorFailures << ", in another place " << stats.dealElsewhere << ", of another kind " << stats.dealOtherKind << ")";
         status << "; copies: sent to their death " << stats.copyDeaths << ", brought back " << stats.copyRevivals << " (from the ghost " << stats.copyGhostRevivals << ", could not be " << stats.copyRevivalsMissed
-               << "); takings told " << stats.taken << " / played from others " << stats.takenApplied << " / missed " << stats.takenMissed << ", machines' touches told " << stats.slotTouchesSent << " / played "
+               << "); takings told " << stats.taken << " / played from others " << stats.takenApplied << " / missed " << stats.takenMissed << " (pedestals given the owner's item first " << stats.takenItemFixes << "), machines' touches told " << stats.slotTouchesSent << " / played "
                << stats.slotTouchesPlayed;
         if (stats.roomFollowsRefused) status << "; ROOMS NOT FOLLOWED INTO (this game's floor has no such room) " << stats.roomFollowsRefused;
         status << ", datagrams refused " << stats.rejected << ", frames lost in pieces " << stats.framesBroken
@@ -2702,8 +2755,9 @@ void Begin(const Setup& setup) {
                 ExchangeSlot(playerDamageSlot, reinterpret_cast<void*>(&OnPlayerDamage), reinterpret_cast<void*>(originalPlayerDamage));
             }
         }
-        // Every member judges who may come into the running match, host and guest alike.
-        if (!failure && !joinsHooked && (rules & kJoin)) {
+        // Every member looks at who would come into the running match, host and guest alike - whatever the rules: a match
+        // of live modules takes nobody in (HoldJoins).
+        if (!failure && !joinsHooked) {
             failure = HookJoins();
             if (failure) {
                 UnhookJoins(); UnhookCode(gateHook); UnhookCode(inputHook); UnhookGrid(); UnhookClear();
@@ -2747,7 +2801,10 @@ DWORD End(bool restoreCompare) {
     DWORD result = ERROR_NOT_READY;
     if (running.load()) {
         running.store(false, std::memory_order_release);
-        UnhookCode(dealHook); UnhookJoins(); UnhookCode(gateHook); UnhookCode(inputHook); UnhookGrid(); UnhookClear();
+        // Between two starts within one match (a player came or left) the newcomers' queue stays watched.
+        if (restoreCompare || !matchChanged.load(std::memory_order_relaxed)) UnhookJoins();
+        if (restoreCompare) matchChanged.store(false, std::memory_order_relaxed);
+        UnhookCode(dealHook); UnhookCode(gateHook); UnhookCode(inputHook); UnhookGrid(); UnhookClear();
         result = ExchangeSlot(slot, reinterpret_cast<void*>(&OnInput), reinterpret_cast<void*>(original));
         const DWORD second = ExchangeSlot(playerSlot, reinterpret_cast<void*>(&OnPlayer), reinterpret_cast<void*>(originalPlayer));
         const DWORD third = ExchangeSlot(damageSlot, reinterpret_cast<void*>(&OnNpcDamage), reinterpret_cast<void*>(originalDamage));
@@ -2796,7 +2853,7 @@ void FollowLog(const std::filesystem::path& path) {
 
 // The state, where the player sees it without looking for a file: the end of the game window's title. It is there from the
 // main menu on ("loaded"), so that a player knows the module is in before a match begins.
-constexpr wchar_t kVersionText[] = L"0.1.6";
+constexpr wchar_t kVersionText[] = L"0.1.7";
 void ShowState(const wchar_t* text) {
     static HWND window = nullptr;
     if (!window || !IsWindow(window)) {
@@ -2849,6 +2906,11 @@ DWORD WINAPI Supervise(void*) noexcept {
                 End(!goesOn);
                 // Done with the match as it stands now: a player who comes (back) into it later is a reason to start again.
                 if (!goesOn) done = Done{startedNumber, match.roster};
+            }
+            // The match ended between two starts of the module (a player had just come or left): what was kept for it goes -
+            // the watch over the newcomers' queue, and the comparison comes back for the next match.
+            if (!running.load() && matchChanged.load(std::memory_order_relaxed) && (!match.on || startedNumber != match.number)) {
+                UnhookJoins(); matchChanged.store(false, std::memory_order_relaxed); Patch(kCompare, kCompareEntry, kCompareEqual);
             }
             if (!match.on) why = L"";
             if (!running.load() && MayStart(match, done, GetTickCount64())) {
