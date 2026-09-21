@@ -432,7 +432,20 @@ constexpr std::array<std::uint8_t, 6> kGetLayerEntry{0x55, 0x8B, 0xEC, 0x6A, 0xF
 constexpr std::uint32_t kFollow = 1, kBehaviour = 2, kClear = 4, kTaken = 8, kGridRule = 16, kFire = 32, kProjectiles = 64, kTears = 128, kDrops = 256,
     kCounters = 512, kDoors = 1024, kTraps = 2048, kBombsRule = 4096, kHurt = 8192, kSlotsRule = 16384, kPets = 32768, kLead = 65536, kLook = 131072, kJoin = 262144, kGate = 524288,
     kDeal = 1048576, kHits = 2097152, kSteady = 4194304, kAllRules = 0x7FFFFF;
-constexpr int kTakenRetryFrames = 30, kAliveBodies = 5; constexpr float kTakenReach = 120.0f;
+constexpr int kTakenRetryFrames = 30, kAliveBodies = 5, kGoneBodies = 5, kRevivalGraceFrames = 90; constexpr float kTakenReach = 120.0f;
+// A dead player of several becomes a ghost (Entity_Player::MorphToCoopGhost, RVA 0x3d96f0: the death is taken back with
+// Revive, the ghost byte +0x20a9 is set, the collisions go) and comes back with Entity_Player::RevivePlayerGhost (RVA
+// 0x3d93b0, thiscall, no arguments: the game calls it where a ghost is given hearts, where PlayerManager revives the
+// co-op players, and from the player's own update). A copy goes both ways by its owner's word. Seen in a match through
+// Steam: this module had no way back from the ghost - a copy whose owner lived again stayed a ghost (a ghost starts no
+// machine: the slot's collision turns it away at +0x20a9, so that owner's coins "did not go in") - and it killed a copy at
+// the first body that said "ghost". But every game brings its ghosts back by itself where the boss room is cleared (the
+// room's clearing calls PlayerManager's revival of all ghosts, RVA 0x5bfae0), and a guest's room is cleared by the host's
+// word, a ping and more later than the host's: for that long the owner's bodies still say "ghost" of a copy the host's
+// game has just brought back - "he came back and died at once". A copy that has just come back here is given
+// kRevivalGraceFrames for its owner to say the same.
+constexpr std::uintptr_t kReviveGhost = 0x3d93b0;
+constexpr std::array<std::uint8_t, 8> kReviveGhostEntry{0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8, 0x83, 0xEC};
 #pragma pack(push, 1)
 // What a reader outside copies: generation is odd while the content is being written.
 struct Published { std::uint32_t magic, generation; Body body; };
@@ -460,6 +473,7 @@ struct Stats {
     std::uint32_t worldsLate, worldsRebased, worldCushion;
     // A guest's twins: shown or hidden by the host's word; flames sized to the host's hit points; deaths held back right before the twin's update.
     std::uint32_t visibleFixes, flameFixes, deathsHeldAtUpdate;
+    std::uint32_t copyGhostRevivals;   // copies brought back from the ghost by their owner's word, with the game's own RevivePlayerGhost
     float correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax;
 };
 #pragma pack(pop)
@@ -498,6 +512,8 @@ void** slot = nullptr; void** playerSlot = nullptr; void** damageSlot = nullptr;
 WithDevice original = nullptr; PlayerUpdate originalPlayer = nullptr; NpcDamage originalDamage = nullptr, originalPlayerDamage = nullptr;
 std::uint32_t deathTried[kControllers]{};  // per controller: the frame a copy was last sent to its death
 std::uint32_t aliveSeen[kControllers]{};   // per controller: bodies in a row that said the owner lives
+std::uint32_t goneSeen[kControllers]{}, ghostRevived[kControllers]{};   // bodies in a row that said it does not; the frame a ghost copy was last brought back
+std::uint32_t cameBackAt[kControllers]{}; bool wasGone[kControllers]{};   // the frame a copy was last seen to come back in this game; whether it was dead or a ghost a body ago
 // Takings: this game's own, numbered from 1; per remote controller the last one dealt with and since when the next is tried.
 void** pickupSlot = nullptr; Collision originalCollision = nullptr; bool applyingTaken = false;
 void** slotSlot = nullptr; Collision originalSlotCollision = nullptr; std::uint32_t touchedSlot = 0, touchedAt = 0;
@@ -1806,9 +1822,13 @@ void AfterUpdate(std::uintptr_t player) noexcept {
         AcquireSRWLockExclusive(&inboxLock); inbox[controller].appliedSequence = body.sequence; ReleaseSRWLockExclusive(&inboxLock);
         stats.applied++; stats.correctionSum += distance; if (distance > stats.correctionMax) stats.correctionMax = distance;
         const bool ghost = At<std::uint8_t>(player + kGhost) != 0, dying = At<std::uint8_t>(player + kDead) != 0, gone = body.ghost || body.dying;
-        aliveSeen[controller] = gone ? 0 : aliveSeen[controller] + 1;
+        aliveSeen[controller] = gone ? 0 : aliveSeen[controller] + 1; goneSeen[controller] = gone ? goneSeen[controller] + 1 : 0;
+        if (wasGone[controller] && !ghost && !dying) cameBackAt[controller] = frame ? frame : 1;
+        wasGone[controller] = ghost || dying;
         if (gone && !ghost && !dying) {
-            if (frame - deathTried[controller] >= kDeathRetryFrames) {
+            // Not at the first such body, and not while this game has only just brought the copy back by itself (see kReviveGhost).
+            const bool justBack = cameBackAt[controller] && frame - cameBackAt[controller] < static_cast<std::uint32_t>(kRevivalGraceFrames);
+            if (goneSeen[controller] >= static_cast<std::uint32_t>(kGoneBodies) && !justBack && frame - deathTried[controller] >= kDeathRetryFrames) {
                 deathTried[controller] = frame; stats.copyDeaths++;
                 static std::uint8_t nobody[0x40]{};   // an empty damage source, as the game's own Kill() builds one
                 originalPlayerDamage(reinterpret_cast<void*>(player), 1000.0f, 0, 0, nobody, 0);
@@ -1816,7 +1836,13 @@ void AfterUpdate(std::uintptr_t player) noexcept {
         } else if (!gone && dying && !ghost) {
             if (aliveSeen[controller] >= static_cast<std::uint32_t>(kAliveBodies)) { reinterpret_cast<PlayerUpdate>(base + kRevive)(reinterpret_cast<void*>(player)); stats.copyRevivals++; }
         } else if (!gone && ghost) {
-            stats.copyRevivalsMissed++;
+            // The owner lives again and its copy is a ghost here: back with the game's own function, and the owner's hearts over what that gives.
+            if (aliveSeen[controller] >= static_cast<std::uint32_t>(kAliveBodies) && frame - ghostRevived[controller] >= static_cast<std::uint32_t>(kDeathRetryFrames)) {
+                ghostRevived[controller] = frame ? frame : 1;
+                reinterpret_cast<PlayerUpdate>(base + kReviveGhost)(reinterpret_cast<void*>(player));
+                for (int h = 0; h < kHealthFields; ++h) At<std::int32_t>(player + kHealth[h]) = body.health[h];
+                if (At<std::uint8_t>(player + kGhost)) stats.copyRevivalsMissed++; else stats.copyGhostRevivals++;
+            }
         } else if (!ghost && !dying) {
             bool fixed = false;
             for (int h = 0; h < kHealthFields; ++h)
@@ -2405,6 +2431,9 @@ void WriteStatus() {
                     << ", deaths held at the update " << stats.deathsHeldAtUpdate << ", flames sized " << stats.flameFixes << "; worlds dropped as overtaken " << stats.worldsLate
                     << " of " << stats.worldReceived << " (cushion " << stats.worldCushion << " frames, clock started anew " << stats.worldsRebased << " times); deal: own rolls held " << stats.dealsHeld << ", doors made by the host's word "
                     << stats.dealDoorsMade << " (failed " << stats.dealDoorFailures << ", in another place " << stats.dealElsewhere << ", of another kind " << stats.dealOtherKind << ")";
+        status << "; copies: sent to their death " << stats.copyDeaths << ", brought back " << stats.copyRevivals << " (from the ghost " << stats.copyGhostRevivals << ", could not be " << stats.copyRevivalsMissed
+               << "); takings told " << stats.taken << " / played from others " << stats.takenApplied << " / missed " << stats.takenMissed << ", machines' touches told " << stats.slotTouchesSent << " / played "
+               << stats.slotTouchesPlayed;
         if (stats.roomFollowsRefused) status << "; ROOMS NOT FOLLOWED INTO (this game's floor has no such room) " << stats.roomFollowsRefused;
         status << ", datagrams refused " << stats.rejected << ", frames lost in pieces " << stats.framesBroken
                << ", frames over 45 ms " << stats.longFrames << " of " << stats.published << "\n";
@@ -2544,6 +2573,7 @@ void Begin(const Setup& setup) {
             std::memcmp(reinterpret_cast<void*>(base + kInputInsert), kInputInsertEntry.data(), kInputInsertEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kInputErase), kInputEraseEntry.data(), kInputEraseEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kGetLayer), kGetLayerEntry.data(), kGetLayerEntry.size()) != 0 ||
+            std::memcmp(reinterpret_cast<void*>(base + kReviveGhost), kReviveGhostEntry.data(), kReviveGhostEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kInitDeal), kInitDealEntry.data(), kInitDealEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kRoomByIdx), kRoomByIdxEntry.data(), kRoomByIdxEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kSpawn), kSpawnEntry.data(), kSpawnEntry.size()) != 0) throw static_cast<DWORD>(ERROR_REVISION_MISMATCH);
@@ -2570,7 +2600,7 @@ void Begin(const Setup& setup) {
         for (int c = 0; c < kControllers; ++c) { shotsInbox[c] = ShotsInbox{}; knownTears[c] = Known{}; knownBombs[c] = Known{}; tearsHeardAt[c] = 0; }
         for (auto& box : inbox) box = Inbox{};
         for (auto& tried : deathTried) tried = 0;
-        for (int c = 0; c < kControllers; ++c) { aliveSeen[c] = takenDone[c] = takenSince[c] = 0; takenKnown[c] = false; hitsPlayed[c] = 0; hitsKnown[c] = false; }
+        for (int c = 0; c < kControllers; ++c) { aliveSeen[c] = goneSeen[c] = ghostRevived[c] = cameBackAt[c] = takenDone[c] = takenSince[c] = 0; wasGone[c] = false; takenKnown[c] = false; hitsPlayed[c] = 0; hitsKnown[c] = false; }
         ownHits = 0; ownBlows = HitLog{}; for (auto& done : blowsDone) done = 0;
         hostDealSeed = 0; hostDealFloor = 0xffffffff; dealDiffering = dealTried = 0; applyingDeal = false;
         for (auto& taken : takenLog) taken = Taken{};
