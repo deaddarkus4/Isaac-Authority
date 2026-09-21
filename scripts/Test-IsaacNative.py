@@ -188,6 +188,13 @@ def positions():
     raise RuntimeError("No clean sample")
 
 
+def room_of(game):
+    """The floor and the room a game is in: a copy's gap means something only between games of one room."""
+    u32 = lambda a: struct.unpack("<I", game["process"].read(a, 4))[0]
+    at = u32(game["process"].base + reader.GAME_RVA)
+    return u32(at), u32(at + 4), u32(at + 0x18304), u32(at + 0x1830c)
+
+
 def stats(game):
     if game["descriptor"]["statsBytes"] != STATS.size:
         raise RuntimeError(f"The module counts {game['descriptor']['statsBytes']} bytes of statistics, this script expects {STATS.size}")
@@ -198,27 +205,33 @@ def stats(game):
 def walk(game, key, seconds):
     """Hold a key in one game; returns key-to-own-movement in ms and, per sample, how far the other games' copy of this
     player is from the owner's own."""
-    own = game["descriptor"]["ownController"]; control = pair.HostWindow(game["pid"]); gaps = []; first = None
+    own = game["descriptor"]["ownController"]; control = pair.HostWindow(game["pid"]); gaps = []; first = None; apart = 0
     try:
         time.sleep(0.4); before = positions(); start = time.perf_counter(); control.key(key, True)
         try:
             while time.perf_counter() - start < seconds:
-                now = positions(); mine = now[game["pid"]][own]
+                # The held key can walk the player through a door, and the games change room some frames apart: a sample
+                # taken then measures the two rooms' doors, not the copy (274 px in the first live run of 0.1.3). The rooms
+                # are read on both sides of the places, so a change in between is seen as well.
+                rooms = [room_of(g) for g in games]; now = positions(); rooms += [room_of(g) for g in games]; mine = now[game["pid"]][own]
                 if first is None and mine != before[game["pid"]][own]:
                     first = (time.perf_counter() - start) * 1000
-                for other in games:
-                    if other is not game:
-                        theirs = now[other["pid"]][own]; gaps.append(((mine[0] - theirs[0]) ** 2 + (mine[1] - theirs[1]) ** 2) ** 0.5)
+                if len(set(rooms)) != 1:
+                    apart += 1
+                else:
+                    for other in games:
+                        if other is not game:
+                            theirs = now[other["pid"]][own]; gaps.append(((mine[0] - theirs[0]) ** 2 + (mine[1] - theirs[1]) ** 2) ** 0.5)
                 time.sleep(0.004)
         finally:
             control.key(key, False)
-        time.sleep(1.2); end = positions()
+        time.sleep(1.2); end = positions(); together = len({room_of(g) for g in games}) == 1
     finally:
         control.release()
     mine = end[game["pid"]][own]; rest = max(((mine[0] - end[o["pid"]][own][0]) ** 2 + (mine[1] - end[o["pid"]][own][1]) ** 2) ** 0.5 for o in games if o is not game)
     return dict(game=game["title"], key=key, keyToOwnMovementMs=round(first) if first is not None else None,
-                copyGapWhileMoving=dict(median=round(statistics.median(gaps), 2), p95=round(sorted(gaps)[int(len(gaps) * 0.95)], 2), max=round(max(gaps), 2)),
-                copyGapAtRest=round(rest, 3))
+                copyGapWhileMoving=dict(median=round(statistics.median(gaps), 2), p95=round(sorted(gaps)[int(len(gaps) * 0.95)], 2), max=round(max(gaps), 2)) if gaps else None,
+                samplesInOtherRooms=apart, copyGapAtRest=round(rest, 3) if together else None)
 
 
 label = ["idle"]; big = []

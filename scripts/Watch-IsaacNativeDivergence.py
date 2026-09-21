@@ -24,6 +24,7 @@ spec = importlib.util.spec_from_file_location("state_reader", scripts / "Read-Is
 NPC, PICKUP, PLAYER, SLOT = 0x767468, 0x767f24, 0x76bdd0, 0x764c50
 GRID = {0x768738: "rock", 0x768648: "poop", 0x769300: "tnt", 0x769558: "web", 0x768698: "door"}
 HEARTS = (0x1340, 0x1344, 0x1348, 0x134c, 0x1350, 0x1d88, 0x1da4, 0x194c)
+PLACE = 10.0   # a pickup lies elsewhere: more than a quarter of a cell between the games
 
 
 def snapshot(process):
@@ -39,9 +40,11 @@ def snapshot(process):
             continue
         kind, variant, subtype = struct.unpack_from("<3I", blob, 0x28); seed = struct.unpack_from("<I", blob, 0x3ec)[0]; x, y = struct.unpack_from("<2f", blob, 0x33c)
         if table == NPC:
-            state["enemies"][seed] = (f"{kind}.{variant}.{subtype}", round(struct.unpack_from("<f", blob, 0x380)[0], 1), round(x / 40), round(y / 40))
+            # Whom it collides with and the layer it is drawn in (+0x184, +0x188, +0x354): what a fireplace that went out changes.
+            state["enemies"][seed] = (f"{kind}.{variant}.{subtype}", round(struct.unpack_from("<f", blob, 0x380)[0], 1), round(x / 40), round(y / 40),
+                                      struct.unpack_from("<2I", blob, 0x184) + struct.unpack_from("<i", blob, 0x354))
         elif table == PICKUP:
-            state["pickups"][seed] = (f"5.{variant}.{subtype}", struct.unpack_from("<i", blob, 0x534)[0])
+            state["pickups"][seed] = (f"5.{variant}.{subtype}", struct.unpack_from("<i", blob, 0x534)[0], x, y)
         elif table == SLOT:
             state["slots"][seed] = (f"6.{variant}.{subtype}", struct.unpack_from("<i", blob, 0x410)[0])
     for index, cell in enumerate(struct.unpack("<448I", process.read(room + 0x24, 448 * 4))):
@@ -80,8 +83,15 @@ def differences(host, guest):
         for seed in a.keys() & b.keys():
             if key == "enemies" and (a[seed][0] != b[seed][0] or abs(a[seed][1] - b[seed][1]) > 0.05):
                 found.add(f"enemy {a[seed][0]}: hit points host {a[seed][1]}, guest {b[seed][1]}" if a[seed][0] == b[seed][0] else f"enemy of one seed: host {a[seed][0]}, guest {b[seed][0]}")
-            elif key != "enemies" and a[seed] != b[seed]:
-                found.add(f"{title[:-1]} of one seed: host {a[seed]}, guest {b[seed]}")
+            elif key == "enemies" and a[seed][4] != b[seed][4]:
+                found.add(f"enemy {a[seed][0]}: grid collision, entity collision, layer host {a[seed][4]}, guest {b[seed][4]}")
+            elif key == "pickups" and a[seed][:2] != b[seed][:2]:
+                found.add(f"pickup of one seed: host {a[seed][:2]}, guest {b[seed][:2]}")
+            elif key == "pickups" and abs(a[seed][2] - b[seed][2]) + abs(a[seed][3] - b[seed][3]) > PLACE:
+                # Said in half cells: a pickup at rest keeps saying the same, one on its way never says the same twice.
+                found.add(f"pickup {a[seed][0]} place (half cells): host {round(a[seed][2] / 20), round(a[seed][3] / 20)}, guest {round(b[seed][2] / 20), round(b[seed][3] / 20)}")
+            elif key == "slots" and a[seed] != b[seed]:
+                found.add(f"slot of one seed: host {a[seed]}, guest {b[seed]}")
     for index in sorted(set(host["grid"]) | set(guest["grid"])):
         if host["grid"].get(index) != guest["grid"].get(index):
             found.add(f"grid cell {index}: host {host['grid'].get(index)}, guest {guest['grid'].get(index)}")
