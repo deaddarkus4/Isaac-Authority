@@ -390,9 +390,34 @@ constexpr std::uintptr_t kKeys = 0x135c, kBombs = 0x1364, kCoins = 0x1368, kPlay
 constexpr std::uintptr_t kDoorTable = 0x768698, kDoorBusted = 0x391, kDoorRefresh = 0x30ee40; constexpr std::uint32_t kGridDoor = 16;
 constexpr std::array<std::uint8_t, 8> kDoorRefreshEntry{0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68, 0x6D, 0xC9};
 constexpr std::uint32_t kDoorSnapshots = 4, kDoorHoldFrames = 30;
+// The door to the floor's deal and the room behind it (docs/j460-deal-and-hits.md). Room::TrySpawnDevilRoomDoor (RVA
+// 0x3f83b0, thiscall on the room: animate, force) holds the chance against the level's generator of deals (Game+0x182e4),
+// has Level::InitializeDevilAngelRoom (RVA 0x3499a0, thiscall on the game: force an angel's, force a devil's) make room -1
+// - its kind by that generator, its layout by the generator's next values - and puts the door into a slot the boss room's
+// own seed names. The chance is made of what a game remembers of the floor (red hearts lost, ...), and two games of this
+// module remember different things. Seen in a match through Steam: the host's game made the door and the guest's did not;
+// the guest followed the host into room -1, which its game had never made, showed black and ended. So a guest's game does
+// not roll (the unforced call is held), the host's doors name the deal they lead to and its world the generator's value
+// its room was made from, and a guest makes both with the game's same two functions. And nobody follows anybody into a
+// room its own game has no layout for: Level::GetRoomByIdx (RVA 0x340bc0, thiscall on the game: index, dimension) gives
+// the descriptor, the layout is at +0x10 of it. A door keeps the room it leads to at +0x394 and that room's type at
+// +0x160; the room keeps its eight door slots from +0x724. All of these read in the user's running game.
+constexpr std::uintptr_t kDealDoor = 0x3f83b0, kInitDeal = 0x3499a0, kRoomByIdx = 0x340bc0, kDealRng = 0x182e4, kRoomData = 0x10, kRoomConfigType = 0x8;
+constexpr std::uintptr_t kDoorLeadsTo = 0x394, kDoorThatRoomType = 0x160, kDoorSlots = 0x724;
+constexpr std::int32_t kDealRoomIndex = -1; constexpr std::uint32_t kDealRetryFrames = 90;
+constexpr std::array<std::uint8_t, 6> kDealDoorEntry{0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08};   // push ebx; mov ebx, esp; sub esp, 8: whole instructions
+constexpr std::array<std::uint8_t, 6> kInitDealEntry{0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68}, kRoomByIdxEntry{0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68};
+// A blow's source as the game hands it to TakeDamage and to the grid's Hurt and Destroy (an EntityRef: read in the code of
+// the enemy's TakeDamage, RVA 0x2d60a0): the type +0, the variant +4, the spawner's type +8, a place and a velocity from
+// +0x10, the entity itself +0x24. DamageFlag COUNTDOWN (0x40, the base TakeDamage, RVA 0x2ace60): the blow lands only while
+// the target's own countdown is 0, and sets it - what makes a laser hit every few frames and not every frame. The grid
+// entity keeps its cell at +0x24.
+constexpr std::uintptr_t kRefVariant = 0x4, kRefSpawnerType = 0x8, kRefPosition = 0x10, kRefVelocity = 0x18, kRefEntity = 0x24, kGridIndex = 0x24;
+constexpr std::uint32_t kDamageCountdown = 0x40, kRefBytes = 0x40; constexpr float kMostDamage = 1.0e6f;
 // The rules that can be left out: the third word of the configuration is their mask in hex.
 constexpr std::uint32_t kFollow = 1, kBehaviour = 2, kClear = 4, kTaken = 8, kGridRule = 16, kFire = 32, kProjectiles = 64, kTears = 128, kDrops = 256,
-    kCounters = 512, kDoors = 1024, kTraps = 2048, kBombsRule = 4096, kHurt = 8192, kSlotsRule = 16384, kPets = 32768, kLead = 65536, kLook = 131072, kJoin = 262144, kGate = 524288, kAllRules = 0xFFFFF;
+    kCounters = 512, kDoors = 1024, kTraps = 2048, kBombsRule = 4096, kHurt = 8192, kSlotsRule = 16384, kPets = 32768, kLead = 65536, kLook = 131072, kJoin = 262144, kGate = 524288,
+    kDeal = 1048576, kHits = 2097152, kAllRules = 0x3FFFFF;
 constexpr int kTakenRetryFrames = 30, kAliveBodies = 5; constexpr float kTakenReach = 120.0f;
 #pragma pack(push, 1)
 // What a reader outside copies: generation is odd while the content is being written.
@@ -413,6 +438,10 @@ struct Stats {
     // Remote players' input: records heard; frames that played the next one / the last one again - which the game's lockstep would have waited for / records jumped over; records that came too late to be played; packets for a counted frame let through quietly; records that did not read as the game read them.
     std::uint32_t inputsHeard, inputsPlayed, inputsRepeated, inputsSkipped, inputsStale, inputsLate, inputsMisread;
     std::uint32_t joinsAdmitted, joinsRefused, joinsUnjudged, joinLacking;   // newcomers let through to the game's own entry; taken out of its queue; queues left alone because a member's save was not known; unlocks the last one refused lacked
+    // Rooms not followed into because this game has no layout for them. The deal: a guest's own rolls held; doors made by the host's word / calls that made none / doors that came to stand in another cell than the host's / rooms of another kind than the host's.
+    std::uint32_t roomFollowsRefused, dealsHeld, dealDoorsMade, dealDoorFailures, dealElsewhere, dealOtherKind;
+    // Blows of the own player told (a guest) / a neighbour's blows played on this world, with no target here, never come (the host) / blows of a copy's that counted for nothing (the host).
+    std::uint32_t blowsSent, blowsPlayed, blowsMissed, blowsLost, copyBlowsIgnored;
     float correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax;
 };
 #pragma pack(pop)
@@ -442,6 +471,9 @@ using ProcessJoins = void(__thiscall*)(void*, std::uint32_t);
 using EraseJoin = std::uint32_t(__thiscall*)(void*, const std::uint64_t*);
 using DequeClear = void(__thiscall*)(void*);
 using DequePush = void(__thiscall*)(void*, const float*);   // a deque of points: the point is copied
+using DealDoor = char(__thiscall*)(void*, char, char);            // the room: animate, force
+using InitDeal = void(__thiscall*)(void*, char, char);            // the game (its level): force an angel's room, force a devil's
+using RoomByIdx = std::uintptr_t(__thiscall*)(void*, int, int);   // the game (its level): grid index, dimension (-1: the present one)
 std::uintptr_t base = 0;
 void** slot = nullptr; void** playerSlot = nullptr; void** damageSlot = nullptr; void** playerDamageSlot = nullptr;
 WithDevice original = nullptr; PlayerUpdate originalPlayer = nullptr; NpcDamage originalDamage = nullptr, originalPlayerDamage = nullptr;
@@ -461,13 +493,19 @@ int ownController = -1; bool host = false;
 bool cheating = false, cheatGod = false, cheatDamage = false; constexpr float kCheatDamage = 20.0f;
 // Blows that landed on the own player; per copy, how many of its owner's this game has played, and whether that count is known yet.
 std::uint32_t ownHits = 0, hitsPlayed[kControllers]{}; bool hitsKnown[kControllers]{};
+// Blows of the own player at the world, to be told (a guest); per remote controller the last number played here (the host).
+HitLog ownBlows; std::uint32_t blowsDone[kControllers]{};
+// The deal. The host: the generator's value its game made this floor's deal room from, and the floor that was. A guest: for
+// how many snapshots the host has had a door to the deal that this game lacks, when it last tried to make one, and whether
+// the call into the game's own making of the door is this module's.
+std::uint32_t hostDealSeed = 0, hostDealFloor = 0xffffffff, dealDiffering = 0, dealTried = 0; bool applyingDeal = false;
 SRWLOCK lifecycle = SRWLOCK_INIT, inboxLock = SRWLOCK_INIT;
 std::atomic<bool> running{false};
 std::atomic<unsigned> counters[2]{};  // reads of the own player's input answered by the keyboard; all other reads
 Published published{}; PublishedWorld publishedWorld{}; PublishedShots publishedShots{};
 Stats stats{};
 struct Inbox { Body body{}; std::uint64_t at = 0, arrivedUs = 0; std::uint32_t appliedSequence = 0, session = 0; };   // session: the owner's start this body is of
-struct ShotsInbox { Shots shots{}; std::uint64_t at = 0; std::uint32_t applied = 0; };
+struct ShotsInbox { Shots shots{}; std::uint64_t at = 0; std::uint32_t applied = 0; bool anew = false; };   // anew: the first of a start of the owner's module - its blows count from 1 again
 std::uint32_t seenSession[kControllers]{};   // the game's thread: the owner's start whose takings and hits this game counts along with
 ShotsInbox shotsInbox[kControllers];
 // The seeds a list has brought here: a shot of such a seed that is missing here has ended here, and is not made again.
@@ -768,18 +806,78 @@ void PublishShots(std::uintptr_t player, std::uintptr_t room, std::uint32_t room
     }
     stats.petsSent += shots.pets;
     stats.tearsSent += shots.count;
+    shots.hits = !host && On(kHits) ? ownBlows.Recent(frame, shots.hit) : 0;   // the host's own blows land on the world itself
     publishedShots.generation++;
     if ((peerCount || steamPeerCount) && frame % 2 == 0) { static std::uint8_t packed[sizeof(Shots)]; SendAll(kOfShots, shots.sequence, packed, PackShots(shots, packed)); }
+}
+
+// Whose a blow is: the device number of the player its source belongs to - the player itself, or whatever it spawned, or a
+// familiar of its - and -1 for nobody's of the players. The source is the game's; a read that fails says nobody's.
+int OwnerOf(const void* source) noexcept {
+    __try {
+        auto entity = source ? At<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(source) + kRefEntity) : 0;
+        for (int depth = 0; entity && depth < 4; ++depth) {
+            const auto table = At<std::uintptr_t>(entity) - base;
+            if (table == kPlayerTable) return At<int>(entity + kController);
+            entity = At<std::uintptr_t>(entity + (table == kFamiliarTable ? kFamiliarPlayer : kSpawner));
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return -1;
+}
+
+// A guest: a blow of the own player as this game saw it land, to be told to the host (see HitLog in native_state.hpp).
+void NoteBlow(std::uint16_t kind, std::uint32_t target, float damage, std::uint32_t flagsLow, std::uint32_t flagsHigh, std::int32_t countdown, const void* source) {
+    const auto game = At<std::uintptr_t>(base + kGame); const auto ref = reinterpret_cast<std::uintptr_t>(source);
+    if (!game || !ref || !(damage >= 0.0f)) return;
+    Hit hit{}; hit.room = At<std::uint32_t>(game + kRoomIndex); hit.kind = kind; hit.target = target; hit.damage = damage < kMostDamage ? damage : kMostDamage;
+    hit.flagsLow = flagsLow; hit.flagsHigh = flagsHigh; hit.countdown = countdown < 0 ? 0 : countdown > 10000 ? 10000 : countdown;
+    hit.sourceType = static_cast<std::uint16_t>(At<std::uint32_t>(ref)); hit.sourceVariant = static_cast<std::uint16_t>(At<std::uint32_t>(ref + kRefVariant));
+    hit.spawnerType = static_cast<std::uint16_t>(At<std::uint32_t>(ref + kRefSpawnerType));
+    ownBlows.Note(hit, frame); stats.blowsSent++;
+}
+
+// The seed under which the host knows a guest's enemy: its own, or the one it was paired with by kind and place.
+std::uint32_t HostSeedOf(std::uintptr_t entity) {
+    const auto seed = At<std::uint32_t>(entity + kSeed);
+    for (std::uint32_t a = 0; a < aliasCount; ++a) if (aliases[a].localSeed == seed) return aliases[a].hostSeed;
+    return seed;
+}
+
+// The host: a neighbour's blows that have not been played here yet, each once, with the game's own TakeDamage or the grid's
+// own Hurt and Destroy - past this module's hooks, for the source is that neighbour's copy, whose blows count for nothing here.
+void PlayBlows(std::uintptr_t player, int controller, std::uintptr_t room, std::uint32_t roomIndex, const Shots& shots) {
+    const auto data = At<std::uintptr_t>(room + kListData); const auto count = At<std::uint32_t>(room + kListCount);
+    for (std::uint32_t n = FreshHits(shots.hit, shots.hits, blowsDone[controller], stats.blowsLost); n < shots.hits; ++n) {
+        const auto& hit = shots.hit[n];
+        std::uint8_t source[kRefBytes]{}; const auto ref = reinterpret_cast<std::uintptr_t>(source);
+        At<std::uint32_t>(ref) = hit.sourceType; At<std::uint32_t>(ref + kRefVariant) = hit.sourceVariant; At<std::uint32_t>(ref + kRefSpawnerType) = hit.spawnerType;
+        std::memcpy(source + kRefPosition, reinterpret_cast<void*>(player + kPosition), 8); std::memcpy(source + kRefVelocity, reinterpret_cast<void*>(player + kVelocity), 8);
+        At<std::uintptr_t>(ref + kRefEntity) = player;
+        bool played = false;
+        if (hit.room != roomIndex) { stats.blowsMissed++; continue; }
+        if (hit.kind == 0) {
+            for (std::uint32_t i = 0; data && count <= 4096 && i < count && !played; ++i) {
+                const auto entity = At<std::uintptr_t>(data + i * sizeof(std::uintptr_t));
+                if (!entity || At<std::uintptr_t>(entity) != base + kNpcTable || !At<std::uint8_t>(entity + kExists) || At<std::uint8_t>(entity + kDead) || At<std::uint32_t>(entity + kSeed) != hit.target) continue;
+                originalDamage(reinterpret_cast<void*>(entity), hit.damage, hit.flagsLow, hit.flagsHigh, source, hit.countdown); played = true;
+            }
+        } else if (hit.target < kGridCells) {
+            const auto& hook = gridHooks[hit.kind - 1]; const auto grid = At<std::uintptr_t>(room + kGrid + hit.target * 4);
+            if (grid && hook.original && At<std::uintptr_t>(grid) == base + hook.table) { reinterpret_cast<GridChange>(hook.original)(reinterpret_cast<void*>(grid), hit.flagsLow, source); played = true; }
+        }
+        if (played) stats.blowsPlayed++; else stats.blowsMissed++;
+    }
 }
 
 // A remote player's tears over its copy's, and the copy's own fire held while they come.
 void ApplyTears(std::uintptr_t player, int controller, std::uintptr_t room, std::uint32_t roomIndex) {
     static Shots shots;   // the game's thread only
     bool fresh = false; const auto now = GetTickCount64();
-    AcquireSRWLockShared(&inboxLock);
-    const auto& box = shotsInbox[controller];
+    AcquireSRWLockExclusive(&inboxLock);
+    auto& box = shotsInbox[controller];
     if (box.shots.sequence && box.shots.sequence != box.applied && now - box.at <= kFreshMs) { shots = box.shots; fresh = true; }
-    ReleaseSRWLockShared(&inboxLock);
+    if (box.anew) { box.anew = false; blowsDone[controller] = 0; }
+    ReleaseSRWLockExclusive(&inboxLock);
     if (fresh && shots.room == roomIndex) {
         const bool complete = shots.count + shots.bombs < kMaxTears;
         if (On(kTears)) { doing = kTears; ApplyShots(room, shots.shot, shots.count, complete, kOfTear, player, knownTears[controller], stats.tearsMade, stats.tearsEnded, stats.tearsDropped); }
@@ -787,6 +885,7 @@ void ApplyTears(std::uintptr_t player, int controller, std::uintptr_t room, std:
             doing = kBombsRule;
             ApplyShots(room, shots.shot + shots.count, shots.bombs, complete, kOfBomb, player, knownBombs[controller], stats.bombsMade, stats.bombsEnded, stats.bombsDropped);
         }
+        if (host && On(kHits) && shots.hits) { doing = kHits; PlayBlows(player, controller, room, roomIndex, shots); }
         doing = 0;
         for (std::uint32_t b = 0; b < shots.bombs; ++b) if (shots.shot[shots.count + b].fallingAccel != 0.0f) tearsHeardAt[controller] = now;   // fetus bombs are this player's fire
         AcquireSRWLockExclusive(&inboxLock); shotsInbox[controller].applied = shots.sequence; ReleaseSRWLockExclusive(&inboxLock);
@@ -896,8 +995,12 @@ void PublishWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t room
     for (std::uint32_t i = 0; i < kGridCells && world.doors < kMaxDoors; ++i) {
         const auto grid = At<std::uintptr_t>(room + kGrid + i * 4);
         if (!grid || At<std::uintptr_t>(grid) != base + kDoorTable || At<std::uint32_t>(grid + kGridType) != kGridDoor) continue;
-        world.door[world.doors++] = DoorState{static_cast<std::uint16_t>(i), At<std::uint8_t>(grid + kDoorBusted), 0, At<std::int32_t>(grid + kGridVariant), At<std::int32_t>(grid + kGridState)};
+        const auto that = At<std::uint32_t>(grid + kDoorThatRoomType);
+        const bool deal = At<std::int32_t>(grid + kDoorLeadsTo) == kDealRoomIndex && (that == kDevilRoom || that == kAngelRoom);
+        world.door[world.doors++] = DoorState{static_cast<std::uint16_t>(i), At<std::uint8_t>(grid + kDoorBusted), static_cast<std::uint8_t>(deal ? that : 0), At<std::int32_t>(grid + kGridVariant),
+                                              At<std::int32_t>(grid + kGridState)};
     }
+    world.dealSeed = hostDealFloor == world.floor ? hostDealSeed : 0;
     world.coins = At<std::int32_t>(player + kCoins); world.bombs = At<std::int32_t>(player + kBombs); world.keys = At<std::int32_t>(player + kKeys);
     // The grid. More changed cells than fit: a window over them that moves with every snapshot.
     world.cells = 0; std::uint32_t changed = 0, seen = 0;
@@ -1110,6 +1213,35 @@ void ApplyDoors(std::uintptr_t room, const World& world) {
     }
 }
 
+// Guest: the host's game has a door to the floor's deal and this one has none (its own roll is held, see OnDealDoor). The
+// room first - from the generator's value the host's was made from and of the host's kind - then the door, both with the
+// game's own functions; the slot the door goes into is named by the boss room's seed, which the two games share. With two
+// doors at the host (Duality) the game's own making of both is left to it: the room is made when one of them is entered.
+char CallDealDoor(void* room, char animate, char force);
+void ApplyDeal(std::uintptr_t game, std::uintptr_t room, const World& world) {
+    std::uint32_t wanted = 0; std::uint8_t kind = 0; std::uint16_t cell = 0;
+    for (std::uint32_t d = 0; d < world.doors && d < kMaxDoors; ++d) if (world.door[d].deal && !wanted++) { kind = world.door[d].deal; cell = world.door[d].cell; }
+    const auto leadsToDeal = [&](std::uintptr_t door) { return door && At<std::uintptr_t>(door) == base + kDoorTable && At<std::int32_t>(door + kDoorLeadsTo) == kDealRoomIndex; };
+    bool have = false;
+    for (std::uint32_t s = 0; s < 8 && !have; ++s) have = leadsToDeal(At<std::uintptr_t>(room + kDoorSlots + s * 4));
+    if (!wanted || have) { dealDiffering = 0; return; }
+    if (++dealDiffering < kDoorSnapshots || (dealTried && frame - dealTried < kDealRetryFrames)) return;
+    dealTried = frame ? frame : 1; dealDiffering = 0;
+    const auto descriptor = reinterpret_cast<RoomByIdx>(base + kRoomByIdx)(reinterpret_cast<void*>(game), kDealRoomIndex, -1);
+    if (!descriptor) { stats.dealDoorFailures++; return; }
+    if (wanted == 1 && !At<std::uintptr_t>(descriptor + kRoomData)) {
+        if (world.dealSeed) At<std::uint32_t>(game + kDealRng) = world.dealSeed;
+        reinterpret_cast<InitDeal>(base + kInitDeal)(reinterpret_cast<void*>(game), kind == kAngelRoom, kind == kDevilRoom);
+    }
+    const auto layout = At<std::uintptr_t>(descriptor + kRoomData);
+    if (wanted == 1 && layout && At<std::uint32_t>(layout + kRoomConfigType) != kind) stats.dealOtherKind++;
+    applyingDeal = true; const char made = CallDealDoor(reinterpret_cast<void*>(room), 1, 1); applyingDeal = false;
+    if (!made) { stats.dealDoorFailures++; return; }
+    stats.dealDoorsMade++;
+    const auto there = cell < kGridCells ? At<std::uintptr_t>(room + kGrid + cell * 4) : 0;
+    if (wanted == 1 && !leadsToDeal(there)) stats.dealElsewhere++;
+}
+
 // Guest: the team's coins, bombs and keys are the host's, once they have stood still here for a while.
 void ApplyCounters(std::uintptr_t game, std::uintptr_t player, const World& world) {
     const std::uintptr_t offsets[3] = {kCoins, kBombs, kKeys}; const std::int32_t hosts[3] = {world.coins, world.bombs, world.keys};
@@ -1277,6 +1409,7 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
     if (On(kSlotsRule)) { doing = kSlotsRule; ApplySlots(room, world); }
     if (On(kDrops)) { doing = kDrops; ApplyDrops(room, world); }
     if (On(kDoors)) { doing = kDoors; ApplyDoors(room, world); }
+    if (On(kDeal) && game) { doing = kDeal; ApplyDeal(game, room, world); }
     doing = 0;
     stats.worldApplied++; worldApplied = world.sequence;
 }
@@ -1422,6 +1555,16 @@ void ApplyTaken(std::uintptr_t player, int controller, const Body& body, std::ui
     }
 }
 
+// Whether this game's floor has that room at all, layout and everything: the rooms off the grid - a deal, a crawl space,
+// the error room - are made only when the game itself has a reason to, and a transition into one that was never made here
+// shows black and ends the game (seen live, a guest that followed its host into a deal its own game had not rolled).
+bool HasRoom(std::uintptr_t game, std::uint32_t index, std::uint32_t dimension) {
+    __try {
+        const auto descriptor = reinterpret_cast<RoomByIdx>(base + kRoomByIdx)(reinterpret_cast<void*>(game), static_cast<int>(index), static_cast<int>(dimension));
+        return descriptor && At<std::uintptr_t>(descriptor + kRoomData) != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 bool RequestRoom(std::uintptr_t game, std::uint32_t index, int direction, std::uint32_t dimension) {
     __try { reinterpret_cast<Transition>(base + kTransition)(reinterpret_cast<void*>(game), static_cast<int>(index), direction, kFade, nullptr, static_cast<int>(dimension)); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
@@ -1478,6 +1621,7 @@ void FollowRoom(std::uintptr_t game, std::uint32_t roomIndex) {
     }
     ReleaseSRWLockShared(&inboxLock);
     if (!found || At<std::uint32_t>(game + kRoomTransition) != 0 || (followTried && frame - followTried < kFollowRetryFrames)) return;
+    if (!HasRoom(game, leader.room, leader.dimension)) { followTried = frame ? frame : 1; stats.roomFollowsRefused++; return; }   // asked again in a while: the room may be made by then
     const auto step = static_cast<std::int32_t>(leader.room) - static_cast<std::int32_t>(roomIndex);
     const int direction = step == 1 ? 2 : step == -1 ? 0 : step == kGridWidth ? 3 : step == -kGridWidth ? 1 : -1;   // left 0, up 1, right 2, down 3
     followTried = frame ? frame : 1;
@@ -1536,7 +1680,7 @@ void TesterKeys(std::uintptr_t room) {
 // longer hidden among refused datagrams, and it is held against the rule that was at work: a rule that reads a wrong
 // place faults on every frame, each time in the middle of the game's own code, and nothing good comes of the next one.
 void TakeFault() {
-    stats.gameFaults++; applyingTaken = false; applyingGrid = false;
+    stats.gameFaults++; applyingTaken = false; applyingGrid = false; applyingDeal = false;
     if (doing) {
         std::uint32_t bit = 0; while (bit < 31 && !(doing >> bit & 1)) ++bit;
         if (++ruleFaults[bit] >= kFaultsToSwitchOff) { faulted |= doing; stats.faultRules = faulted; }
@@ -1584,7 +1728,7 @@ void AfterUpdate(std::uintptr_t player) noexcept {
             return;
         }
         if (controller < 0 || controller >= kControllers || !Live()) return;
-        if (room && (On(kTears) || On(kBombsRule) || On(kPets))) ApplyTears(player, controller, room, roomIndex);
+        if (room && (On(kTears) || On(kBombsRule) || On(kPets) || On(kHits))) ApplyTears(player, controller, room, roomIndex);
         Body body{}; bool fresh = false; std::uint64_t arrivedUs = 0; std::uint32_t ownerSession = 0;
         AcquireSRWLockShared(&inboxLock);
         if (inbox[controller].body.sequence && inbox[controller].body.sequence != inbox[controller].appliedSequence) {
@@ -1646,12 +1790,24 @@ void __fastcall OnPlayer(void* object, void*) {
 
 char __fastcall OnNpcDamage(void* self, void*, float damage, std::uint32_t flagsLow, std::uint32_t flagsHigh, void* source, int countdown) {
     if (cheating && cheatDamage && running.load(std::memory_order_acquire)) damage *= kCheatDamage;   // the tester's help
-    if (Live() && !host) {
-        const auto entity = reinterpret_cast<std::uintptr_t>(self); const float hitPoints = At<float>(entity + kHitPoints);
-        if (At<std::uint32_t>(entity + kType) == kFireplace && On(kFire) && HostRules()) { stats.fireHeld++; return 0; }
-        if (At<float>(entity + kMaxHitPoints) > 0 && damage >= hitPoints) { damage = hitPoints > 0.02f ? hitPoints - 0.01f : 0.0f; stats.deathsHeld++; }
+    if (!Live()) return originalDamage(self, damage, flagsLow, flagsHigh, source, countdown);
+    const int owner = On(kHits) ? OwnerOf(source) : -1;
+    // The host: a copy's blow counts for nothing - its owner's game tells what landed there, and PlayBlows plays that.
+    if (host) {
+        if (owner >= 0 && owner != ownController) { stats.copyBlowsIgnored++; return 0; }
+        return originalDamage(self, damage, flagsLow, flagsHigh, source, countdown);
     }
-    return originalDamage(self, damage, flagsLow, flagsHigh, source, countdown);
+    const auto entity = reinterpret_cast<std::uintptr_t>(self); const float hitPoints = At<float>(entity + kHitPoints), asked = damage; const bool own = owner == ownController;
+    // A fireplace is the host's alone, so its own countdown is: the blow is told as it was asked for.
+    if (At<std::uint32_t>(entity + kType) == kFireplace && On(kFire) && HostRules()) {
+        if (own) NoteBlow(0, HostSeedOf(entity), asked, flagsLow, flagsHigh, countdown, source);
+        stats.fireHeld++; return 0;
+    }
+    if (At<float>(entity + kMaxHitPoints) > 0 && damage >= hitPoints) { damage = hitPoints > 0.02f ? hitPoints - 0.01f : 0.0f; stats.deathsHeld++; }
+    const char landed = originalDamage(self, damage, flagsLow, flagsHigh, source, countdown);
+    // What landed here is told as the game asked for it, before the death was held back; its countdown has been counted here already.
+    if (landed && own) NoteBlow(0, HostSeedOf(entity), asked, flagsLow & ~kDamageCountdown, flagsHigh, 0, source);
+    return landed;
 }
 
 // A guest's enemy runs the game's own code from a state the host named, not one it reached by itself, and whatever the
@@ -1702,6 +1858,12 @@ bool HostRules() {
 bool GridHeld() { return !applyingGrid && On(kGridRule) && HostRules(); }
 
 template <int N> std::uint32_t __fastcall OnGrid(void* self, void*, std::uint32_t argument, void* source) {
+    // As with enemies: a copy's blow at the grid counts for nothing at the host, and a guest tells its own player's.
+    if (Live() && On(kHits) && !applyingGrid) {
+        const int owner = OwnerOf(source);
+        if (host && owner >= 0 && owner != ownController) { stats.copyBlowsIgnored++; return 0; }
+        if (!host && owner == ownController) NoteBlow(static_cast<std::uint16_t>(N + 1), At<std::uint32_t>(reinterpret_cast<std::uintptr_t>(self) + kGridIndex), 0.0f, argument, 0, 0, source);
+    }
     if (GridHeld()) { stats.gridHeld++; return 0; }
     return reinterpret_cast<GridChange>(gridHooks[N].original)(self, argument, source);
 }
@@ -1891,7 +2053,37 @@ void UnhookCode(CodeHook& hook) {
 
 char __fastcall OnFrameGate(void* net, void*);
 char __fastcall OnProcessInput(void* device, void*, void* message, void* control);
-CodeHook gateHook{kFrameGate, 6, kFrameGateEntry.data(), reinterpret_cast<void*>(&OnFrameGate)}, inputHook{kProcessInput, 5, kProcessInputEntry.data(), reinterpret_cast<void*>(&OnProcessInput)};
+char __fastcall OnDealDoor(void* room, void*, char animate, char force);
+CodeHook gateHook{kFrameGate, 6, kFrameGateEntry.data(), reinterpret_cast<void*>(&OnFrameGate)}, inputHook{kProcessInput, 5, kProcessInputEntry.data(), reinterpret_cast<void*>(&OnProcessInput)},
+    dealHook{kDealDoor, 6, kDealDoorEntry.data(), reinterpret_cast<void*>(&OnDealDoor)};
+
+// The game's own making of the door to a deal, past this module's jump.
+char CallDealDoor(void* room, char animate, char force) { return dealHook.trampoline ? reinterpret_cast<DealDoor>(dealHook.trampoline)(room, animate, force) : 0; }
+
+// What the host's game made this floor's deal room from, read around its own making of the door. A room that was there
+// before (something else made it earlier) tells nothing of the generator, and then nothing is told.
+char HostDealDoor(void* room, char animate, char force) noexcept {
+    std::uintptr_t game = 0, descriptor = 0; std::uint32_t before = 0; bool made = true;
+    __try {
+        game = At<std::uintptr_t>(base + kGame);
+        descriptor = game ? reinterpret_cast<RoomByIdx>(base + kRoomByIdx)(reinterpret_cast<void*>(game), kDealRoomIndex, -1) : 0;
+        if (descriptor) { made = At<std::uintptr_t>(descriptor + kRoomData) != 0; before = At<std::uint32_t>(game + kDealRng); }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { descriptor = 0; }
+    const char result = CallDealDoor(room, animate, force);
+    __try {
+        if (result && descriptor && !made && At<std::uintptr_t>(descriptor + kRoomData)) { hostDealSeed = before; hostDealFloor = Floor(game); }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return result;
+}
+
+// A guest's game does not roll for the floor's deal: whether there is one is the host's word, and ApplyDeal makes it here.
+// A forced call is somebody's deed and not a roll, and goes through.
+char __fastcall OnDealDoor(void* room, void*, char animate, char force) {
+    if (!Live() || !On(kDeal) || applyingDeal) return CallDealDoor(room, animate, force);
+    if (host) return HostDealDoor(room, animate, force);
+    if (!force) { stats.dealsHeld++; return 0; }
+    return CallDealDoor(room, animate, force);
+}
 
 // A remote player's input message, read beside the game's own reading of it: the record goes into that device's playout.
 // Says whether it is for a frame this game has already counted - one the game would drop, with a line in its log.
@@ -2016,13 +2208,14 @@ bool DeliverBody(const Body& body, std::uint32_t ofSession, bool anew) {
 
 bool DeliverShots(const Shots& shots, bool anew) {
     bool valid = shots.magic == kShotsMagic && shots.controller < kControllers && shots.sequence && static_cast<int>(shots.controller) != ownController &&
-        shots.count <= kMaxTears && shots.bombs <= kMaxTears && shots.count + shots.bombs <= kMaxTears && shots.pets <= kMaxPets;
+        shots.count <= kMaxTears && shots.bombs <= kMaxTears && shots.count + shots.bombs <= kMaxTears && shots.pets <= kMaxPets && shots.hits <= kMaxHits &&
+        ValidHits(shots.hit, shots.hits);
     for (std::uint32_t n = 0; valid && n < shots.pets; ++n) valid = Finite(shots.pet[n].position) && Finite(shots.pet[n].velocity);
     for (std::uint32_t n = 0; valid && n < shots.count + shots.bombs; ++n) valid = ValidShot(shots.shot[n]);
     if (!valid) return false;
     AcquireSRWLockExclusive(&inboxLock);
     auto& box = shotsInbox[shots.controller];
-    if (anew || shots.sequence > box.shots.sequence) { if (anew) box.applied = 0; box.shots = shots; box.at = GetTickCount64(); }
+    if (anew || shots.sequence > box.shots.sequence) { if (anew) { box.applied = 0; box.anew = true; } box.shots = shots; box.at = GetTickCount64(); }
     ReleaseSRWLockExclusive(&inboxLock);
     return true;
 }
@@ -2129,6 +2322,12 @@ void WriteStatus() {
         if (stats.joinsAdmitted || stats.joinsRefused || stats.joinsUnjudged)
             status << ", newcomers let in " << stats.joinsAdmitted << " / refused " << stats.joinsRefused << " (the last one's save lacked " << stats.joinLacking << " of the session's unlocks) / not judged " << stats.joinsUnjudged;
         if (stats.npcFaults) status << ", enemies whose update threw " << stats.npcFaults << " (kinds left to their own behaviour: " << stats.ownBehaviourKinds << ")";
+        if (host) status << "; neighbours' blows played " << stats.blowsPlayed << " / with no target here " << stats.blowsMissed << " / never come " << stats.blowsLost << ", copies' blows that counted for nothing "
+                         << stats.copyBlowsIgnored;
+        else status << "; own blows told " << stats.blowsSent << "; enemies made by the host's list " << stats.npcSpawned << " / removed as not the host's " << stats.npcRemoved << " / killed by the host's word "
+                    << stats.npcKilled << ", states taken from the host " << stats.stateFixes << ", animations " << stats.animationFixes << "; deal: own rolls held " << stats.dealsHeld << ", doors made by the host's word "
+                    << stats.dealDoorsMade << " (failed " << stats.dealDoorFailures << ", in another place " << stats.dealElsewhere << ", of another kind " << stats.dealOtherKind << ")";
+        if (stats.roomFollowsRefused) status << "; ROOMS NOT FOLLOWED INTO (this game's floor has no such room) " << stats.roomFollowsRefused;
         status << ", datagrams refused " << stats.rejected << ", frames lost in pieces " << stats.framesBroken
                << ", frames over 45 ms " << stats.longFrames << " of " << stats.published << "\n";
     } catch (...) {}
@@ -2266,6 +2465,8 @@ void Begin(const Setup& setup) {
             std::memcmp(reinterpret_cast<void*>(base + kInputFind), kInputFindEntry.data(), kInputFindEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kInputInsert), kInputInsertEntry.data(), kInputInsertEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kInputErase), kInputEraseEntry.data(), kInputEraseEntry.size()) != 0 ||
+            std::memcmp(reinterpret_cast<void*>(base + kInitDeal), kInitDealEntry.data(), kInitDealEntry.size()) != 0 ||
+            std::memcmp(reinterpret_cast<void*>(base + kRoomByIdx), kRoomByIdxEntry.data(), kRoomByIdxEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kSpawn), kSpawnEntry.data(), kSpawnEntry.size()) != 0) throw static_cast<DWORD>(ERROR_REVISION_MISMATCH);
         original = reinterpret_cast<WithDevice>(*slot); originalPlayer = reinterpret_cast<PlayerUpdate>(*playerSlot); originalDamage = reinterpret_cast<NpcDamage>(*damageSlot);
         originalPlayerDamage = reinterpret_cast<NpcDamage>(*playerDamageSlot); originalCollision = reinterpret_cast<Collision>(*pickupSlot); originalSlotCollision = reinterpret_cast<Collision>(*slotSlot);
@@ -2291,7 +2492,8 @@ void Begin(const Setup& setup) {
         for (auto& box : inbox) box = Inbox{};
         for (auto& tried : deathTried) tried = 0;
         for (int c = 0; c < kControllers; ++c) { aliveSeen[c] = takenDone[c] = takenSince[c] = 0; takenKnown[c] = false; hitsPlayed[c] = 0; hitsKnown[c] = false; }
-        ownHits = 0;
+        ownHits = 0; ownBlows = HitLog{}; for (auto& done : blowsDone) done = 0;
+        hostDealSeed = 0; hostDealFloor = 0xffffffff; dealDiffering = dealTried = 0; applyingDeal = false;
         for (auto& taken : takenLog) taken = Taken{};
         takenTotal = 0; applyingTaken = false; applyingGrid = false; entryRoom = cellGoneRoom = 0xffffffff; touchedSlot = touchedAt = slotAgeCount = 0;
         hostClearRoom = 0xfffffffe; hostClear = 0; hostHeardAt = 0;
@@ -2365,7 +2567,8 @@ void Begin(const Setup& setup) {
                 ExchangeSlot(playerDamageSlot, reinterpret_cast<void*>(&OnPlayerDamage), reinterpret_cast<void*>(originalPlayerDamage));
             }
         }
-        if (!failure && !host) {
+        // A guest holds its own breaking of the grid; with blows told by their owners the host looks at the grid's blows as well.
+        if (!failure && (!host || (rules & kHits))) {
             failure = HookGrid();
             if (failure) {
                 UnhookGrid(); UnhookClear();
@@ -2403,6 +2606,19 @@ void Begin(const Setup& setup) {
                 ExchangeSlot(playerDamageSlot, reinterpret_cast<void*>(&OnPlayerDamage), reinterpret_cast<void*>(originalPlayerDamage));
             }
         }
+        // The door to a deal is the host's to make: a guest's game does not roll, the host's notes what its room was made from.
+        if (!failure && (rules & kDeal)) {
+            failure = HookCode(dealHook);
+            if (failure) {
+                UnhookCode(dealHook); UnhookJoins(); UnhookCode(gateHook); UnhookCode(inputHook); UnhookGrid(); UnhookClear();
+                ExchangeSlot(slotSlot, reinterpret_cast<void*>(&OnSlotCollision), reinterpret_cast<void*>(originalSlotCollision));
+                ExchangeSlot(pickupSlot, reinterpret_cast<void*>(&OnPickupCollision), reinterpret_cast<void*>(originalCollision));
+                ExchangeSlot(slot, reinterpret_cast<void*>(&OnInput), reinterpret_cast<void*>(original));
+                ExchangeSlot(playerSlot, reinterpret_cast<void*>(&OnPlayer), reinterpret_cast<void*>(originalPlayer));
+                ExchangeSlot(damageSlot, reinterpret_cast<void*>(&OnNpcDamage), reinterpret_cast<void*>(originalDamage));
+                ExchangeSlot(playerDamageSlot, reinterpret_cast<void*>(&OnPlayerDamage), reinterpret_cast<void*>(originalPlayerDamage));
+            }
+        }
         if (failure) { running = false; CloseNetwork(); if (carried) Patch(kCompare, kCompareEntry, kCompareEqual); throw failure; }
         std::ofstream descriptor(folder / (L"native-" + std::to_wstring(GetCurrentProcessId()) + L".json"), std::ios::trunc);
         descriptor << "{\"pid\":" << GetCurrentProcessId() << ",\"role\":\"" << (host ? "native-host" : "native-guest") << "\",\"ownController\":" << ownController
@@ -2422,7 +2638,7 @@ DWORD End(bool restoreCompare) {
     DWORD result = ERROR_NOT_READY;
     if (running.load()) {
         running.store(false, std::memory_order_release);
-        UnhookJoins(); UnhookCode(gateHook); UnhookCode(inputHook); UnhookGrid(); UnhookClear();
+        UnhookCode(dealHook); UnhookJoins(); UnhookCode(gateHook); UnhookCode(inputHook); UnhookGrid(); UnhookClear();
         result = ExchangeSlot(slot, reinterpret_cast<void*>(&OnInput), reinterpret_cast<void*>(original));
         const DWORD second = ExchangeSlot(playerSlot, reinterpret_cast<void*>(&OnPlayer), reinterpret_cast<void*>(originalPlayer));
         const DWORD third = ExchangeSlot(damageSlot, reinterpret_cast<void*>(&OnNpcDamage), reinterpret_cast<void*>(originalDamage));
@@ -2471,7 +2687,7 @@ void FollowLog(const std::filesystem::path& path) {
 
 // The state, where the player sees it without looking for a file: the end of the game window's title. It is there from the
 // main menu on ("loaded"), so that a player knows the module is in before a match begins.
-constexpr wchar_t kVersionText[] = L"0.1.4";
+constexpr wchar_t kVersionText[] = L"0.1.5";
 void ShowState(const wchar_t* text) {
     static HWND window = nullptr;
     if (!window || !IsWindow(window)) {

@@ -30,14 +30,44 @@ bool UnpackWorld(const std::uint8_t* from, std::uint32_t size, World& world) {
 
 std::uint32_t PackShots(const Shots& shots, std::uint8_t* out) {
     auto* at = out; Put(at, reinterpret_cast<const std::uint8_t*>(&shots), static_cast<std::uint32_t>(offsetof(Shots, shot)));
-    Put(at, shots.shot, shots.count + shots.bombs); Put(at, shots.pet, shots.pets);
+    Put(at, shots.shot, shots.count + shots.bombs); Put(at, shots.pet, shots.pets); Put(at, shots.hit, shots.hits);
     return static_cast<std::uint32_t>(at - out);
 }
 
 bool UnpackShots(const std::uint8_t* from, std::uint32_t size, Shots& shots) {
     const auto* at = from; const auto* end = from + size; shots = Shots{};
     return Take(at, end, reinterpret_cast<std::uint8_t*>(&shots), static_cast<std::uint32_t>(offsetof(Shots, shot)), static_cast<std::uint32_t>(offsetof(Shots, shot))) &&
-        shots.count <= kMaxTears && shots.bombs <= kMaxTears && Take(at, end, shots.shot, shots.count + shots.bombs, kMaxTears) && Take(at, end, shots.pet, shots.pets, kMaxPets) && at == end;
+        shots.count <= kMaxTears && shots.bombs <= kMaxTears && Take(at, end, shots.shot, shots.count + shots.bombs, kMaxTears) && Take(at, end, shots.pet, shots.pets, kMaxPets) &&
+        Take(at, end, shots.hit, shots.hits, kMaxHits) && at == end;
+}
+
+void HitLog::Note(Hit hit, std::uint32_t frame) {
+    hit.number = total + 1; ring[total % kMaxHits] = hit; madeAt[total % kMaxHits] = frame; ++total;
+}
+
+std::uint32_t HitLog::Recent(std::uint32_t frame, Hit* out) const {
+    std::uint32_t count = 0;
+    for (std::uint32_t n = total > kMaxHits ? total - kMaxHits : 0; n < total; ++n)
+        if (frame - madeAt[n % kMaxHits] <= kHitResendFrames) out[count++] = ring[n % kMaxHits];
+    return count;
+}
+
+bool ValidHits(const Hit* hits, std::uint32_t count) {
+    for (std::uint32_t n = 0; n < count; ++n) {
+        const auto& hit = hits[n];
+        if (!hit.number || (n && hit.number <= hits[n - 1].number) || hit.kind >= kHitKinds || !std::isfinite(hit.damage) || hit.damage < 0.0f || hit.damage > 1.0e7f ||
+            hit.countdown < -1 || hit.countdown > 100000) return false;
+    }
+    return true;
+}
+
+std::uint32_t FreshHits(const Hit* hits, std::uint32_t count, std::uint32_t& done, std::uint32_t& lost) {
+    if (!count) return 0;
+    if (hits[count - 1].number < done) done = 0;   // the sender counts from 1 again
+    std::uint32_t first = 0;
+    while (first < count && hits[first].number <= done) ++first;
+    if (first < count) { if (done) lost += hits[first].number - done - 1; done = hits[count - 1].number; }
+    return first;
 }
 
 bool ValidShot(const Shot& shot) {
@@ -53,6 +83,7 @@ bool ValidShot(const Shot& shot) {
 bool ValidWorld(const World& world) {
     if (world.magic != kWorldMagic || !world.sequence || world.count > kMaxNpcs || world.deaths > kMaxDeaths || world.cells > kMaxCells || world.shots > kMaxShots ||
         world.drops > kMaxDrops || world.doors > kMaxDoors || world.enemyBombs > kMaxEnemyBombs || world.slots > kMaxSlots || world.born > kMaxBorn) return false;
+    for (std::uint32_t n = 0; n < world.doors; ++n) if (world.door[n].deal && world.door[n].deal != kDevilRoom && world.door[n].deal != kAngelRoom) return false;
     for (std::uint32_t n = 0; n < world.slots; ++n) if (!Finite(world.slot[n].position) || world.slot[n].animation[kAnimationName - 1]) return false;
     for (std::uint32_t n = 0; n < world.enemyBombs; ++n) if (!ValidShot(world.enemyBomb[n])) return false;
     for (std::uint32_t n = 0; n < world.drops; ++n) if (!Finite(world.drop[n].position) || !Finite(world.drop[n].velocity)) return false;

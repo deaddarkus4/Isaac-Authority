@@ -14,7 +14,7 @@ std::unique_ptr<World> Room() {
     auto world = std::make_unique<World>(); *world = World{};
     world->magic = kWorldMagic; world->sequence = 5; world->room = 84; world->count = 2; world->npcTotal = 2; world->deaths = 1; world->shots = 1; world->drops = 1; world->doors = 1; world->born = 1;
     world->npcs[0].seed = 11; world->npcs[0].hitPoints = 10; std::memcpy(world->npcs[0].animation, "WalkVert", 9); world->npcs[1].seed = 12; world->npcs[1].position[0] = 100;
-    world->died[0] = 9; world->shot[0] = Tear(); world->drop[0].seed = 31; world->drop[0].variant = 20; world->door[0].cell = 7; world->door[0].state = 2;
+    world->died[0] = 9; world->shot[0] = Tear(); world->drop[0].seed = 31; world->drop[0].variant = 20; world->door[0].cell = 7; world->door[0].state = 2; world->door[0].deal = 14; world->dealSeed = 0xf20729e3;
     world->bornCell[0].index = 40; world->bornCell[0].type = 14; world->bornCell[0].state = 250; world->gridMap[5] = 0x80; world->coins = 15;
     return world;
 }
@@ -56,6 +56,7 @@ void Ranges() {
     world = Room(); world->npcs[1].gridCollision = 3; world->npcs[1].entityCollision = 4; world->npcs[0].renderZ = -1000; Check(ValidWorld(*world), "a fireplace that burns beside one that has gone out: no collisions, drawn under everything");
     world = Room(); world->sequence = 0; Check(!ValidWorld(*world), "sequences start at one");
     world = Room(); world->doors = kMaxDoors + 1; Check(!ValidWorld(*world), "more doors than the list holds");
+    world = Room(); world->door[0].deal = 3; Check(!ValidWorld(*world), "a door to a deal leads to a devil's room or an angel's");
 }
 
 FrameHeader Header(std::uint32_t sequence, std::uint32_t total, std::uint8_t chunk) {
@@ -196,6 +197,41 @@ void Inputs() {
     playout.Take(record(500, 9)); Check(pressed(playout.Play()) == 7 && pressed(playout.Play()) == 9, "a record far ahead is reached after the frame of grace");
 }
 
+void Hits() {
+    const auto blow = [](std::uint32_t target, float damage) { Hit hit{}; hit.room = 84; hit.target = target; hit.damage = damage; hit.sourceType = 2; hit.spawnerType = 1; return hit; };
+    HitLog log; Hit said[kMaxHits];
+    Check(log.Recent(100, said) == 0, "nothing has landed: nothing to say");
+    log.Note(blow(11, 3.5f), 100); log.Note(blow(12, 3.5f), 101); log.Note(blow(11, 3.5f), 108);
+    Check(log.Recent(108, said) == 3 && said[0].number == 1 && said[2].number == 3 && said[1].target == 12 && ValidHits(said, 3), "blows are numbered from 1 and said oldest first");
+    Check(log.Recent(111, said) == 2 && said[0].number == 2, "a blow is said again for kHitResendFrames frames and no longer");
+    Check(log.Recent(200, said) == 0, "and then not at all");
+    // The receiver: every number once, whichever of the lists that carried it came through.
+    std::uint32_t done = 0, lost = 0; const Hit all[3] = {log.ring[0], log.ring[1], log.ring[2]};
+    Check(FreshHits(all, 2, done, lost) == 0 && done == 2 && lost == 0, "the first list of a sender: all of it is new, and nothing before it is called lost");
+    Check(FreshHits(all, 2, done, lost) == 2 && done == 2, "the same list again: nothing new");
+    Check(FreshHits(all, 3, done, lost) == 2 && done == 3 && lost == 0, "a longer one: what is behind the last number played");
+    Hit later = blow(11, 1); later.number = 9; Check(FreshHits(&later, 1, done, lost) == 0 && done == 9 && lost == 5, "numbers that never came are counted as lost");
+    Hit anew = blow(11, 1); anew.number = 1; Check(FreshHits(&anew, 1, done, lost) == 0 && done == 1 && lost == 5, "a list that ends below the last number played: the sender has started anew");
+    Check(FreshHits(nullptr, 0, done, lost) == 0 && done == 1, "an empty list changes nothing");
+    // More blows in a window than the ring holds: the newest stay.
+    HitLog busy; for (std::uint32_t n = 0; n < kMaxHits + 10; ++n) busy.Note(blow(n, 1), 50);
+    Check(busy.Recent(50, said) == kMaxHits && said[0].number == 11 && said[kMaxHits - 1].number == kMaxHits + 10 && ValidHits(said, kMaxHits), "the ring keeps the newest blows");
+    // What a list must keep.
+    Hit bad[2] = {log.ring[1], log.ring[0]}; Check(!ValidHits(bad, 2), "numbers must rise");
+    bad[0] = log.ring[0]; bad[1] = log.ring[1]; bad[1].kind = kHitKinds; Check(!ValidHits(bad, 2), "a kind there is not");
+    bad[1] = log.ring[1]; bad[1].damage = std::numeric_limits<float>::quiet_NaN(); Check(!ValidHits(bad, 2), "damage that is no number");
+    bad[1] = log.ring[1]; bad[1].damage = -1; Check(!ValidHits(bad, 2), "negative damage");
+    bad[1] = log.ring[1]; bad[1].number = 0; Check(!ValidHits(bad + 1, 1), "numbers start at one");
+    // And they travel with the shots.
+    auto shots = std::make_unique<Shots>(); *shots = Shots{}; shots->magic = kShotsMagic; shots->controller = 3; shots->sequence = 9; shots->count = 1; shots->shot[0] = Tear();
+    shots->hits = log.Recent(108, shots->hit);
+    auto back = std::make_unique<Shots>(); std::vector<std::uint8_t> carried(sizeof(Shots)); const auto size = PackShots(*shots, carried.data());
+    Check(size == offsetof(Shots, shot) + sizeof(Shot) + 3 * sizeof(Hit) && UnpackShots(carried.data(), size, *back) && std::memcmp(shots.get(), back.get(), sizeof(Shots)) == 0,
+        "blows ride behind the tears and the pets");
+    shots->hits = kMaxHits + 1; std::memcpy(carried.data(), shots.get(), offsetof(Shots, shot));
+    Check(!UnpackShots(carried.data(), static_cast<std::uint32_t>(carried.size()), *back), "more blows than the list holds are refused");
+}
+
 void Contract(const wchar_t* path) {
     HMODULE dll = LoadLibraryW(path); Check(dll != nullptr, "load native adapter");
     using Export = DWORD(WINAPI*)(void*);
@@ -208,8 +244,8 @@ void Contract(const wchar_t* path) {
 }
 int wmain(int argc, wchar_t** argv) {
     try {
-        Packing(); Ranges(); Frames(); Sessions(); Handshake(); Tables(); Log(); Unlocks(); Inputs();
+        Packing(); Ranges(); Frames(); Sessions(); Handshake(); Tables(); Log(); Unlocks(); Inputs(); Hits();
         for (int i = 1; i < argc; ++i) Contract(argv[i]);
-        std::cout << "PASS native packing, ranges, frame assembly, sessions, handshake, tables, match log, unlocks, input playout, module contract\n"; return 0;
+        std::cout << "PASS native packing, ranges, frame assembly, sessions, handshake, tables, match log, unlocks, input playout, blows, module contract\n"; return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

@@ -15,12 +15,15 @@ constexpr std::uint8_t kOfBody = 1, kOfShots = 2, kOfWorld = 3, kOfHello = 4;
 // 2: the receiver numbers the sender's player; 3: an enemy's collision damage, a player's hits and blink;
 // 4: every frame names its sender's start (the session), and a hello's host and rules are held against the others'.
 // 5: the game no longer waits for a remote player's input - which a game that still waits must not be matched with.
-constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 5;   // "HEL1"
+// 6: a player's blows at the world are told by its owner (they ride with its shots) and a copy's count nowhere; a door to a
+//    deal is the host's (its kind rides with the door, the seed its room was made from with the world).
+constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 6;   // "HEL1"
 constexpr std::uint32_t kGridCollisionClasses = 8, kEntityCollisionClasses = 5;   // the game's enums: GRIDCOLL_NONE..PITSONLY, ENTCOLL_NONE..ALL
+constexpr std::uint8_t kDevilRoom = 14, kAngelRoom = 15;                           // the game's RoomType of the two deals
 constexpr std::uint8_t kHere = 0, kCompareOff = 1, kLive = 2;
 constexpr int kHealthFields = 10, kMaxTaken = 8, kAnimationName = 24, kMaxNpcs = 48, kMaxDeaths = 16;
 constexpr std::uint32_t kMaxCells = 96, kGridMapBytes = 56, kMaxBorn = 48, kMaxShots = 64, kMaxTears = 32, kMaxSlots = 8, kMaxPets = 24, kMaxEnemyBombs = 16,
-    kMaxDrops = 64, kMaxDoors = 8, kMaxChunks = 31;
+    kMaxDrops = 64, kMaxDoors = 8, kMaxChunks = 31, kMaxHits = 48;
 
 #pragma pack(push, 1)
 struct Taken { std::uint32_t number, room, seed, variant, subtype, low; float position[2]; };
@@ -49,23 +52,32 @@ struct Shot {
     std::uint64_t flags[2]; float color[11];
 };
 struct Drop { std::uint32_t seed, variant, subtype; float position[2], velocity[2]; std::int32_t price, timeout, options, shopItemId; };
-struct DoorState { std::uint16_t cell; std::uint8_t busted, reserved; std::int32_t variant, state; };
+// deal: 0, or the type of the room behind a door that leads to the floor's deal (room -1): 14 a devil's, 15 an angel's.
+struct DoorState { std::uint16_t cell; std::uint8_t busted, deal; std::int32_t variant, state; };
 struct SlotState { std::uint32_t seed, variant, subtype; float position[2]; std::int32_t state, prize, timeout, donation, trigger; char animation[kAnimationName]; };
 struct World {
-    std::uint32_t magic, sequence, room, count, deaths, clear, cells, shots, drops, dropsTotal, doors, npcTotal, hurt, enemyBombs, floor, slots, born; std::int32_t coins, bombs, keys;
+    std::uint32_t magic, sequence, room, count, deaths, clear, cells, shots, drops, dropsTotal, doors, npcTotal, hurt, enemyBombs, floor, slots, born;
+    std::uint32_t dealSeed;   // what the level's generator of deals held before the host's game made this floor's deal room from it; 0: not known
+    std::int32_t coins, bombs, keys;
     Npc npcs[kMaxNpcs]; std::uint32_t died[kMaxDeaths]; Cell grid[kMaxCells]; Shot shot[kMaxShots]; Drop drop[kMaxDrops]; DoorState door[kMaxDoors]; Shot enemyBomb[kMaxEnemyBombs]; SlotState slot[kMaxSlots]; Born bornCell[kMaxBorn]; std::uint8_t gridMap[kGridMapBytes];
 };
 // Tears first, then bombs. A bomb in a Shot: height = frames to the explosion, fallingSpeed = radius multiplier,
 // fallingAccel = 1 for a fetus bomb, damage = explosion damage.
 struct Pet { std::uint32_t seed, variant, subtype; float position[2], velocity[2]; std::uint32_t reserved; };
-struct Shots { std::uint32_t magic, controller, sequence, room, count, bombs, pets; Shot shot[kMaxTears]; Pet pet[kMaxPets]; };
+// A blow of the sender's own player at the world, as its game saw it land: kind 0 at an enemy (target: the enemy's seed as
+// the host knows it), kinds 1..5 at a cell of the grid (target: the cell; the kind is the grid hook's number plus one, and
+// flagsLow carries that call's argument). damage, the flags and the countdown are what the game handed to its TakeDamage;
+// the source is named by its type, variant and its spawner's type - the entity itself is the owner's copy wherever it lands.
+struct Hit { std::uint32_t number, room, target; float damage; std::uint32_t flagsLow, flagsHigh; std::int32_t countdown; std::uint16_t kind, sourceType, sourceVariant, spawnerType; };
+struct Shots { std::uint32_t magic, controller, sequence, room, count, bombs, pets, hits; Shot shot[kMaxTears]; Pet pet[kMaxPets]; Hit hit[kMaxHits]; };
 // session: which start of the sender's module this frame is of (see NewerSession); never 0.
 struct FrameHeader { std::uint32_t magic; std::uint8_t kind, chunk, chunks, reserved; std::uint32_t sequence, total, session; };
 struct Hello { std::uint32_t magic, protocol, rules; std::uint8_t controller, host, stage, reserved; };
 #pragma pack(pop)
-static_assert(sizeof(Taken) == 32 && sizeof(Body) == 76 + 4 * kHealthFields + kMaxTaken * 32 && sizeof(Npc) == 124 && sizeof(Pet) == 32 && sizeof(Cell) == 8 && sizeof(Shot) == 108 && sizeof(Shots) == 28 + kMaxTears * 108 + kMaxPets * 32 &&
+static_assert(sizeof(Taken) == 32 && sizeof(Body) == 76 + 4 * kHealthFields + kMaxTaken * 32 && sizeof(Npc) == 124 && sizeof(Pet) == 32 && sizeof(Cell) == 8 && sizeof(Shot) == 108 && sizeof(Hit) == 36 &&
+              sizeof(Shots) == 32 + kMaxTears * 108 + kMaxPets * 32 + kMaxHits * 36 &&
               sizeof(Drop) == 44 && sizeof(DoorState) == 12 && sizeof(SlotState) == 64 && sizeof(Born) == 16 && sizeof(FrameHeader) == 20 && sizeof(Hello) == 16 &&
-              sizeof(World) == 80 + kMaxNpcs * 124 + kMaxDeaths * 4 + kMaxCells * 8 + kMaxShots * 108 + kMaxDrops * 44 + kMaxDoors * 12 + kMaxEnemyBombs * 108 + kMaxSlots * 64 +
+              sizeof(World) == 84 + kMaxNpcs * 124 + kMaxDeaths * 4 + kMaxCells * 8 + kMaxShots * 108 + kMaxDrops * 44 + kMaxDoors * 12 + kMaxEnemyBombs * 108 + kMaxSlots * 64 +
                                    kMaxBorn * 16 + kGridMapBytes && sizeof(Shots) != sizeof(Body) && sizeof(FrameHeader) + kChunkBytes <= 1200 &&
               sizeof(World) <= kMaxChunks * kChunkBytes, "wire layout");
 
@@ -152,6 +164,25 @@ struct Playout {
     // kPlayoutMostWaiting frames behind the newest - what is jumped over keeps its buttons, so that no press is lost.
     InputRecord Play();
 };
+
+// A player's blows at the world are its owner's to tell. A remote player's shots are copies led by their owner's lists, a
+// ping behind the owner's own; what the owner's tear hit - a fireplace, a poop, an enemy that has walked on since - the copy
+// reaches late or never, for it ends with its owner's. Reported from a match with 100 ms and more between the players: a
+// guest's tears did not put a fire out. So every game tells the blows of its own player as it saw them land, the host plays
+// them on its world with the game's own TakeDamage (or the grid's Hurt and Destroy), and a blow of a copy counts nowhere.
+// They ride with the shots, unreliably: every blow is said again for kHitResendFrames frames, numbered from 1, and a
+// receiver plays each number once.
+constexpr std::uint32_t kHitResendFrames = 10, kHitKinds = 6;
+struct HitLog {
+    Hit ring[kMaxHits]{}; std::uint32_t madeAt[kMaxHits]{}; std::uint32_t total = 0;
+    void Note(Hit hit, std::uint32_t frame);                     // gives it its number
+    std::uint32_t Recent(std::uint32_t frame, Hit* out) const;   // what is still to be said, oldest first; at most kMaxHits
+};
+// Numbers rising, a kind there is, a damage that can be one.
+bool ValidHits(const Hit* hits, std::uint32_t count);
+// Where in a list that came the blows not played yet begin (count: none). done: the last number played, 0 while nothing is
+// known of this sender; a list that ends below it is of a sender that has started anew. lost: numbers that never came.
+std::uint32_t FreshHits(const Hit* hits, std::uint32_t count, std::uint32_t& done, std::uint32_t& lost);
 
 // Who may come into a match that runs (the user's rule): a player whose save has at least every unlock of the session's
 // shared save. The game's shared save is its members' achievements ANDed (its builder, RVA 0x51a450), so an unlock of the
