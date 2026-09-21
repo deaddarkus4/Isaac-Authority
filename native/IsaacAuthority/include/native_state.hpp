@@ -15,6 +15,7 @@ constexpr std::uint8_t kOfBody = 1, kOfShots = 2, kOfWorld = 3, kOfHello = 4;
 // 2: the receiver numbers the sender's player; 3: an enemy's collision damage, a player's hits and blink;
 // 4: every frame names its sender's start (the session), and a hello's host and rules are held against the others'.
 constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 4;   // "HEL1"
+constexpr std::uint32_t kGridCollisionClasses = 8, kEntityCollisionClasses = 5;   // the game's enums: GRIDCOLL_NONE..PITSONLY, ENTCOLL_NONE..ALL
 constexpr std::uint8_t kHere = 0, kCompareOff = 1, kLive = 2;
 constexpr int kHealthFields = 10, kMaxTaken = 8, kAnimationName = 24, kMaxNpcs = 48, kMaxDeaths = 16;
 constexpr std::uint32_t kMaxCells = 96, kGridMapBytes = 56, kMaxBorn = 48, kMaxShots = 64, kMaxTears = 32, kMaxSlots = 8, kMaxPets = 24, kMaxEnemyBombs = 16,
@@ -32,7 +33,12 @@ struct Npc {
     std::int32_t state, stateFrame, cooldown; float v1[2], v2[2]; std::int32_t i1, i2; float target[2];
     char animation[kAnimationName];   // empty: none, or a name too long to carry
     std::uint32_t linked;             // 1 has a parent, 2 has a child: a part of something, never created or removed by the lists
-    float collisionDamage;            // what touching it costs: a fireplace the host has put out costs nothing, whatever the guest's own code thinks
+    float collisionDamage;            // what touching it costs
+    // Whom and what it collides with at all (the game's GridCollisionClass and EntityCollisionClass) and the layer it is
+    // drawn in (RenderZOffset). Read in a live pair: a fireplace the host's game has put out keeps its collision damage of
+    // 1 - what the game changes is both classes to 0 and the layer to -1000. A guest's twin never goes out by itself (its
+    // state is the host's), so without these it went on hurting the guest and its embers were drawn over the coin it dropped.
+    std::uint32_t gridCollision, entityCollision; std::int32_t renderZ;
 };
 struct Cell { std::uint16_t index, type; std::int32_t state; };
 struct Born { std::uint16_t index, type; std::uint32_t variant, seed; };
@@ -55,9 +61,9 @@ struct Shots { std::uint32_t magic, controller, sequence, room, count, bombs, pe
 struct FrameHeader { std::uint32_t magic; std::uint8_t kind, chunk, chunks, reserved; std::uint32_t sequence, total, session; };
 struct Hello { std::uint32_t magic, protocol, rules; std::uint8_t controller, host, stage, reserved; };
 #pragma pack(pop)
-static_assert(sizeof(Taken) == 32 && sizeof(Body) == 72 + 4 * kHealthFields + kMaxTaken * 32 && sizeof(Npc) == 112 && sizeof(Pet) == 32 && sizeof(Cell) == 8 && sizeof(Shot) == 108 && sizeof(Shots) == 28 + kMaxTears * 108 + kMaxPets * 32 &&
+static_assert(sizeof(Taken) == 32 && sizeof(Body) == 72 + 4 * kHealthFields + kMaxTaken * 32 && sizeof(Npc) == 124 && sizeof(Pet) == 32 && sizeof(Cell) == 8 && sizeof(Shot) == 108 && sizeof(Shots) == 28 + kMaxTears * 108 + kMaxPets * 32 &&
               sizeof(Drop) == 44 && sizeof(DoorState) == 12 && sizeof(SlotState) == 64 && sizeof(Born) == 12 && sizeof(FrameHeader) == 20 && sizeof(Hello) == 16 &&
-              sizeof(World) == 80 + kMaxNpcs * 112 + kMaxDeaths * 4 + kMaxCells * 8 + kMaxShots * 108 + kMaxDrops * 44 + kMaxDoors * 12 + kMaxEnemyBombs * 108 + kMaxSlots * 64 +
+              sizeof(World) == 80 + kMaxNpcs * 124 + kMaxDeaths * 4 + kMaxCells * 8 + kMaxShots * 108 + kMaxDrops * 44 + kMaxDoors * 12 + kMaxEnemyBombs * 108 + kMaxSlots * 64 +
                                    kMaxBorn * 12 + kGridMapBytes && sizeof(Shots) != sizeof(Body) && sizeof(FrameHeader) + kChunkBytes <= 1200 &&
               sizeof(World) <= kMaxChunks * kChunkBytes, "wire layout");
 

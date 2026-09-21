@@ -133,6 +133,15 @@
 //   Machines paid with health (variants 2 blood donation, 5 devil beggar, 15 hell game, 17 confessional: the collision
 //   deals the player a blow and plays whatever comes of it) are the exception: a blow to a copy counts nowhere, so the
 //   owner's game plays the touch as well - there the player pays with its own health - and only the outcome is the host's.
+//   The donation machines (variants 8 and 11) are no machine of the host's at all: the game's own lockstep plays a donation in
+//   every game (the user's word), and what a donation is happens in the machine's update when its coin animation ends (RVA
+//   0x25d950, read in its decompilation): the save's counter of donations goes up (event counter 20; 0x73 and a character's
+//   own for greed), the digits on the machine are set, the achievements of 10 to 999 coins are given, the jam is rolled from
+//   the machine's own random numbers. With the host alone playing it a guest got none of that - its twin's animation was
+//   started over by the host's next one before it ever ended. So every game plays these by itself: a touch that started
+//   the machine is an event of its owner, host or guest, and every other game plays it for its copy of that player with
+//   the machine's own collision - in order, and again while the machine still plays the donation before. The host's state
+//   is laid over such a twin only where either machine has ended (jammed, blown up).
 // - enemies that are parts of something (a parent or a child: Entity +0x3bc, +0x3c0 - the segments of a worm boss) are
 //   neither created nor removed by the lists: the first live run of these rules crashed the guest on entering the room
 //   of a segmented boss, where it had created segments with a bare Spawn - without the parent the game's own code gives
@@ -223,6 +232,8 @@ constexpr int kKeyboard = 0;
 // Entity: exists +0x172, dead +0x173, position +0x33c, velocity +0x360, hit points +0x380, maximum +0x384, seed +0x3ec.
 // Entity_Player: update is slot 3 of the table at RVA 0x76bdd0; controller +0x1618. Entity_NPC: table at RVA 0x767468.
 constexpr std::uintptr_t kPlayerTable = 0x76bdd0, kPlayerUpdate = 0x382af0, kNpcTable = 0x767468, kController = 0x1618;
+// Entity, by the game's own Lua accessors of J460 (plain stores): GridCollisionClass +0x184, EntityCollisionClass +0x188, RenderZOffset +0x354.
+constexpr std::uintptr_t kGridCollision = 0x184, kEntityCollision = 0x188, kRenderZ = 0x354;
 constexpr std::uintptr_t kExists = 0x172, kDead = 0x173, kPosition = 0x33c, kVelocity = 0x360, kHitPoints = 0x380, kMaxHitPoints = 0x384, kSeed = 0x3ec;
 // Game at RVA 0x871678: current room +0x18300, its grid index +0x18304; the room's entity list: data +0x125c, count +0x1264.
 constexpr std::uintptr_t kGame = 0x871678, kRoom = 0x18300, kRoomIndex = 0x18304, kDimension = 0x1830c, kListData = 0x125c, kListCount = 0x1264;
@@ -418,7 +429,7 @@ GridHook gridHooks[5] = {{kPoopTable, 4, 0x315330}, {kRockTable, 5, 0x3197d0}, {
 bool applyingGrid = false;
 // The host: which breakable cells the room had when it entered. The guest: for how many snapshots a cell has been one the host lacks.
 std::uint8_t entryMap[kGridMapBytes]{}; std::uint32_t entryRoom = 0xffffffff; std::uint8_t cellGone[kGridCells]{}; std::uint32_t cellGoneRoom = 0xffffffff;
-bool GridHeld(); bool HostRules();
+bool GridHeld(); bool HostRules(); bool PlayedByAll(std::uint32_t variant);
 std::uint32_t rules = kAllRules;
 inline bool On(std::uint32_t rule) { return (rules & ~faulted & rule) != 0; }
 // The module runs and the handshake with every neighbour is through. Until then nothing of the game is changed: a module
@@ -728,6 +739,7 @@ void PublishWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t room
         AnimationOf(entity, npc.animation);
         npc.linked = (At<std::uintptr_t>(entity + kParent) ? 1u : 0u) | (At<std::uintptr_t>(entity + kChild) ? 2u : 0u);
         npc.collisionDamage = At<float>(entity + kCollisionDamage);
+        npc.gridCollision = At<std::uint32_t>(entity + kGridCollision); npc.entityCollision = At<std::uint32_t>(entity + kEntityCollision); npc.renderZ = At<std::int32_t>(entity + kRenderZ);
         std::memcpy(npc.position, reinterpret_cast<void*>(entity + kPosition), 8); std::memcpy(npc.velocity, reinterpret_cast<void*>(entity + kVelocity), 8);
     }
     // A list that did not fit tells nothing about who is gone: nobody of it is called dead.
@@ -929,6 +941,11 @@ void ApplySlots(std::uintptr_t room, const World& world) {
         while (n < world.slots && (taken[n] || world.slot[n].seed != seed)) ++n;
         if (n == world.slots) continue;
         const auto& machine = world.slot[n]; taken[n] = true;
+        // A donation machine runs by itself in every game; only its end - jammed, blown up - is the host's to say.
+        if (PlayedByAll(machine.variant)) {
+            const auto own = At<std::int32_t>(entity + kSlotState);
+            if ((machine.state == 1 || machine.state == 2) && (own == 1 || own == 2)) continue;
+        }
         // A playing machine must not reach the end of its countdown here: that is where the game rolls the payout.
         const std::int16_t timeout = static_cast<std::int16_t>(machine.state == 2 && machine.timeout < 2 ? 2 : machine.timeout);
         const bool differs = At<std::int32_t>(entity + kSlotState) != machine.state || At<std::int32_t>(entity + kSlotPrize) != machine.prize || At<std::int32_t>(entity + kSlotDonation) != machine.donation;
@@ -1082,6 +1099,8 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
         At<std::int32_t>(entity + kI1) = npc.i1; At<std::int32_t>(entity + kI2) = npc.i2;
         std::memcpy(reinterpret_cast<void*>(entity + kV1), npc.v1, 8); std::memcpy(reinterpret_cast<void*>(entity + kV2), npc.v2, 8);
         std::memcpy(reinterpret_cast<void*>(entity + kTarget), npc.target, 8);
+        // What the host's enemy collides with and where it is drawn: its own code sets these where it changes state - which a guest's twin never does by itself.
+        At<std::uint32_t>(entity + kGridCollision) = npc.gridCollision; At<std::uint32_t>(entity + kEntityCollision) = npc.entityCollision; At<std::int32_t>(entity + kRenderZ) = npc.renderZ;
         if (npc.animation[0]) {
             char own[kAnimationName]; AnimationOf(entity, own);
             if (std::memcmp(own, npc.animation, kAnimationName) != 0) {
@@ -1145,7 +1164,14 @@ bool __fastcall OnPickupCollision(void* self, void*, void* collider, std::uint32
     const auto other = reinterpret_cast<std::uintptr_t>(collider);
     if (!Live() || !On(kTaken) || applyingTaken || !other || At<std::uintptr_t>(other) != base + kPlayerTable)
         return originalCollision(self, collider, low);
-    if (At<int>(other + kController) != ownController) { stats.copyTouchesIgnored++; return false; }
+    // A copy's touch takes nothing here. What it answers is the game's own answer where that does not depend on the taking
+    // (RVA 0x2e8ae0, read in its decompilation; true means no collision at all): true for anything with a price, affordable
+    // or not, and while the pickup still waits; false otherwise - a free pickup is pushed, a pedestal stands in the way.
+    // It used to answer false always, and a copy shoved the shop's goods about - only in the games where it is a copy.
+    if (At<int>(other + kController) != ownController) {
+        stats.copyTouchesIgnored++;
+        return At<std::int32_t>(reinterpret_cast<std::uintptr_t>(self) + kPrice) != 0 || At<std::int32_t>(reinterpret_cast<std::uintptr_t>(self) + kWait) > 0;
+    }
     const auto pickup = reinterpret_cast<std::uintptr_t>(self); const Shape before = ShapeOf(pickup);
     float position[2]; std::memcpy(position, reinterpret_cast<void*>(pickup + kPosition), 8);
     const bool result = originalCollision(self, collider, low);
@@ -1158,28 +1184,42 @@ bool __fastcall OnPickupCollision(void* self, void*, void* collider, std::uint32
     return result;
 }
 
+// The machines every game plays by itself, as the game's own lockstep does: the donation machine and the greed donation machine.
+bool PlayedByAll(std::uint32_t variant) { return variant == 8 || variant == 11; }
+
+// The own player's touch of a machine, for the other games: it rides in the bodies with the takings.
+void SayTouch(std::uintptr_t machine, std::uint32_t low) {
+    const auto game = At<std::uintptr_t>(base + kGame); const auto* position = reinterpret_cast<float*>(machine + kPosition);
+    takenLog[takenTotal % kMaxTaken] = Taken{takenTotal + 1, game ? At<std::uint32_t>(game + kRoomIndex) : 0, At<std::uint32_t>(machine + kSeed), At<std::uint32_t>(machine + kVariant),
+                                             At<std::uint32_t>(machine + kSubtype), (low & 0xff) | kSlotTouch, {position[0], position[1]}};
+    ++takenTotal; stats.slotTouchesSent++;
+}
+
 bool __fastcall OnSlotCollision(void* self, void*, void* collider, std::uint32_t low) {
     const auto other = reinterpret_cast<std::uintptr_t>(collider);
     if (!Live() || !On(kSlotsRule) || applyingTaken || !other || At<std::uintptr_t>(other) != base + kPlayerTable)
         return originalSlotCollision(self, collider, low);
     if (At<int>(other + kController) != ownController) { stats.slotTouchesIgnored++; return false; }   // a copy: its owner's game says when it touches
+    const auto machine = reinterpret_cast<std::uintptr_t>(self); const auto seed = At<std::uint32_t>(machine + kSeed); const auto variant = At<std::uint32_t>(machine + kVariant);
+    // A donation machine: the own player's touch is played here whoever hosts, and said to the others when it started the machine.
+    if (PlayedByAll(variant)) {
+        const auto before = At<std::int32_t>(machine + kSlotState); const bool result = originalSlotCollision(self, collider, low);
+        if (before == 1 && At<std::int32_t>(machine + kSlotState) == 2) SayTouch(machine, low);
+        return result;
+    }
     if (host || !HostRules()) return originalSlotCollision(self, collider, low);                         // the host's own player, or a guest on its own
     // A guest's own player: the machine is the host's. A touch that would start a waiting machine is sent; the rest is nothing -
     // except where the price is health, which only the owner's game can take.
-    const auto machine = reinterpret_cast<std::uintptr_t>(self); const auto seed = At<std::uint32_t>(machine + kSeed);
     if (At<std::int32_t>(machine + kSlotState) == 1 && At<std::int16_t>(machine + kSlotTimeout) <= 0 && (seed != touchedSlot || frame - touchedAt >= kSlotTouchEveryFrames)) {
-        const auto game = At<std::uintptr_t>(base + kGame); const auto* position = reinterpret_cast<float*>(machine + kPosition);
-        takenLog[takenTotal % kMaxTaken] = Taken{takenTotal + 1, game ? At<std::uint32_t>(game + kRoomIndex) : 0, seed, At<std::uint32_t>(machine + kVariant), At<std::uint32_t>(machine + kSubtype),
-                                                 (low & 0xff) | kSlotTouch, {position[0], position[1]}};
-        ++takenTotal; touchedSlot = seed; touchedAt = frame; stats.slotTouchesSent++;
+        SayTouch(machine, low); touchedSlot = seed; touchedAt = frame;
     }
-    const auto variant = At<std::uint32_t>(machine + kVariant);
     if (variant == 2 || variant == 5 || variant == 15 || variant == 17) return originalSlotCollision(self, collider, low);
     return false;
 }
 
-// The host plays a guest's touch of a machine with the machine's own collision, for its copy of that guest's player.
-void PlaySlotTouch(std::uintptr_t player, const Taken& touch, std::uintptr_t room) {
+// A remote player's touch of a machine, played with the machine's own collision for the copy of that player: by the host,
+// or for a donation machine by every game. True when the touch started the machine (its state went from waiting to playing).
+bool PlaySlotTouch(std::uintptr_t player, const Taken& touch, std::uintptr_t room) {
     const auto data = At<std::uintptr_t>(room + kListData); const auto count = At<std::uint32_t>(room + kListCount);
     std::uintptr_t found = 0; float foundDistance = 0;
     for (std::uint32_t i = 0; data && count <= 4096 && i < count; ++i) {
@@ -1190,9 +1230,12 @@ void PlaySlotTouch(std::uintptr_t player, const Taken& touch, std::uintptr_t roo
         const float dx = position[0] - touch.position[0], dy = position[1] - touch.position[1], distance = dx * dx + dy * dy;
         if (distance <= kTakenReach * kTakenReach && (!found || distance < foundDistance)) { found = entity; foundDistance = distance; }
     }
-    if (!found) return;
+    if (!found) return false;
+    const auto before = At<std::int32_t>(found + kSlotState);
     applyingTaken = true; originalSlotCollision(reinterpret_cast<void*>(found), reinterpret_cast<void*>(player), touch.low & 0xff); applyingTaken = false;
-    stats.slotTouchesPlayed++;
+    const bool started = before == 1 && At<std::int32_t>(found + kSlotState) == 2;
+    if (started || !PlayedByAll(touch.variant)) stats.slotTouchesPlayed++;
+    return started;
 }
 
 // A remote player's takings, in order: its copy takes here what its owner's game saw it take.
@@ -1203,8 +1246,18 @@ void ApplyTaken(std::uintptr_t player, int controller, const Body& body, std::ui
         const std::uint32_t number = takenDone[controller] + 1; const Taken* taken = nullptr;
         for (const auto& t : body.taken) if (t.number == number) taken = &t;
         if (!taken || taken->room != roomIndex) { takenDone[controller] = number; takenSince[controller] = 0; stats.takenMissed++; continue; }
-        if (taken->low & kSlotTouch) {   // a touch of a machine: played by the host alone, once, whatever comes of it
-            if (host && On(kSlotsRule)) { doing = kSlotsRule; PlaySlotTouch(player, *taken, room); doing = 0; }
+        if (taken->low & kSlotTouch) {
+            // A touch of a machine. Most machines are the host's: it alone plays the touch, once, whatever comes of it. A donation
+            // machine is played by every game: in order, and again while the machine here still plays the donation before.
+            const bool everybody = PlayedByAll(taken->variant);
+            if (On(kSlotsRule) && (host || everybody)) {
+                if (!takenSince[controller]) takenSince[controller] = frame ? frame : 1;
+                doing = kSlotsRule; const bool started = PlaySlotTouch(player, *taken, room); doing = 0;
+                if (everybody && !started) {
+                    if (frame - takenSince[controller] < static_cast<std::uint32_t>(kTakenRetryFrames)) return;
+                    stats.takenMissed++;
+                }
+            }
             takenDone[controller] = number; takenSince[controller] = 0; continue;
         }
         if (!On(kTaken)) { takenDone[controller] = number; takenSince[controller] = 0; continue; }

@@ -52,6 +52,8 @@ void Ranges() {
     world->shot[0].fallingSpeed = 1.0e6f; Check(!ValidWorld(*world), "one wild shot spoils the whole world: the sender reads another layout");
     world = Room(); std::memset(world->npcs[0].animation, 'A', kAnimationName); Check(!ValidWorld(*world), "an animation's name must end");
     world = Room(); world->npcs[1].hitPoints = std::numeric_limits<float>::quiet_NaN(); Check(!ValidWorld(*world), "hit points that are no number");
+    world = Room(); world->npcs[0].entityCollision = kEntityCollisionClasses; Check(!ValidWorld(*world), "a collision class the game does not have");
+    world = Room(); world->npcs[1].gridCollision = 3; world->npcs[1].entityCollision = 4; world->npcs[0].renderZ = -1000; Check(ValidWorld(*world), "a fireplace that burns beside one that has gone out: no collisions, drawn under everything");
     world = Room(); world->sequence = 0; Check(!ValidWorld(*world), "sequences start at one");
     world = Room(); world->doors = kMaxDoors + 1; Check(!ValidWorld(*world), "more doors than the list holds");
 }

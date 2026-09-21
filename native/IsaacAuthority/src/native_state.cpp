@@ -58,7 +58,9 @@ bool ValidWorld(const World& world) {
     for (std::uint32_t n = 0; n < world.drops; ++n) if (!Finite(world.drop[n].position) || !Finite(world.drop[n].velocity)) return false;
     for (std::uint32_t n = 0; n < world.shots; ++n) if (!ValidShot(world.shot[n])) return false;
     for (std::uint32_t n = 0; n < world.count; ++n)
-        if (!Finite(world.npcs[n].position) || !Finite(world.npcs[n].velocity) || !std::isfinite(world.npcs[n].hitPoints) || world.npcs[n].animation[kAnimationName - 1]) return false;
+        if (!Finite(world.npcs[n].position) || !Finite(world.npcs[n].velocity) || !std::isfinite(world.npcs[n].hitPoints) || world.npcs[n].animation[kAnimationName - 1] ||
+            world.npcs[n].gridCollision >= kGridCollisionClasses || world.npcs[n].entityCollision >= kEntityCollisionClasses ||
+            world.npcs[n].renderZ < -100000 || world.npcs[n].renderZ > 100000) return false;
     return true;
 }
 
