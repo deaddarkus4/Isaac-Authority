@@ -37,6 +37,10 @@
 // its name), and a guest whose twin plays another one starts the host's with the sprite's own Play (RVA 0xa380, forced).
 // Frames are left alone: jumping over a frame could jump over the shot.
 //
+// A state written from outside also skips whatever else the game's code does on the way into it. For one kind that ended
+// a guest's game in a live run (the Needle's leap: see kNeedle) and is now done as the game does it; against the kinds
+// nobody has looked at yet a guest updates its enemies guarded (see OnNpcUpdate).
+//
 // Step 4, first event: damage to a player. A character's health is its owner's (the user's model), so the owner's hearts
 // travel with its body and replace the copy's; a blow to a remote player's copy is ignored here (Entity_Player's
 // TakeDamage, slot 8, RVA 0x3729d0) - the neighbour's enemies and shots stand a little differently and would hit a copy
@@ -281,6 +285,17 @@ constexpr std::uintptr_t kState = 0xb64, kStateFrame = 0x410, kCooldown = 0xba0,
 // its current animation +0x34 (an object that begins with its name, a std::string).
 constexpr std::uintptr_t kSprite = 0x48, kAnimation = 0x34, kSpritePlay = 0xa380;
 constexpr std::array<std::uint8_t, 8> kSpritePlayEntry{0x55, 0x8B, 0xEC, 0x80, 0x7D, 0x0C, 0x00, 0x56};
+// A state written from outside skips what the game's own code does on the way into it. Seen live: the Needle (type 881,
+// its AI RVA 0x14eb80) keeps the trail of its leap in two deques of points - the places at +0xc04, the heights at +0xc18
+// (the size of a deque at +0x10) - which it empties and gives a first point each where it goes from state 3 into its leap,
+// state 6; in the leap it asks for the trail's first point. A guest's twin that was given state 6 had none, the deque's
+// front() threw std::out_of_range inside the game's update of the enemy, and the guest's game ended. The same is done
+// for a twin now, with the game's own two functions (std::deque's clear and push_back as the AI calls them).
+constexpr std::uint32_t kNeedle = 881; constexpr std::int32_t kNeedleLeap = 6;
+constexpr std::uintptr_t kNeedleTrail = 0xc04, kNeedleHeights = 0xc18, kDequeSize = 0x10, kDequeClear = 0x99380, kDequePush = 0x99190;
+constexpr std::array<std::uint8_t, 8> kDequeClearEntry{0x57, 0x8B, 0xF9, 0x8B, 0x4F, 0x10, 0x85, 0xC9}, kDequePushEntry{0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x0C, 0x53, 0x56};
+// And for every kind nobody has looked at yet: Entity_NPC's Update (slot 3 of its table) runs guarded on a guest.
+constexpr std::uintptr_t kNpcUpdate = 0x2c4b30; constexpr std::uint32_t kMaxOwnBehaviour = 16;
 constexpr std::uintptr_t kSpawn = 0x28b20, kTriggerClear = 0x4068f0, kDescriptor = 0x4, kRoomFlags = 0x44;
 constexpr std::array<std::uint8_t, 9> kClearEntry{0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x08, 0x53, 0x8B, 0xD9};  // the first six move as they are
 constexpr std::uint64_t kHostSilenceMs = 2000;
@@ -350,6 +365,7 @@ struct Stats {
     std::uint32_t copyRevivals, copyTouchesIgnored, taken, takenApplied, takenMissed, animationFixes, gridHeld, gridFixes, gridMismatch, fireHeld;
     std::uint32_t projectilesMade, projectilesEnded, projectilesDropped, tearsSent, tearsMade, tearsEnded, tearsDropped, fireHolds;
     std::uint32_t dropsMade, dropsRemoved, dropsMorphed, dropsSkipped, counterFixes, doorFixes, doorMismatch, bombsMade, bombsEnded, bombsDropped, enemyBombsMade, enemyBombsEnded, enemyBombsDropped, hurtTaken, otherFloor, slotFixes, slotsMade, slotTouchesSent, slotTouchesPlayed, slotTouchesIgnored, npcPartsLeft, petsSent, petsSet, petFireHolds, gridBorn, gridRemoved, longFrames, frameMaxMs, bytesSent, bytesReceived, framesBroken, copyHitsPlayed, gameFaults, faultRules, floorFollows, floorFollowFailures, floorsElsewhere;
+    std::uint32_t npcFaults, ownBehaviourKinds, needleLeaps;   // a guest's enemy whose update threw; the kinds left to their own behaviour after that; leaps set up for a twin
     float correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax;
 };
 #pragma pack(pop)
@@ -370,6 +386,8 @@ using TearSetScale = void(__thiscall*)(void*, float);
 using PickupSetPrice = void(__thiscall*)(void*, int);
 using PickupMorph = void(__thiscall*)(void*, int, int, int, std::uint32_t, std::uint32_t, std::uint32_t);   // type, variant, subtype, keep price, keep seed, ignore modifiers
 using Spawn = void*(__thiscall*)(void*, std::uint32_t, std::uint32_t, const float*, const float*, void*, std::uint32_t, std::uint32_t);
+using DequeClear = void(__thiscall*)(void*);
+using DequePush = void(__thiscall*)(void*, const float*);   // a deque of points: the point is copied
 std::uintptr_t base = 0;
 void** slot = nullptr; void** playerSlot = nullptr; void** damageSlot = nullptr; void** playerDamageSlot = nullptr;
 WithDevice original = nullptr; PlayerUpdate originalPlayer = nullptr; NpcDamage originalDamage = nullptr, originalPlayerDamage = nullptr;
@@ -441,10 +459,19 @@ struct Missing { std::uint32_t seed, age, spawnedAt; } missing[kMaxNpcs]{}; std:
 // Clearing: the way into the game's own TriggerClear past this module's jump, and what the host last said of which room.
 std::uint8_t* clearEntry = nullptr; std::uint8_t* clearTrampoline = nullptr; bool clearHooked = false;
 std::atomic<std::uint32_t> hostClearRoom{0xfffffffe}, hostClear{0}; std::atomic<std::uint64_t> hostHeardAt{0};
-// The grid: what a guest holds - poop's Hurt, the rock's Destroy, TNT's both, the web's Destroy.
+// The grid: what a guest holds - poop's Hurt, the rock's Destroy, TNT's both, the web's Destroy. And, set and taken back
+// by the same means because it is a guest's alone as well, the guard around an enemy's Update.
 struct GridHook { std::uintptr_t table; int slot; std::uintptr_t function; void* replacement; void** at; void* original; bool installed; };
-GridHook gridHooks[5] = {{kPoopTable, 4, 0x315330}, {kRockTable, 5, 0x3197d0}, {kTntTable, 4, 0x31f250}, {kTntTable, 5, 0x31f2b0}, {kWebTable, 5, 0x321a10}};
+constexpr int kGridHooks = 5, kNpcUpdateHook = 5;
+GridHook gridHooks[6] = {{kPoopTable, 4, 0x315330}, {kRockTable, 5, 0x3197d0}, {kTntTable, 4, 0x31f250}, {kTntTable, 5, 0x31f2b0}, {kWebTable, 5, 0x321a10}, {kNpcTable, 3, kNpcUpdate}};
 bool applyingGrid = false;
+// The kinds of enemy whose update has thrown in this match under a state the host named: from then on their twins take
+// the host's place and hit points only, and what they do is their own. The game's thread.
+struct OwnBehaviour { std::uint32_t type, variant; } ownBehaviour[kMaxOwnBehaviour]{}; std::uint32_t ownBehaviourCount = 0;
+inline bool BehavesAlone(std::uint32_t type, std::uint32_t variant) {
+    for (std::uint32_t n = 0; n < ownBehaviourCount; ++n) if (ownBehaviour[n].type == type && ownBehaviour[n].variant == variant) return true;
+    return false;
+}
 // The host: which breakable cells the room had when it entered. The guest: for how many snapshots a cell has been one the host lacks.
 std::uint8_t entryMap[kGridMapBytes]{}; std::uint32_t entryRoom = 0xffffffff; std::uint8_t cellGone[kGridCells]{}; std::uint32_t cellGoneRoom = 0xffffffff;
 bool GridHeld(); bool HostRules(); bool PlayedByAll(std::uint32_t variant);
@@ -1124,9 +1151,21 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
         if (At<float>(entity + kHitPoints) != npc.hitPoints) { At<float>(entity + kHitPoints) = npc.hitPoints; stats.hitPointFixes++; }
         if (npc.collisionDamage >= 0.0f && npc.collisionDamage < 1000.0f) At<float>(entity + kCollisionDamage) = npc.collisionDamage;
         // What the enemy does: the host's. The guest's own code goes on from here, so it plays the host's attack.
-        if (!On(kBehaviour)) { stats.npcCorrectionSum += distance; if (distance > stats.npcCorrectionMax) stats.npcCorrectionMax = distance; stats.npcMatched++; continue; }
+        if (!On(kBehaviour) || BehavesAlone(At<std::uint32_t>(entity + kType), At<std::uint32_t>(entity + kVariant))) {
+            stats.npcCorrectionSum += distance; if (distance > stats.npcCorrectionMax) stats.npcCorrectionMax = distance; stats.npcMatched++; continue;
+        }
         doing = kBehaviour;
-        if (At<std::int32_t>(entity + kState) != npc.state) { At<std::int32_t>(entity + kState) = npc.state; stats.stateFixes++; }
+        if (At<std::int32_t>(entity + kState) != npc.state) {
+            // A Needle sent into its leap: what the game's own code does there (see kNeedle), with the host's place and height.
+            if (At<std::uint32_t>(entity + kType) == kNeedle && npc.state == kNeedleLeap) {
+                const auto clear = reinterpret_cast<DequeClear>(base + kDequeClear); const auto push = reinterpret_cast<DequePush>(base + kDequePush);
+                const float height[2] = {0.0f, npc.v1[1]};
+                clear(reinterpret_cast<void*>(entity + kNeedleTrail)); clear(reinterpret_cast<void*>(entity + kNeedleHeights));
+                push(reinterpret_cast<void*>(entity + kNeedleTrail), npc.position); push(reinterpret_cast<void*>(entity + kNeedleHeights), height);
+                stats.needleLeaps++;
+            }
+            At<std::int32_t>(entity + kState) = npc.state; stats.stateFixes++;
+        }
         At<std::int32_t>(entity + kStateFrame) = npc.stateFrame; At<std::int32_t>(entity + kCooldown) = npc.cooldown;
         At<std::int32_t>(entity + kI1) = npc.i1; At<std::int32_t>(entity + kI2) = npc.i2;
         std::memcpy(reinterpret_cast<void*>(entity + kV1), npc.v1, 8); std::memcpy(reinterpret_cast<void*>(entity + kV2), npc.v2, 8);
@@ -1555,6 +1594,32 @@ char __fastcall OnNpcDamage(void* self, void*, float damage, std::uint32_t flags
     return originalDamage(self, damage, flagsLow, flagsHigh, source, countdown);
 }
 
+// A guest's enemy runs the game's own code from a state the host named, not one it reached by itself, and whatever the
+// game sets up on the way into that state is then missing. Seen live (see kNeedle): an exception out of the enemy's AI,
+// which nothing in the game catches - the guest's game ended. What is known is done as the game does it; for every other
+// kind a guest's enemy is updated guarded. One that throws was cut off in the middle of its update and is not to be
+// trusted any more: it goes with the entity's own Remove, the host's list makes a fresh one under its seed a third of a
+// second later, and for the rest of the match its kind is led by place and hit points only - what it does is its own.
+// A part of something is never removed by this module (see the head of this file): it stays as it is and may throw again.
+bool UpdatedWhole(void* self) noexcept {
+    __try { reinterpret_cast<PlayerUpdate>(gridHooks[kNpcUpdateHook].original)(self); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+void AfterNpcFault(std::uintptr_t entity) noexcept {
+    __try {
+        stats.npcFaults++;
+        const auto type = At<std::uint32_t>(entity + kType), variant = At<std::uint32_t>(entity + kVariant);
+        if (!BehavesAlone(type, variant) && ownBehaviourCount < kMaxOwnBehaviour) { ownBehaviour[ownBehaviourCount++] = OwnBehaviour{type, variant}; stats.ownBehaviourKinds = ownBehaviourCount; }
+        if (!At<std::uintptr_t>(entity + kParent) && !At<std::uintptr_t>(entity + kChild)) reinterpret_cast<PlayerUpdate>(At<void**>(entity)[10])(reinterpret_cast<void*>(entity));
+    } __except (EXCEPTION_EXECUTE_HANDLER) { TakeFault(); }
+}
+
+void __fastcall OnNpcUpdate(void* self, void*) {
+    if (!Live() || host) { reinterpret_cast<PlayerUpdate>(gridHooks[kNpcUpdateHook].original)(self); return; }
+    if (!UpdatedWhole(self)) AfterNpcFault(reinterpret_cast<std::uintptr_t>(self));
+}
+
 char __fastcall OnPlayerDamage(void* self, void*, float damage, std::uint32_t flagsLow, std::uint32_t flagsHigh, void* source, int countdown) {
     if (Live() && At<int>(reinterpret_cast<std::uintptr_t>(self) + kController) != ownController) {
         stats.copyDamageIgnored++;
@@ -1582,9 +1647,9 @@ template <int N> std::uint32_t __fastcall OnGrid(void* self, void*, std::uint32_
 }
 
 DWORD HookGrid() {
-    void* replacements[5] = {reinterpret_cast<void*>(&OnGrid<0>), reinterpret_cast<void*>(&OnGrid<1>), reinterpret_cast<void*>(&OnGrid<2>),
-                             reinterpret_cast<void*>(&OnGrid<3>), reinterpret_cast<void*>(&OnGrid<4>)};
-    for (int n = 0; n < 5; ++n) {
+    void* replacements[kGridHooks + 1] = {reinterpret_cast<void*>(&OnGrid<0>), reinterpret_cast<void*>(&OnGrid<1>), reinterpret_cast<void*>(&OnGrid<2>),
+                                          reinterpret_cast<void*>(&OnGrid<3>), reinterpret_cast<void*>(&OnGrid<4>), reinterpret_cast<void*>(&OnNpcUpdate)};
+    for (int n = 0; n <= kNpcUpdateHook; ++n) {
         auto& hook = gridHooks[n]; hook.replacement = replacements[n];
         hook.at = reinterpret_cast<void**>(base + hook.table + hook.slot * sizeof(void*));
         if (!hook.installed && *hook.at != reinterpret_cast<void*>(base + hook.function)) return ERROR_REVISION_MISMATCH;
@@ -1767,6 +1832,7 @@ void WriteStatus() {
                << " KB" << (cheating ? (cheatGod ? (cheatDamage ? "; TESTER'S HELP: no damage, x20" : "; TESTER'S HELP: no damage") : cheatDamage ? "; TESTER'S HELP: x20" : "; TESTER'S HELP: all off") : "")
                << "; bodies applied " << stats.applied << ", worlds applied " << stats.worldApplied << "; faults " << stats.gameFaults;
         if (stats.faultRules) status << " (rules switched off after them: " << std::hex << stats.faultRules << std::dec << ")";
+        if (stats.npcFaults) status << ", enemies whose update threw " << stats.npcFaults << " (kinds left to their own behaviour: " << stats.ownBehaviourKinds << ")";
         status << ", datagrams refused " << stats.rejected << ", frames lost in pieces " << stats.framesBroken
                << ", frames over 45 ms " << stats.longFrames << " of " << stats.published << "\n";
     } catch (...) {}
@@ -1898,6 +1964,8 @@ void Begin(const Setup& setup) {
             std::memcmp(reinterpret_cast<void*>(base + kKill), kKillEntry.data(), kKillEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kTransition), kTransitionEntry.data(), kTransitionEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kStageTransition), kStageTransitionEntry.data(), kStageTransitionEntry.size()) != 0 ||
+            std::memcmp(reinterpret_cast<void*>(base + kDequeClear), kDequeClearEntry.data(), kDequeClearEntry.size()) != 0 ||
+            std::memcmp(reinterpret_cast<void*>(base + kDequePush), kDequePushEntry.data(), kDequePushEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kSpawn), kSpawnEntry.data(), kSpawnEntry.size()) != 0) throw static_cast<DWORD>(ERROR_REVISION_MISMATCH);
         original = reinterpret_cast<WithDevice>(*slot); originalPlayer = reinterpret_cast<PlayerUpdate>(*playerSlot); originalDamage = reinterpret_cast<NpcDamage>(*damageSlot);
         originalPlayerDamage = reinterpret_cast<NpcDamage>(*playerDamageSlot); originalCollision = reinterpret_cast<Collision>(*pickupSlot); originalSlotCollision = reinterpret_cast<Collision>(*slotSlot);
@@ -1912,7 +1980,7 @@ void Begin(const Setup& setup) {
         for (std::uint32_t n = 0; n < kMaxPeers; ++n) { heardStage[n] = 0; heardHost[n] = 0; heardRules[n] = 0; peerSession[n] = 0; peerHeardAt[n] = 0; peerAnew[n] = 0; }
         FILETIME clock{}; GetSystemTimeAsFileTime(&clock);   // this start's number: the clock in tenths of a second, and higher than the last start's
         session = NextSession(session, (static_cast<std::uint64_t>(clock.dwHighDateTime) << 32 | clock.dwLowDateTime) / 1000000ull);
-        doing = faulted = 0; for (auto& faults : ruleFaults) faults = 0; for (auto& seen : seenSession) seen = 0;
+        doing = faulted = 0; for (auto& faults : ruleFaults) faults = 0; for (auto& seen : seenSession) seen = 0; ownBehaviourCount = 0;
         for (auto& perPeer : assemblies) for (auto& assembly : perPeer) assembly.Reset();
         counters[0] = 0; counters[1] = 0; stats = Stats{}; sequence = worldSequence = frame = 0;
         published = Published{}; published.magic = kBodyMagic; publishedWorld = PublishedWorld{}; publishedWorld.magic = kWorldMagic;
