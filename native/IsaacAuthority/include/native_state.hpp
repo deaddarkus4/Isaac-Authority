@@ -127,12 +127,13 @@ struct MatchLog {
 void TakeLogLine(MatchLog& match, const std::string& line, std::uint64_t now);
 
 // Who may come into a match that runs (the user's rule): a player whose save has at least every unlock of the session's
-// shared save. What a lobby member tells the others of its save (the game's writer, RVA 0x51b130) begins with the
-// achievements: 642 flags of a bit each, least significant first, in (642 >> 3) + 1 bytes. The game's shared save is these
-// flags ANDed over the members (its builder, RVA 0x51a450), so an unlock of the session is a flag every member has.
-constexpr std::uint32_t kSaveAchievements = 642, kSaveAchievementBytes = (kSaveAchievements >> 3) + 1;
-// The session's unlocks from its members' blocks; of no members, none.
+// shared save. The game's shared save is its members' achievements ANDed (its builder, RVA 0x51a450), so an unlock of the
+// session is an achievement every member has. A game keeps what each lobby member told of its save in its network manager
+// (a map by user id at +0x1068; read in a live game: the achievements are 642 bytes, one each, at +0x38 of an entry's value,
+// as in the game's own PersistentGameData), and that is the form taken here.
+constexpr std::uint32_t kSaveAchievements = 642;
+// The session's unlocks from its members' achievements; of no members, none.
 void SharedUnlocks(const std::uint8_t* const* members, std::uint32_t count, std::uint8_t* shared);
-// How many unlocks of the session a save lacks: 0 and its player may come in. Bits past the last achievement say nothing.
+// How many unlocks of the session a save lacks: 0 and its player may come in.
 std::uint32_t UnlocksLacking(const std::uint8_t* shared, const std::uint8_t* joiner);
 }

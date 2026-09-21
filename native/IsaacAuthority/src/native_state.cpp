@@ -143,17 +143,16 @@ void TakeLogLine(MatchLog& match, const std::string& line, std::uint64_t now) {
 }
 
 void SharedUnlocks(const std::uint8_t* const* members, std::uint32_t count, std::uint8_t* shared) {
-    for (std::uint32_t at = 0; at < kSaveAchievementBytes; ++at) {
-        std::uint8_t all = count ? 0xff : 0;
-        for (std::uint32_t m = 0; m < count; ++m) all &= members[m][at];
-        shared[at] = all;
+    for (std::uint32_t n = 0; n < kSaveAchievements; ++n) {
+        bool all = count != 0;
+        for (std::uint32_t m = 0; m < count && all; ++m) all = members[m][n] != 0;
+        shared[n] = all ? 1 : 0;
     }
 }
 
 std::uint32_t UnlocksLacking(const std::uint8_t* shared, const std::uint8_t* joiner) {
     std::uint32_t lacking = 0;
-    for (std::uint32_t n = 0; n < kSaveAchievements; ++n)
-        if ((shared[n >> 3] >> (n & 7) & 1) && !(joiner[n >> 3] >> (n & 7) & 1)) ++lacking;
+    for (std::uint32_t n = 0; n < kSaveAchievements; ++n) if (shared[n] && !joiner[n]) ++lacking;
     return lacking;
 }
 }

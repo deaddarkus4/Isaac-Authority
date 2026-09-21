@@ -150,22 +150,19 @@ void Log() {
 }
 
 void Unlocks() {
-    std::uint8_t host[kSaveAchievementBytes]{}, guest[kSaveAchievementBytes]{}, joiner[kSaveAchievementBytes]{}, shared[kSaveAchievementBytes]{};
-    const auto set = [](std::uint8_t* save, std::uint32_t n) { save[n >> 3] |= static_cast<std::uint8_t>(1u << (n & 7)); };
-    for (std::uint32_t n : {0u, 7u, 8u, 100u, 641u}) set(host, n);
-    for (std::uint32_t n : {7u, 8u, 100u, 300u, 641u}) set(guest, n);
+    std::uint8_t host[kSaveAchievements]{}, guest[kSaveAchievements]{}, joiner[kSaveAchievements]{}, shared[kSaveAchievements]{};
+    for (std::uint32_t n : {0u, 7u, 8u, 100u, 641u}) host[n] = 1;
+    for (std::uint32_t n : {7u, 8u, 100u, 300u, 641u}) guest[n] = 1;
     const std::uint8_t* members[] = {host, guest};
     SharedUnlocks(members, 2, shared);
-    Check(shared[0] == 0x80 && shared[1] == 0x01 && UnlocksLacking(shared, host) == 0 && UnlocksLacking(shared, guest) == 0, "the session's unlocks are what every member has");
-    Check(UnlocksLacking(shared, joiner) == 4, "an empty save lacks them all");
-    for (std::uint32_t n : {7u, 8u, 100u}) set(joiner, n);
+    Check(!shared[0] && shared[7] && shared[8] && shared[100] && !shared[300] && shared[641], "the session's unlocks are what every member has");
+    Check(UnlocksLacking(shared, host) == 0 && UnlocksLacking(shared, guest) == 0 && UnlocksLacking(shared, joiner) == 4, "its members lack none, an empty save lacks them all");
+    joiner[7] = joiner[8] = joiner[100] = 1;
     Check(UnlocksLacking(shared, joiner) == 1, "the last achievement counts too");
-    set(joiner, 641); set(joiner, 5);
-    Check(UnlocksLacking(shared, joiner) == 0, "a save with more than the session's unlocks may come in");
-    shared[kSaveAchievementBytes - 1] |= 0xfc;   // bits 642..647: no achievements
-    Check(UnlocksLacking(shared, joiner) == 0, "bits past the last achievement say nothing");
+    joiner[641] = 0x7f; joiner[5] = 1;
+    Check(UnlocksLacking(shared, joiner) == 0, "a save with more than the session's unlocks may come in, and any byte but 0 is an unlock");
     SharedUnlocks(members, 0, shared);
-    Check(shared[0] == 0 && shared[kSaveAchievementBytes - 1] == 0 && UnlocksLacking(shared, joiner) == 0, "of no members nothing is shared");
+    Check(!shared[7] && !shared[641] && UnlocksLacking(shared, joiner) == 0, "of no members nothing is shared");
 }
 
 void Contract(const wchar_t* path) {

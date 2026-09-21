@@ -170,6 +170,11 @@
 // - a copy is placed ahead by the age of its body. The two games' frames are not in step, so a body is anything from
 //   fresh to a frame old when it is applied, and a copy placed exactly where its owner was jitters by up to a frame of
 //   its movement. It is placed at the owner's place plus the owner's velocity times the body's age in frames (at most 2).
+// - coming into a match that runs. The game lets a newcomer in where the floor changes (see kProcessJoins); the user's
+//   rule is that only a save with every unlock of the session comes in, and every member of the match enforces it by
+//   itself, inside the game's own processing of its queue. The match log counts the player who came like one who left:
+//   the installed module starts anew with the newcomer as a neighbour, and the newcomer's module starts by its own
+//   "Start Networked". Not yet: a newcomer without this module is not told apart - it would end the match for everybody.
 // A tester's help, for getting through floors to what is to be tried (the word "cheats" in the configuration, which the
 // harness gives to the host's game alone): the own player takes no damage (F6 turns that off and on), every blow to an
 // enemy in this game counts twentyfold (F7), and F8 kills the room's enemies with the game's own Kill - on the host only,
@@ -294,6 +299,22 @@ constexpr std::array<std::uint8_t, 8> kSpritePlayEntry{0x55, 0x8B, 0xEC, 0x80, 0
 constexpr std::uint32_t kNeedle = 881; constexpr std::int32_t kNeedleLeap = 6;
 constexpr std::uintptr_t kNeedleTrail = 0xc04, kNeedleHeights = 0xc18, kDequeSize = 0x10, kDequeClear = 0x99380, kDequePush = 0x99190;
 constexpr std::array<std::uint8_t, 8> kDequeClearEntry{0x57, 0x8B, 0xF9, 0x8B, 0x4F, 0x10, 0x85, 0xC9}, kDequePushEntry{0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x0C, 0x53, 0x56};
+// Coming into a match that runs (docs/j460-join-in-progress.md). The game has it: a newcomer that is ready in the lobby is
+// queued by every member of the match (a map by user id at the network manager's +0x1864; the manager is at +0x4b3d8 of
+// the object RVA 0x87169c points to), and where the floor changes every member runs NetManager's processing of that queue
+// (RVA 0x50df40, thiscall, one argument): the players are added, and the lobby's owner sends the newcomer the world. The
+// user's rule on top of it: only a player whose save has every unlock of the session comes in. Every member holds what
+// every lobby member told of its save (a map by user id at the network manager's +0x1068; an entry's value is at +0x18
+// of its node and the achievements at +0x38 of the value - read in three live games, where they matched the real saves)
+// and the players of the match (entries of 0x14 bytes at +0x4b278 of the same object; an entry's user at +4, the id at +8
+// of the user), so every member reaches the same verdict by itself, at the same point: before the game's own processing,
+// which is hooked for it. Whoever may not come in leaves the queue by the game's own means - the map's erase (RVA
+// 0x513c80), which the game calls when a queued newcomer stops being ready.
+constexpr std::uintptr_t kIsaacManager = 0x87169c, kNetManager = 0x4b3d8, kMatchPlayers = 0x4b278, kPendingJoins = 0x1864, kMemberSaves = 0x1068;
+constexpr std::uintptr_t kMapKey = 0x10, kMapValue = 0x18, kMapNil = 0xd, kSaveAchievementsAt = 0x38, kProcessJoins = 0x50df40, kEraseJoin = 0x513c80;
+constexpr std::array<std::uint8_t, 5> kProcessJoinsEntry{0x55, 0x8B, 0xEC, 0x6A, 0xFF};   // push ebp; mov ebp, esp; push -1: whole instructions, nothing in them that moves with the image
+constexpr std::array<std::uint8_t, 8> kEraseJoinEntry{0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x0C, 0x8B, 0xC1};
+constexpr std::uint32_t kMaxJoinPlayers = 8;
 // And for every kind nobody has looked at yet: Entity_NPC's Update (slot 3 of its table) runs guarded on a guest.
 constexpr std::uintptr_t kNpcUpdate = 0x2c4b30; constexpr std::uint32_t kMaxOwnBehaviour = 16;
 constexpr std::uintptr_t kSpawn = 0x28b20, kTriggerClear = 0x4068f0, kDescriptor = 0x4, kRoomFlags = 0x44;
@@ -348,7 +369,7 @@ constexpr std::array<std::uint8_t, 8> kDoorRefreshEntry{0x55, 0x8B, 0xEC, 0x6A, 
 constexpr std::uint32_t kDoorSnapshots = 4, kDoorHoldFrames = 30;
 // The rules that can be left out: the third word of the configuration is their mask in hex.
 constexpr std::uint32_t kFollow = 1, kBehaviour = 2, kClear = 4, kTaken = 8, kGridRule = 16, kFire = 32, kProjectiles = 64, kTears = 128, kDrops = 256,
-    kCounters = 512, kDoors = 1024, kTraps = 2048, kBombsRule = 4096, kHurt = 8192, kSlotsRule = 16384, kPets = 32768, kLead = 65536, kLook = 131072, kAllRules = 0x3FFFF;
+    kCounters = 512, kDoors = 1024, kTraps = 2048, kBombsRule = 4096, kHurt = 8192, kSlotsRule = 16384, kPets = 32768, kLead = 65536, kLook = 131072, kJoin = 262144, kAllRules = 0x7FFFF;
 constexpr int kTakenRetryFrames = 30, kAliveBodies = 5; constexpr float kTakenReach = 120.0f;
 #pragma pack(push, 1)
 // What a reader outside copies: generation is odd while the content is being written.
@@ -366,6 +387,7 @@ struct Stats {
     std::uint32_t projectilesMade, projectilesEnded, projectilesDropped, tearsSent, tearsMade, tearsEnded, tearsDropped, fireHolds;
     std::uint32_t dropsMade, dropsRemoved, dropsMorphed, dropsSkipped, counterFixes, doorFixes, doorMismatch, bombsMade, bombsEnded, bombsDropped, enemyBombsMade, enemyBombsEnded, enemyBombsDropped, hurtTaken, otherFloor, slotFixes, slotsMade, slotTouchesSent, slotTouchesPlayed, slotTouchesIgnored, npcPartsLeft, petsSent, petsSet, petFireHolds, gridBorn, gridRemoved, longFrames, frameMaxMs, bytesSent, bytesReceived, framesBroken, copyHitsPlayed, gameFaults, faultRules, floorFollows, floorFollowFailures, floorsElsewhere;
     std::uint32_t npcFaults, ownBehaviourKinds, needleLeaps;   // a guest's enemy whose update threw; the kinds left to their own behaviour after that; leaps set up for a twin
+    std::uint32_t joinsAdmitted, joinsRefused, joinsUnjudged, joinLacking;   // newcomers let through to the game's own entry; taken out of its queue; queues left alone because a member's save was not known; unlocks the last one refused lacked
     float correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax;
 };
 #pragma pack(pop)
@@ -386,6 +408,8 @@ using TearSetScale = void(__thiscall*)(void*, float);
 using PickupSetPrice = void(__thiscall*)(void*, int);
 using PickupMorph = void(__thiscall*)(void*, int, int, int, std::uint32_t, std::uint32_t, std::uint32_t);   // type, variant, subtype, keep price, keep seed, ignore modifiers
 using Spawn = void*(__thiscall*)(void*, std::uint32_t, std::uint32_t, const float*, const float*, void*, std::uint32_t, std::uint32_t);
+using ProcessJoins = void(__thiscall*)(void*, std::uint32_t);
+using EraseJoin = std::uint32_t(__thiscall*)(void*, const std::uint64_t*);
 using DequeClear = void(__thiscall*)(void*);
 using DequePush = void(__thiscall*)(void*, const float*);   // a deque of points: the point is copied
 std::uintptr_t base = 0;
@@ -459,6 +483,8 @@ struct Missing { std::uint32_t seed, age, spawnedAt; } missing[kMaxNpcs]{}; std:
 // Clearing: the way into the game's own TriggerClear past this module's jump, and what the host last said of which room.
 std::uint8_t* clearEntry = nullptr; std::uint8_t* clearTrampoline = nullptr; bool clearHooked = false;
 std::atomic<std::uint32_t> hostClearRoom{0xfffffffe}, hostClear{0}; std::atomic<std::uint64_t> hostHeardAt{0};
+// The queue of newcomers: the way into the game's own processing past this module's jump.
+std::uint8_t* joinsEntry = nullptr; std::uint8_t* joinsTrampoline = nullptr; bool joinsHooked = false;
 // The grid: what a guest holds - poop's Hurt, the rock's Destroy, TNT's both, the web's Destroy. And, set and taken back
 // by the same means because it is a guest's alone as well, the guard around an enemy's Update.
 struct GridHook { std::uintptr_t table; int slot; std::uintptr_t function; void* replacement; void** at; void* original; bool installed; };
@@ -1705,6 +1731,98 @@ void UnhookClear() {
     }
 }
 
+// An MSVC std::map as the game keeps it: the map is a head node and a size; a node is left, parent, right, colour, "is
+// nil" (+0xd), then the key (+0x10, here a user id) and the value (+0x18). The head's parent is the root.
+std::uintptr_t FindInMap(std::uintptr_t map, std::uint64_t id) {
+    const auto head = At<std::uintptr_t>(map);
+    if (!head) return 0;
+    auto node = At<std::uintptr_t>(head + 4);
+    for (int depth = 0; node && node != head && !At<std::uint8_t>(node + kMapNil) && depth < 64; ++depth) {
+        const auto key = At<std::uint64_t>(node + kMapKey);
+        if (key == id) return node;
+        node = At<std::uintptr_t>(node + (id < key ? 0 : 8));
+    }
+    return 0;
+}
+
+std::uint32_t KeysOfMap(std::uintptr_t map, std::uint64_t* keys, std::uint32_t most) {
+    const auto head = At<std::uintptr_t>(map); std::uint32_t count = 0;
+    if (!head) return 0;
+    std::uintptr_t stack[64]; int top = 0; stack[top++] = At<std::uintptr_t>(head + 4);
+    while (top > 0 && count < most) {
+        const auto node = stack[--top];
+        if (!node || node == head || At<std::uint8_t>(node + kMapNil)) continue;
+        keys[count++] = At<std::uint64_t>(node + kMapKey);
+        if (top < 62) { stack[top++] = At<std::uintptr_t>(node); stack[top++] = At<std::uintptr_t>(node + 8); }
+    }
+    return count;
+}
+
+// The game's thread, inside the game's own processing of its queue of newcomers, before any of it has run.
+void RefuseJoins(std::uintptr_t net) {
+    const auto manager = At<std::uintptr_t>(base + kIsaacManager);
+    if (!manager || manager + kNetManager != net || !At<std::uint32_t>(net + kPendingJoins + 4)) return;
+    // The session's unlocks: what every player of the match has. A member whose save this game was never told of: no verdict.
+    const std::uint8_t* members[kMaxJoinPlayers]; std::uint32_t count = 0;
+    const auto first = At<std::uintptr_t>(manager + kMatchPlayers), last = At<std::uintptr_t>(manager + kMatchPlayers + 4);
+    for (auto at = first; at && at + 0x14 <= last && count < kMaxJoinPlayers; at += 0x14) {
+        const auto user = At<std::uintptr_t>(at + 4);
+        const auto save = user ? FindInMap(net + kMemberSaves, At<std::uint64_t>(user + 8)) : 0;
+        if (!save) { stats.joinsUnjudged++; return; }
+        members[count++] = reinterpret_cast<const std::uint8_t*>(save + kMapValue + kSaveAchievementsAt);
+    }
+    if (!count) return;
+    static std::uint8_t shared[kSaveAchievements]; SharedUnlocks(members, count, shared);
+    std::uint64_t queued[kMaxJoinPlayers]; const auto waiting = KeysOfMap(net + kPendingJoins, queued, kMaxJoinPlayers);
+    for (std::uint32_t n = 0; n < waiting; ++n) {
+        // A newcomer that never told of its save cannot be held against anything: it waits outside as well.
+        const auto save = FindInMap(net + kMemberSaves, queued[n]);
+        const auto lacking = save ? UnlocksLacking(shared, reinterpret_cast<const std::uint8_t*>(save + kMapValue + kSaveAchievementsAt)) : kSaveAchievements;
+        if (!lacking) { stats.joinsAdmitted++; continue; }
+        reinterpret_cast<EraseJoin>(base + kEraseJoin)(reinterpret_cast<void*>(net + kPendingJoins), &queued[n]);
+        stats.joinsRefused++; stats.joinLacking = lacking;
+    }
+}
+
+void GuardedRefuseJoins(std::uintptr_t net) noexcept {
+    __try { doing = kJoin; RefuseJoins(net); doing = 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { TakeFault(); }
+}
+
+void __fastcall OnProcessJoins(void* net, void*, std::uint32_t forced) {
+    if (Live() && On(kJoin)) GuardedRefuseJoins(reinterpret_cast<std::uintptr_t>(net));
+    reinterpret_cast<ProcessJoins>(joinsTrampoline)(net, forced);
+}
+
+// The processing is no virtual function: its first five bytes - three whole instructions - become a jump, as TriggerClear's do.
+DWORD HookJoins() {
+    joinsEntry = reinterpret_cast<std::uint8_t*>(base + kProcessJoins);
+    if (std::memcmp(joinsEntry, kProcessJoinsEntry.data(), kProcessJoinsEntry.size()) != 0) return ERROR_REVISION_MISMATCH;
+    auto* code = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!code) return GetLastError();
+    std::memcpy(code, joinsEntry, 5); code[5] = 0xE9;
+    const auto back = static_cast<std::uint32_t>((joinsEntry + 5) - (code + 10)); std::memcpy(code + 6, &back, 4);
+    DWORD old = 0; VirtualProtect(code, 32, PAGE_EXECUTE_READ, &old);
+    joinsTrampoline = code;
+    if (!VirtualProtect(joinsEntry, 5, PAGE_EXECUTE_READWRITE, &old)) return GetLastError();
+    std::uint8_t jump[5]{0xE9, 0, 0, 0, 0};
+    const auto there = static_cast<std::uint32_t>(reinterpret_cast<std::uint8_t*>(&OnProcessJoins) - (joinsEntry + 5)); std::memcpy(jump + 1, &there, 4);
+    std::memcpy(joinsEntry, jump, 5);
+    DWORD ignored = 0; VirtualProtect(joinsEntry, 5, old, &ignored); FlushInstructionCache(GetCurrentProcess(), joinsEntry, 5);
+    joinsHooked = true;
+    return ERROR_SUCCESS;
+}
+
+void UnhookJoins() {
+    if (!joinsHooked) return;
+    DWORD old = 0;
+    if (VirtualProtect(joinsEntry, 5, PAGE_EXECUTE_READWRITE, &old)) {
+        std::memcpy(joinsEntry, kProcessJoinsEntry.data(), 5);
+        DWORD ignored = 0; VirtualProtect(joinsEntry, 5, old, &ignored); FlushInstructionCache(GetCurrentProcess(), joinsEntry, 5);
+        joinsHooked = false;   // the trampoline stays allocated: a thread may still be inside it
+    }
+}
+
 std::filesystem::path OwnFolder();
 
 // anew: the first of its kind from a start of the sender's module this game has not heard before - taken whatever its
@@ -1832,6 +1950,8 @@ void WriteStatus() {
                << " KB" << (cheating ? (cheatGod ? (cheatDamage ? "; TESTER'S HELP: no damage, x20" : "; TESTER'S HELP: no damage") : cheatDamage ? "; TESTER'S HELP: x20" : "; TESTER'S HELP: all off") : "")
                << "; bodies applied " << stats.applied << ", worlds applied " << stats.worldApplied << "; faults " << stats.gameFaults;
         if (stats.faultRules) status << " (rules switched off after them: " << std::hex << stats.faultRules << std::dec << ")";
+        if (stats.joinsAdmitted || stats.joinsRefused || stats.joinsUnjudged)
+            status << ", newcomers let in " << stats.joinsAdmitted << " / refused " << stats.joinsRefused << " (the last one's save lacked " << stats.joinLacking << " of the session's unlocks) / not judged " << stats.joinsUnjudged;
         if (stats.npcFaults) status << ", enemies whose update threw " << stats.npcFaults << " (kinds left to their own behaviour: " << stats.ownBehaviourKinds << ")";
         status << ", datagrams refused " << stats.rejected << ", frames lost in pieces " << stats.framesBroken
                << ", frames over 45 ms " << stats.longFrames << " of " << stats.published << "\n";
@@ -1966,6 +2086,7 @@ void Begin(const Setup& setup) {
             std::memcmp(reinterpret_cast<void*>(base + kStageTransition), kStageTransitionEntry.data(), kStageTransitionEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kDequeClear), kDequeClearEntry.data(), kDequeClearEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kDequePush), kDequePushEntry.data(), kDequePushEntry.size()) != 0 ||
+            std::memcmp(reinterpret_cast<void*>(base + kEraseJoin), kEraseJoinEntry.data(), kEraseJoinEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kSpawn), kSpawnEntry.data(), kSpawnEntry.size()) != 0) throw static_cast<DWORD>(ERROR_REVISION_MISMATCH);
         original = reinterpret_cast<WithDevice>(*slot); originalPlayer = reinterpret_cast<PlayerUpdate>(*playerSlot); originalDamage = reinterpret_cast<NpcDamage>(*damageSlot);
         originalPlayerDamage = reinterpret_cast<NpcDamage>(*playerDamageSlot); originalCollision = reinterpret_cast<Collision>(*pickupSlot); originalSlotCollision = reinterpret_cast<Collision>(*slotSlot);
@@ -2076,6 +2197,19 @@ void Begin(const Setup& setup) {
                 ExchangeSlot(playerDamageSlot, reinterpret_cast<void*>(&OnPlayerDamage), reinterpret_cast<void*>(originalPlayerDamage));
             }
         }
+        // Every member judges who may come into the running match, host and guest alike.
+        if (!failure && !joinsHooked && (rules & kJoin)) {
+            failure = HookJoins();
+            if (failure) {
+                UnhookJoins(); UnhookGrid(); UnhookClear();
+                ExchangeSlot(slotSlot, reinterpret_cast<void*>(&OnSlotCollision), reinterpret_cast<void*>(originalSlotCollision));
+                ExchangeSlot(pickupSlot, reinterpret_cast<void*>(&OnPickupCollision), reinterpret_cast<void*>(originalCollision));
+                ExchangeSlot(slot, reinterpret_cast<void*>(&OnInput), reinterpret_cast<void*>(original));
+                ExchangeSlot(playerSlot, reinterpret_cast<void*>(&OnPlayer), reinterpret_cast<void*>(originalPlayer));
+                ExchangeSlot(damageSlot, reinterpret_cast<void*>(&OnNpcDamage), reinterpret_cast<void*>(originalDamage));
+                ExchangeSlot(playerDamageSlot, reinterpret_cast<void*>(&OnPlayerDamage), reinterpret_cast<void*>(originalPlayerDamage));
+            }
+        }
         if (failure) { running = false; CloseNetwork(); if (carried) Patch(kCompare, kCompareEntry, kCompareEqual); throw failure; }
         std::ofstream descriptor(folder / (L"native-" + std::to_wstring(GetCurrentProcessId()) + L".json"), std::ios::trunc);
         descriptor << "{\"pid\":" << GetCurrentProcessId() << ",\"role\":\"" << (host ? "native-host" : "native-guest") << "\",\"ownController\":" << ownController
@@ -2095,7 +2229,7 @@ DWORD End(bool restoreCompare) {
     DWORD result = ERROR_NOT_READY;
     if (running.load()) {
         running.store(false, std::memory_order_release);
-        UnhookGrid(); UnhookClear();
+        UnhookJoins(); UnhookGrid(); UnhookClear();
         result = ExchangeSlot(slot, reinterpret_cast<void*>(&OnInput), reinterpret_cast<void*>(original));
         const DWORD second = ExchangeSlot(playerSlot, reinterpret_cast<void*>(&OnPlayer), reinterpret_cast<void*>(originalPlayer));
         const DWORD third = ExchangeSlot(damageSlot, reinterpret_cast<void*>(&OnNpcDamage), reinterpret_cast<void*>(originalDamage));
