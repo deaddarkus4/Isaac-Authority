@@ -11,14 +11,24 @@
 // It also gives the game's "local user" the identity the localhost lobby knows this game by: the game's window handle with
 // 0xfefefefe above it. With Steam running the local user carries the Steam id instead; the game then files its own save
 // under an id no lobby member has, never finds a save for its own player, and the match never starts (RVA 0x50c400).
+//
+// A ping for the test stand. The localhost connection hands a message to the other game's window with WM_COPYDATA, at
+// once and in step - nothing like two machines, where a packet is on its way for tens of milliseconds and the game's
+// lockstep waits for it. Making a game stand still does not show that either: the sender then blocks inside its send.
+// So this module can hold what arrives: the window's procedure is replaced, a WM_COPYDATA is copied and answered at
+// once - the sender goes on - and the game's own procedure gets it when its time has come, in the order of arrival, on
+// the window's own thread. %LOCALAPPDATA%\IsaacAuthority\localhost-<pid>.ping holds two numbers, the delay and the
+// jitter on top of it in milliseconds; it is read again every second, and without it nothing is held.
 #include "profile.hpp"
 #include <windows.h>
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <vector>
 
 namespace {
 constexpr std::uintptr_t kFactory = 0x629370, kSaveLeaf = 0x77e04c;
@@ -31,6 +41,49 @@ std::uint8_t* stub = nullptr; std::uint8_t* entry = nullptr;
 volatile LONG counters[2]{};  // requests for a service; requests turned into localhost
 std::uint32_t* identity = nullptr; std::uint32_t steamIdentity[2]{};  // kept in memory only, to put it back on Stop
 
+// What arrived and waits for its time, in the order of arrival; the window's thread only.
+struct Held { LONGLONG due; WPARAM from; ULONG_PTR kind; std::vector<std::uint8_t> data; };
+std::deque<Held> held; WNDPROC gameProcedure = nullptr; HWND gameWindow = nullptr; std::filesystem::path pingFile;
+LONGLONG frequency = 1, pingReadAt = 0, lastDue = 0; int pingMs = 0, jitterMs = 0; std::uint32_t random = 0x9e3779b9;
+constexpr UINT_PTR kPingTimer = 0x15aac;
+volatile LONG pingCounters[2]{};  // messages held; messages handed on
+
+LONGLONG Now() { LARGE_INTEGER now; QueryPerformanceCounter(&now); return now.QuadPart; }
+
+void HandOn(HWND window, LONGLONG now) {
+    while (!held.empty() && held.front().due <= now) {
+        Held message = std::move(held.front()); held.pop_front();
+        COPYDATASTRUCT copy{message.kind, static_cast<DWORD>(message.data.size()), message.data.empty() ? nullptr : message.data.data()};
+        CallWindowProcW(gameProcedure, window, WM_COPYDATA, message.from, reinterpret_cast<LPARAM>(&copy));
+        InterlockedIncrement(&pingCounters[1]);
+    }
+}
+
+LRESULT CALLBACK OnWindow(HWND window, UINT kind, WPARAM first, LPARAM second) {
+    static bool timerSet = false;
+    if (!timerSet) { timerSet = true; SetTimer(window, kPingTimer, 5, nullptr); }   // a window's timer is its own thread's to set: it wakes this procedure while nothing arrives
+    const auto now = Now();
+    if (now - pingReadAt > frequency) {
+        pingReadAt = now; int delay = 0, jitter = 0;
+        try { std::ifstream file(pingFile); if (!(file >> delay)) delay = 0; if (!(file >> jitter)) jitter = 0; } catch (...) { delay = jitter = 0; }
+        pingMs = delay < 0 ? 0 : delay > 2000 ? 2000 : delay; jitterMs = jitter < 0 ? 0 : jitter > 2000 ? 2000 : jitter;
+    }
+    HandOn(window, now);
+    if (kind == WM_COPYDATA && second && (pingMs > 0 || !held.empty())) {
+        const auto* copy = reinterpret_cast<const COPYDATASTRUCT*>(second);
+        random = random * 1664525u + 1013904223u;
+        auto due = now + (pingMs + (jitterMs ? static_cast<int>((random >> 8) % static_cast<std::uint32_t>(jitterMs + 1)) : 0)) * frequency / 1000;
+        if (due < lastDue) due = lastDue;   // in the order of arrival, as one connection delivers
+        lastDue = due;
+        const auto* bytes = static_cast<const std::uint8_t*>(copy->lpData);
+        held.push_back(Held{due, first, copy->dwData, bytes ? std::vector<std::uint8_t>(bytes, bytes + copy->cbData) : std::vector<std::uint8_t>{}});
+        InterlockedIncrement(&pingCounters[0]);
+        return TRUE;
+    }
+    if (kind == WM_TIMER && first == kPingTimer) return 0;
+    return CallWindowProcW(gameProcedure, window, kind, first, second);
+}
+
 // True when the local user now answers to the id the localhost service gives this game.
 bool Rename(std::uintptr_t base) {
     const auto user = *reinterpret_cast<std::uint32_t**>(base + kLocalUser);
@@ -41,7 +94,7 @@ bool Rename(std::uintptr_t base) {
     if (!IsWindow(handle) || !GetWindowThreadProcessId(handle, &owner) || owner != GetCurrentProcessId()) return false;
     steamIdentity[0] = user[2]; steamIdentity[1] = user[3];
     user[2] = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(handle)); user[3] = kLocalhostUser;
-    identity = user;
+    identity = user; gameWindow = handle;
     return true;
 }
 
@@ -99,7 +152,13 @@ extern "C" DWORD WINAPI IsaacAuthorityLocalhostStart(void*) noexcept {
             std::ofstream descriptor(directory / (L"localhost-" + std::to_wstring(GetCurrentProcessId()) + L".json"), std::ios::trunc);
             descriptor << "{\"pid\":" << GetCurrentProcessId() << ",\"role\":\"localhost-service\",\"factoryRva\":" << kFactory
                        << ",\"stub\":" << reinterpret_cast<std::uintptr_t>(stub) << ",\"counters\":" << reinterpret_cast<std::uintptr_t>(&counters)
-                       << ",\"localUserRenamed\":" << (renamed ? "true" : "false") << "}\n";
+                       << ",\"localUserRenamed\":" << (renamed ? "true" : "false") << ",\"pingCounters\":" << reinterpret_cast<std::uintptr_t>(&pingCounters) << "}\n";
+            // The ping: only where the window is known, and its procedure is this game's own thread's business from now on.
+            if (renamed && gameWindow && !gameProcedure) {
+                LARGE_INTEGER per; QueryPerformanceFrequency(&per); frequency = per.QuadPart ? per.QuadPart : 1;
+                pingFile = directory / (L"localhost-" + std::to_wstring(GetCurrentProcessId()) + L".ping");
+                gameProcedure = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(gameWindow, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(&OnWindow)));
+            }
         }
         return ERROR_SUCCESS;
     } catch (...) { return ERROR_INVALID_DATA; }

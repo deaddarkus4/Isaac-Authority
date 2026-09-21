@@ -165,6 +165,37 @@ void Unlocks() {
     Check(!shared[7] && !shared[641] && UnlocksLacking(shared, joiner) == 0, "of no members nothing is shared");
 }
 
+void Inputs() {
+    const auto record = [](std::uint32_t frame, std::uint16_t buttons) {
+        InputRecord made{frame, {}}; std::memcpy(made.input, kNeutralInput, kInputBytes);
+        made.input[0] = static_cast<std::uint8_t>(buttons); made.input[1] = static_cast<std::uint8_t>(buttons >> 8); return made;
+    };
+    const auto pressed = [](const InputRecord& of) { return static_cast<std::uint16_t>(of.input[0] | of.input[1] << 8); };
+    Playout playout;
+    const auto first = playout.Play();
+    Check(std::memcmp(first.input, kNeutralInput, kInputBytes) == 0 && playout.repeated == 1, "before anything has come a frame plays the game's own empty input");
+    // The sender's numbers are its own: this game's frames are never asked about.
+    playout.Take(record(1000, 1)); playout.Take(record(1001, 2)); playout.Take(record(1002, 4));
+    Check(pressed(playout.Play()) == 1 && pressed(playout.Play()) == 2 && pressed(playout.Play()) == 4 && playout.played == 3, "what came is played in the sender's order, a record a frame");
+    Check(pressed(playout.Play()) == 4 && pressed(playout.Play()) == 4 && playout.repeated == 2, "nothing has come: the last record again, and the frame does not wait (the counts are of this sender's match)");
+    playout.Take(record(1001, 8)); Check(playout.stale == 1 && pressed(playout.Play()) == 4, "a record of a frame already played is stale");
+    // A record that stays away while later ones are here: a frame's grace, then it is given up.
+    playout.Take(record(1004, 16)); playout.Take(record(1005, 32));
+    Check(pressed(playout.Play()) == 4 && pressed(playout.Play()) == 16 && pressed(playout.Play()) == 32, "a hole is given up after a frame's grace");
+    playout.Take(record(1003, 64)); Check(playout.stale == 2, "and what comes for it afterwards is stale");
+    // Overtaken on the way: played in the sender's order all the same.
+    playout.Take(record(1007, 2)); playout.Take(record(1006, 1));
+    Check(pressed(playout.Play()) == 1 && pressed(playout.Play()) == 2, "records that overtook each other are played in order");
+    // This game stood still for a while: never more than kPlayoutMostWaiting behind, and no press is lost on the way.
+    for (std::uint32_t n = 0; n < 20; ++n) playout.Take(record(1008 + n, n == 3 ? 0x100 : 0));
+    const auto caught = playout.Play();
+    Check((pressed(caught) & 0x100) && playout.skipped == 12 && playout.newest - playout.next < kPlayoutMostWaiting, "what is jumped over keeps its buttons");
+    // The sender's count starts over: a new match.
+    playout.Take(record(3, 7)); Check(playout.started && playout.next == 3 && playout.heard == 1 && pressed(playout.Play()) == 7, "a count that starts over is a new match");
+    // Far ahead of what is being played: reached after the frame of grace.
+    playout.Take(record(500, 9)); Check(pressed(playout.Play()) == 7 && pressed(playout.Play()) == 9, "a record far ahead is reached after the frame of grace");
+}
+
 void Contract(const wchar_t* path) {
     HMODULE dll = LoadLibraryW(path); Check(dll != nullptr, "load native adapter");
     using Export = DWORD(WINAPI*)(void*);
@@ -177,8 +208,8 @@ void Contract(const wchar_t* path) {
 }
 int wmain(int argc, wchar_t** argv) {
     try {
-        Packing(); Ranges(); Frames(); Sessions(); Handshake(); Tables(); Log(); Unlocks();
+        Packing(); Ranges(); Frames(); Sessions(); Handshake(); Tables(); Log(); Unlocks(); Inputs();
         for (int i = 1; i < argc; ++i) Contract(argv[i]);
-        std::cout << "PASS native packing, ranges, frame assembly, sessions, handshake, tables, match log, unlocks, module contract\n"; return 0;
+        std::cout << "PASS native packing, ranges, frame assembly, sessions, handshake, tables, match log, unlocks, input playout, module contract\n"; return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

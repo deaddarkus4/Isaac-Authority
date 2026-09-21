@@ -142,6 +142,35 @@ void TakeLogLine(MatchLog& match, const std::string& line, std::uint64_t now) {
     }
 }
 
+void Playout::Take(const InputRecord& record) {
+    ++heard;
+    if (started && record.frame + kPlayoutRestart < next) started = false;   // the sender counts from the start again
+    if (!started) { *this = Playout{}; heard = 1; started = true; next = newest = record.frame; }
+    if (record.frame < next) { ++stale; return; }
+    // Far ahead of what is being played: what lies between is given up, as Play() would give it up.
+    while (record.frame - next >= kPlayoutSlots) { if (filled[next % kPlayoutSlots]) { filled[next % kPlayoutSlots] = false; ++skipped; } ++next; }
+    slots[record.frame % kPlayoutSlots] = record; filled[record.frame % kPlayoutSlots] = true;
+    if (record.frame > newest || newest < next) newest = record.frame;
+}
+
+InputRecord Playout::Play() {
+    if (!started) { ++repeated; return last; }
+    const auto buttons = [](const InputRecord& of) { return static_cast<std::uint16_t>(of.input[0] | of.input[1] << 8); };
+    std::uint16_t carried = 0;
+    for (; newest >= next && newest - next >= kPlayoutMostWaiting; ++next) {
+        if (!filled[next % kPlayoutSlots]) continue;
+        carried |= buttons(slots[next % kPlayoutSlots]); filled[next % kPlayoutSlots] = false; ++skipped;
+    }
+    if (!filled[next % kPlayoutSlots]) {
+        // Not here. Later ones are: it is lost, or very late - one frame of grace, then on to the earliest that is here.
+        if (newest > next && ++waited > 1) { while (next < newest && !filled[next % kPlayoutSlots]) ++next; waited = 0; }
+        if (!filled[next % kPlayoutSlots]) { ++repeated; return last; }
+    }
+    last = slots[next % kPlayoutSlots]; filled[next % kPlayoutSlots] = false; ++next; waited = 0; ++played;
+    if (carried) { const auto all = static_cast<std::uint16_t>(buttons(last) | carried); last.input[0] = static_cast<std::uint8_t>(all); last.input[1] = static_cast<std::uint8_t>(all >> 8); }
+    return last;
+}
+
 void SharedUnlocks(const std::uint8_t* const* members, std::uint32_t count, std::uint8_t* shared) {
     for (std::uint32_t n = 0; n < kSaveAchievements; ++n) {
         bool all = count != 0;

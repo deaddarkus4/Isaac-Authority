@@ -14,7 +14,8 @@ constexpr std::uint32_t kFrameMagic = 0x31464149, kChunkBytes = 1180, kMaxPeers 
 constexpr std::uint8_t kOfBody = 1, kOfShots = 2, kOfWorld = 3, kOfHello = 4;
 // 2: the receiver numbers the sender's player; 3: an enemy's collision damage, a player's hits and blink;
 // 4: every frame names its sender's start (the session), and a hello's host and rules are held against the others'.
-constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 4;   // "HEL1"
+// 5: the game no longer waits for a remote player's input - which a game that still waits must not be matched with.
+constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 5;   // "HEL1"
 constexpr std::uint32_t kGridCollisionClasses = 8, kEntityCollisionClasses = 5;   // the game's enums: GRIDCOLL_NONE..PITSONLY, ENTCOLL_NONE..ALL
 constexpr std::uint8_t kHere = 0, kCompareOff = 1, kLive = 2;
 constexpr int kHealthFields = 10, kMaxTaken = 8, kAnimationName = 24, kMaxNpcs = 48, kMaxDeaths = 16;
@@ -125,6 +126,32 @@ struct MatchLog {
     std::uint64_t remoteIds[8]{}; int remoteDevices[8]{}; int remotes = 0;
 };
 void TakeLogLine(MatchLog& match, const std::string& line, std::uint64_t now);
+
+// The game's lockstep counts a frame only when every player's input for that frame has come, and drops an input that comes
+// for a frame already counted: with a real ping between the players every late packet is a frame that waits (measured in
+// the user's match through Steam: 21 waits of over 50 ms in 25 s, the longest 351 ms). A remote player stands where its
+// owner says anyway, so nothing has to wait for its input: what came is played out in the sender's own order, one record
+// a frame - by the sender's frame numbers, never this game's, so the two games' counts may drift apart - and a frame for
+// which nothing has come plays the last record again. The game takes a press from the change between two frames' buttons,
+// so a record played twice presses nothing twice.
+constexpr std::uint32_t kInputBytes = 12, kPlayoutSlots = 64, kPlayoutMostWaiting = 8, kPlayoutRestart = 600;
+#pragma pack(push, 1)
+struct InputRecord { std::uint32_t frame; std::uint8_t input[kInputBytes]; };   // as the game keeps and sends it: the frame, 16 buttons, four axes, two bytes
+#pragma pack(pop)
+static_assert(sizeof(InputRecord) == 16, "the game's input record");
+constexpr std::uint8_t kNeutralInput[kInputBytes] = {0, 0, 0xff, 0x7f, 0xff, 0x7f, 0xff, 0x7f, 0xff, 0x7f, 0x3c, 0};   // what the game itself puts into an empty record
+struct Playout {
+    InputRecord slots[kPlayoutSlots]{}; bool filled[kPlayoutSlots]{};
+    std::uint32_t next = 0, newest = 0, waited = 0; bool started = false;
+    InputRecord last{0, {0, 0, 0xff, 0x7f, 0xff, 0x7f, 0xff, 0x7f, 0xff, 0x7f, 0x3c, 0}};
+    std::uint32_t heard = 0, played = 0, repeated = 0, skipped = 0, stale = 0;   // repeated: frames the game's own lockstep would have waited for
+    // A record as it came. One for a frame already played (or given up) is stale; a count that starts over is a new match.
+    void Take(const InputRecord& record);
+    // The input of this frame: the next record in the sender's order; the last one again while the next has not come (a
+    // record that stays away while later ones are here is given up after a frame's grace); and never more than
+    // kPlayoutMostWaiting frames behind the newest - what is jumped over keeps its buttons, so that no press is lost.
+    InputRecord Play();
+};
 
 // Who may come into a match that runs (the user's rule): a player whose save has at least every unlock of the session's
 // shared save. The game's shared save is its members' achievements ANDed (its builder, RVA 0x51a450), so an unlock of the

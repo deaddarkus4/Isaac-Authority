@@ -170,6 +170,11 @@
 // - a copy is placed ahead by the age of its body. The two games' frames are not in step, so a body is anything from
 //   fresh to a frame old when it is applied, and a copy placed exactly where its owner was jitters by up to a frame of
 //   its movement. It is placed at the owner's place plus the owner's velocity times the body's age in frames (at most 2).
+// - nobody waits for a remote player's input (the rule "gate"; see Playout in native_state.hpp and kFrameGate below).
+//   The game's lockstep counts a frame only when every player's input of it has come: between two machines that is a
+//   frame that waits for every packet the ping makes late, and the game drops the late packet besides. A remote player
+//   stands where its owner says, so its input - which still starts what only a button starts: an active item, a card -
+//   is played out as it comes, in the sender's order, and a frame for which nothing has come plays the last input again.
 // - coming into a match that runs. The game lets a newcomer in where the floor changes (see kProcessJoins); the user's
 //   rule is that only a save with every unlock of the session comes in, and every member of the match enforces it by
 //   itself, inside the game's own processing of its queue. The match log counts the player who came like one who left:
@@ -315,6 +320,24 @@ constexpr std::uintptr_t kMapKey = 0x10, kMapValue = 0x18, kMapNil = 0xd, kSaveA
 constexpr std::array<std::uint8_t, 5> kProcessJoinsEntry{0x55, 0x8B, 0xEC, 0x6A, 0xFF};   // push ebp; mov ebp, esp; push -1: whole instructions, nothing in them that moves with the image
 constexpr std::array<std::uint8_t, 8> kEraseJoinEntry{0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x0C, 0x8B, 0xC1};
 constexpr std::uint32_t kMaxJoinPlayers = 8;
+// The frame gate of the game's lockstep (see Playout in native_state.hpp; docs/j460-frame-gate.md). NetManager's gate (RVA
+// 0x510980, thiscall, no arguments) asks every net input device whether the input of the manager's frame (+0xc) has come
+// and, when all have, carries that frame's record into the device - the buttons, what was just pressed (taken from the
+// buttons before), the axes - and counts the frame; otherwise the frame waits. A device keeps its records in a map by
+// frame (+0x3a0; a second one, +0x3ac, keeps the last five frames); the game's own find (RVA 0x501190), insert (RVA
+// 0x501070) and "erase what is older than" (RVA 0x501030) work on it. NetInputDevice::ProcessInputMessage (RVA 0x502010,
+// thiscall on the device, the message handed over by value) reads one record - a checksum, twelve bytes of header, then
+// the record's sixteen bytes - and drops one that comes for a frame already counted. The manager's byte +0x18 says that
+// the game has waited, and asks for the input to be the input delay ahead again before it goes on; the gate clears it
+// when it passes. All of it read in the game's code; the records' layout is checked against the game's own map while it runs.
+constexpr std::uintptr_t kFrameGate = 0x510980, kProcessInput = 0x502010, kInputFind = 0x501190, kInputInsert = 0x501070, kInputErase = 0x501030;
+constexpr std::uintptr_t kNetFrame = 0xc, kNetWaited = 0x18, kDeviceIsNet = 0x8, kDeviceInputs = 0x3a0, kDeviceHistory = 0x3ac;
+constexpr std::uintptr_t kMessageParts = 0x8, kMessageCount = 0xc, kPartData = 0x14, kPartSize = 0x18;
+constexpr std::uint32_t kMessageHead = 8, kInputAt = kMessageHead + 4 + 12, kInputMessageBytes = kInputAt + 16, kInputMessageKind = 1, kMaxRemoteInputs = 8;
+constexpr std::array<std::uint8_t, 6> kFrameGateEntry{0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08};   // push ebx; mov ebx, esp; sub esp, 8: whole instructions
+constexpr std::array<std::uint8_t, 5> kProcessInputEntry{0x55, 0x8B, 0xEC, 0x6A, 0xFF};
+constexpr std::array<std::uint8_t, 8> kInputFindEntry{0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08, 0x83, 0xE4}, kInputInsertEntry{0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08, 0x83, 0xE4},
+    kInputEraseEntry{0x55, 0x8B, 0xEC, 0x56, 0x8B, 0xF1, 0x83, 0x7E};
 // And for every kind nobody has looked at yet: Entity_NPC's Update (slot 3 of its table) runs guarded on a guest.
 constexpr std::uintptr_t kNpcUpdate = 0x2c4b30; constexpr std::uint32_t kMaxOwnBehaviour = 16;
 constexpr std::uintptr_t kSpawn = 0x28b20, kTriggerClear = 0x4068f0, kDescriptor = 0x4, kRoomFlags = 0x44;
@@ -369,7 +392,7 @@ constexpr std::array<std::uint8_t, 8> kDoorRefreshEntry{0x55, 0x8B, 0xEC, 0x6A, 
 constexpr std::uint32_t kDoorSnapshots = 4, kDoorHoldFrames = 30;
 // The rules that can be left out: the third word of the configuration is their mask in hex.
 constexpr std::uint32_t kFollow = 1, kBehaviour = 2, kClear = 4, kTaken = 8, kGridRule = 16, kFire = 32, kProjectiles = 64, kTears = 128, kDrops = 256,
-    kCounters = 512, kDoors = 1024, kTraps = 2048, kBombsRule = 4096, kHurt = 8192, kSlotsRule = 16384, kPets = 32768, kLead = 65536, kLook = 131072, kJoin = 262144, kAllRules = 0x7FFFF;
+    kCounters = 512, kDoors = 1024, kTraps = 2048, kBombsRule = 4096, kHurt = 8192, kSlotsRule = 16384, kPets = 32768, kLead = 65536, kLook = 131072, kJoin = 262144, kGate = 524288, kAllRules = 0xFFFFF;
 constexpr int kTakenRetryFrames = 30, kAliveBodies = 5; constexpr float kTakenReach = 120.0f;
 #pragma pack(push, 1)
 // What a reader outside copies: generation is odd while the content is being written.
@@ -387,6 +410,8 @@ struct Stats {
     std::uint32_t projectilesMade, projectilesEnded, projectilesDropped, tearsSent, tearsMade, tearsEnded, tearsDropped, fireHolds;
     std::uint32_t dropsMade, dropsRemoved, dropsMorphed, dropsSkipped, counterFixes, doorFixes, doorMismatch, bombsMade, bombsEnded, bombsDropped, enemyBombsMade, enemyBombsEnded, enemyBombsDropped, hurtTaken, otherFloor, slotFixes, slotsMade, slotTouchesSent, slotTouchesPlayed, slotTouchesIgnored, npcPartsLeft, petsSent, petsSet, petFireHolds, gridBorn, gridRemoved, longFrames, frameMaxMs, bytesSent, bytesReceived, framesBroken, copyHitsPlayed, gameFaults, faultRules, floorFollows, floorFollowFailures, floorsElsewhere;
     std::uint32_t npcFaults, ownBehaviourKinds, needleLeaps;   // a guest's enemy whose update threw; the kinds left to their own behaviour after that; leaps set up for a twin
+    // Remote players' input: records heard; frames that played the next one / the last one again - which the game's lockstep would have waited for / records jumped over; records that came too late to be played; packets for a counted frame let through quietly; records that did not read as the game read them.
+    std::uint32_t inputsHeard, inputsPlayed, inputsRepeated, inputsSkipped, inputsStale, inputsLate, inputsMisread;
     std::uint32_t joinsAdmitted, joinsRefused, joinsUnjudged, joinLacking;   // newcomers let through to the game's own entry; taken out of its queue; queues left alone because a member's save was not known; unlocks the last one refused lacked
     float correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax;
 };
@@ -408,6 +433,11 @@ using TearSetScale = void(__thiscall*)(void*, float);
 using PickupSetPrice = void(__thiscall*)(void*, int);
 using PickupMorph = void(__thiscall*)(void*, int, int, int, std::uint32_t, std::uint32_t, std::uint32_t);   // type, variant, subtype, keep price, keep seed, ignore modifiers
 using Spawn = void*(__thiscall*)(void*, std::uint32_t, std::uint32_t, const float*, const float*, void*, std::uint32_t, std::uint32_t);
+using FrameGate = char(__thiscall*)(void*);
+using ProcessInput = char(__thiscall*)(void*, void*, void*);   // the device; the message and what counts its owners - one smart pointer, by value
+using InputFind = std::uintptr_t(__thiscall*)(void*, std::uint32_t);
+using InputInsert = void(__thiscall*)(void*, const InputRecord*);
+using InputErase = void(__thiscall*)(void*, std::uint32_t);
 using ProcessJoins = void(__thiscall*)(void*, std::uint32_t);
 using EraseJoin = std::uint32_t(__thiscall*)(void*, const std::uint64_t*);
 using DequeClear = void(__thiscall*)(void*);
@@ -483,6 +513,10 @@ struct Missing { std::uint32_t seed, age, spawnedAt; } missing[kMaxNpcs]{}; std:
 // Clearing: the way into the game's own TriggerClear past this module's jump, and what the host last said of which room.
 std::uint8_t* clearEntry = nullptr; std::uint8_t* clearTrampoline = nullptr; bool clearHooked = false;
 std::atomic<std::uint32_t> hostClearRoom{0xfffffffe}, hostClear{0}; std::atomic<std::uint64_t> hostHeardAt{0};
+// The remote players' input as it came, per net input device, and the frame it was last played for. The lock: a message
+// may be read on another thread than the one that counts the frames.
+struct RemoteInput { std::uintptr_t device; Playout playout; } remoteInputs[kMaxRemoteInputs]{}; std::uint32_t remoteInputCount = 0, fedFrame = 0xffffffff;
+SRWLOCK inputLock = SRWLOCK_INIT; std::atomic<DWORD> gateThread{0}; std::atomic<bool> inputsDistrusted{false};
 // The queue of newcomers: the way into the game's own processing past this module's jump.
 std::uint8_t* joinsEntry = nullptr; std::uint8_t* joinsTrampoline = nullptr; bool joinsHooked = false;
 // The grid: what a guest holds - poop's Hurt, the rock's Destroy, TNT's both, the web's Destroy. And, set and taken back
@@ -1823,6 +1857,145 @@ void UnhookJoins() {
     }
 }
 
+// A function of the game's that is no virtual one: its first whole instructions become a jump, and a trampoline plays
+// them and goes on behind them - as for TriggerClear and the queue of newcomers.
+struct CodeHook { std::uintptr_t rva; std::uint32_t bytes; const std::uint8_t* expected; void* replacement; std::uint8_t* entry; std::uint8_t* trampoline; bool hooked; };
+DWORD HookCode(CodeHook& hook) {
+    if (hook.hooked) return ERROR_SUCCESS;
+    hook.entry = reinterpret_cast<std::uint8_t*>(base + hook.rva);
+    if (std::memcmp(hook.entry, hook.expected, hook.bytes) != 0) return ERROR_REVISION_MISMATCH;
+    auto* code = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, 32, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE));
+    if (!code) return GetLastError();
+    std::memcpy(code, hook.entry, hook.bytes); code[hook.bytes] = 0xE9;
+    const auto back = static_cast<std::uint32_t>((hook.entry + hook.bytes) - (code + hook.bytes + 5)); std::memcpy(code + hook.bytes + 1, &back, 4);
+    DWORD old = 0; VirtualProtect(code, 32, PAGE_EXECUTE_READ, &old);
+    hook.trampoline = code;
+    if (!VirtualProtect(hook.entry, hook.bytes, PAGE_EXECUTE_READWRITE, &old)) return GetLastError();
+    std::uint8_t jump[8]{0xE9, 0, 0, 0, 0, 0x90, 0x90, 0x90};
+    const auto there = static_cast<std::uint32_t>(static_cast<std::uint8_t*>(hook.replacement) - (hook.entry + 5)); std::memcpy(jump + 1, &there, 4);
+    std::memcpy(hook.entry, jump, hook.bytes);
+    DWORD ignored = 0; VirtualProtect(hook.entry, hook.bytes, old, &ignored); FlushInstructionCache(GetCurrentProcess(), hook.entry, hook.bytes);
+    hook.hooked = true;
+    return ERROR_SUCCESS;
+}
+
+void UnhookCode(CodeHook& hook) {
+    if (!hook.hooked) return;
+    DWORD old = 0;
+    if (VirtualProtect(hook.entry, hook.bytes, PAGE_EXECUTE_READWRITE, &old)) {
+        std::memcpy(hook.entry, hook.expected, hook.bytes);
+        DWORD ignored = 0; VirtualProtect(hook.entry, hook.bytes, old, &ignored); FlushInstructionCache(GetCurrentProcess(), hook.entry, hook.bytes);
+        hook.hooked = false;   // the trampoline stays allocated: a thread may still be inside it
+    }
+}
+
+char __fastcall OnFrameGate(void* net, void*);
+char __fastcall OnProcessInput(void* device, void*, void* message, void* control);
+CodeHook gateHook{kFrameGate, 6, kFrameGateEntry.data(), reinterpret_cast<void*>(&OnFrameGate)}, inputHook{kProcessInput, 5, kProcessInputEntry.data(), reinterpret_cast<void*>(&OnProcessInput)};
+
+// A remote player's input message, read beside the game's own reading of it: the record goes into that device's playout.
+// Says whether it is for a frame this game has already counted - one the game would drop, with a line in its log.
+bool HearInput(std::uintptr_t device, std::uintptr_t message, InputRecord& record, std::uint32_t current) {
+    if (!message || At<std::uint32_t>(message + kMessageCount) != 1) return false;
+    const auto parts = At<std::uintptr_t>(message + kMessageParts); const auto part = parts ? At<std::uintptr_t>(parts) : 0;
+    const auto data = part ? At<std::uintptr_t>(part + kPartData) : 0;
+    if (!data || At<std::uint32_t>(part + kPartSize) < kInputMessageBytes || At<std::uint8_t>(data + 5) != kInputMessageKind) return false;
+    std::memcpy(&record, reinterpret_cast<const void*>(data + kInputAt), sizeof record);
+    AcquireSRWLockExclusive(&inputLock);
+    std::uint32_t n = 0;
+    while (n < remoteInputCount && remoteInputs[n].device != device) ++n;
+    if (n == remoteInputCount && remoteInputCount < kMaxRemoteInputs) { remoteInputs[remoteInputCount].device = device; remoteInputs[remoteInputCount++].playout = Playout{}; }
+    if (n < remoteInputCount) remoteInputs[n].playout.Take(record);
+    ReleaseSRWLockExclusive(&inputLock);
+    return record.frame < current;
+}
+
+bool GuardedHearInput(std::uintptr_t device, std::uintptr_t message, InputRecord& record, std::uint32_t current, bool& read) noexcept {
+    __try { read = false; const bool late = HearInput(device, message, record, current); read = true; return late; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { doing = kGate; TakeFault(); return false; }
+}
+
+// The game's own reading of a message for a frame it has counted already: it would drop the record and write a line
+// into its log - thirty a second with a neighbour whose ping is above its input delay, which is every neighbour this rule
+// is for. For the length of that one call the game believes to be at frame 0: the record goes into the device's maps
+// under its old frame, where the game's next "erase what is older" takes it away.
+char ReadAsNotLate(void* device, void* message, void* control, std::uintptr_t net, std::uint32_t current) {
+    char result = 0;
+    reinterpret_cast<InputErase>(base + kInputErase)(reinterpret_cast<void*>(reinterpret_cast<std::uintptr_t>(device) + kDeviceInputs), current);
+    At<std::uint32_t>(net + kNetFrame) = 0;
+    __try { result = reinterpret_cast<ProcessInput>(inputHook.trampoline)(device, message, control); }
+    __finally { At<std::uint32_t>(net + kNetFrame) = current; }
+    return result;
+}
+
+char __fastcall OnProcessInput(void* device, void*, void* message, void* control) {
+    const auto manager = At<std::uintptr_t>(base + kIsaacManager);
+    if (!manager || !Live() || !On(kGate) || inputsDistrusted.load(std::memory_order_relaxed)) return reinterpret_cast<ProcessInput>(inputHook.trampoline)(device, message, control);
+    const auto net = manager + kNetManager; const auto current = At<std::uint32_t>(net + kNetFrame);
+    InputRecord record{}; bool read = false;
+    const bool late = GuardedHearInput(reinterpret_cast<std::uintptr_t>(device), reinterpret_cast<std::uintptr_t>(message), record, current, read);
+    // Only on the thread that counts the frames may the frame be touched; anywhere else the game reads the message as it always did.
+    if (late && gateThread.load(std::memory_order_relaxed) == GetCurrentThreadId()) { stats.inputsLate++; return ReadAsNotLate(device, message, control, net, current); }
+    const auto find = reinterpret_cast<InputFind>(base + kInputFind); const auto inputs = reinterpret_cast<void*>(reinterpret_cast<std::uintptr_t>(device) + kDeviceInputs);
+    const bool had = !read || late || find(inputs, record.frame) != 0;
+    const char result = reinterpret_cast<ProcessInput>(inputHook.trampoline)(device, message, control);
+    // The check of this module's reading: a record the game has just put into its map must be the record read here.
+    if (!had) {
+        const auto kept = find(inputs, record.frame);
+        if (kept && std::memcmp(reinterpret_cast<const void*>(kept + 4), record.input, kInputBytes) != 0) { stats.inputsMisread++; inputsDistrusted.store(true, std::memory_order_relaxed); }
+    }
+    return result;
+}
+
+// The game's thread, inside the game's own frame gate, before any of it has run: every remote device that has been heard
+// gets the record of this frame. The game then finds its input there, carries it into the device and counts the frame.
+void FeedInputs(std::uintptr_t net) {
+    gateThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    const auto current = At<std::uint32_t>(net + kNetFrame);
+    if (current == fedFrame) return;   // the gate is asked about this frame again (it waits for something else): nothing is played twice
+    const auto find = reinterpret_cast<InputFind>(base + kInputFind); const auto insert = reinterpret_cast<InputInsert>(base + kInputInsert);
+    const auto first = At<std::uintptr_t>(net), last = At<std::uintptr_t>(net + 4);
+    // The game's memory is read and written outside the lock: whatever goes wrong there must not leave it taken.
+    std::uintptr_t devices[kMaxRemoteInputs * 2]; InputRecord records[kMaxRemoteInputs * 2]; bool known[kMaxRemoteInputs * 2]{}; std::uint32_t count = 0;
+    for (auto at = first; at && at + 4 <= last && count < kMaxRemoteInputs * 2; at += 4) {
+        const auto device = At<std::uintptr_t>(at);
+        if (device && (At<std::uint8_t>(device + kDeviceIsNet) & 1)) devices[count++] = device;
+    }
+    std::uint32_t fed = 0, heard = 0, played = 0, repeated = 0, skipped = 0, stale = 0;
+    AcquireSRWLockExclusive(&inputLock);
+    for (std::uint32_t d = 0; d < count; ++d) {
+        std::uint32_t n = 0;
+        while (n < remoteInputCount && remoteInputs[n].device != devices[d]) ++n;
+        if (n == remoteInputCount) continue;   // the own device, or a remote one nothing has come from yet: the game's own way
+        records[d] = remoteInputs[n].playout.Play(); records[d].frame = current; known[d] = true;
+    }
+    for (std::uint32_t n = 0; n < remoteInputCount; ++n) {
+        const auto& playout = remoteInputs[n].playout;
+        heard += playout.heard; played += playout.played; repeated += playout.repeated; skipped += playout.skipped; stale += playout.stale;
+    }
+    ReleaseSRWLockExclusive(&inputLock);
+    for (std::uint32_t d = 0; d < count; ++d) {
+        if (!known[d]) continue;
+        const auto kept = find(reinterpret_cast<void*>(devices[d] + kDeviceInputs), current);
+        if (kept) std::memcpy(reinterpret_cast<void*>(kept + 4), records[d].input, kInputBytes);
+        else { insert(reinterpret_cast<void*>(devices[d] + kDeviceInputs), &records[d]); insert(reinterpret_cast<void*>(devices[d] + kDeviceHistory), &records[d]); }
+        ++fed;
+    }
+    stats.inputsHeard = heard; stats.inputsPlayed = played; stats.inputsRepeated = repeated; stats.inputsSkipped = skipped; stats.inputsStale = stale;
+    fedFrame = current;
+    if (fed) At<std::uint8_t>(net + kNetWaited) = 0;   // nothing was waited for: the game need not ask for input ahead of the frame
+}
+
+void GuardedFeedInputs(std::uintptr_t net) noexcept {
+    __try { doing = kGate; FeedInputs(net); doing = 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { TakeFault(); }
+}
+
+char __fastcall OnFrameGate(void* net, void*) {
+    if (Live() && On(kGate) && !inputsDistrusted.load(std::memory_order_relaxed)) GuardedFeedInputs(reinterpret_cast<std::uintptr_t>(net));
+    return reinterpret_cast<FrameGate>(gateHook.trampoline)(net);
+}
+
 std::filesystem::path OwnFolder();
 
 // anew: the first of its kind from a start of the sender's module this game has not heard before - taken whatever its
@@ -1950,6 +2123,9 @@ void WriteStatus() {
                << " KB" << (cheating ? (cheatGod ? (cheatDamage ? "; TESTER'S HELP: no damage, x20" : "; TESTER'S HELP: no damage") : cheatDamage ? "; TESTER'S HELP: x20" : "; TESTER'S HELP: all off") : "")
                << "; bodies applied " << stats.applied << ", worlds applied " << stats.worldApplied << "; faults " << stats.gameFaults;
         if (stats.faultRules) status << " (rules switched off after them: " << std::hex << stats.faultRules << std::dec << ")";
+        if (stats.inputsHeard)
+            status << "; remote input: frames that did not wait " << stats.inputsRepeated << " of " << stats.inputsRepeated + stats.inputsPlayed << ", records heard " << stats.inputsHeard
+                   << " / too late to be played " << stats.inputsStale << " / jumped over " << stats.inputsSkipped << (inputsDistrusted.load() ? "; REMOTE INPUT NOT TRUSTED: the game waits as it always did" : "");
         if (stats.joinsAdmitted || stats.joinsRefused || stats.joinsUnjudged)
             status << ", newcomers let in " << stats.joinsAdmitted << " / refused " << stats.joinsRefused << " (the last one's save lacked " << stats.joinLacking << " of the session's unlocks) / not judged " << stats.joinsUnjudged;
         if (stats.npcFaults) status << ", enemies whose update threw " << stats.npcFaults << " (kinds left to their own behaviour: " << stats.ownBehaviourKinds << ")";
@@ -2087,6 +2263,9 @@ void Begin(const Setup& setup) {
             std::memcmp(reinterpret_cast<void*>(base + kDequeClear), kDequeClearEntry.data(), kDequeClearEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kDequePush), kDequePushEntry.data(), kDequePushEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kEraseJoin), kEraseJoinEntry.data(), kEraseJoinEntry.size()) != 0 ||
+            std::memcmp(reinterpret_cast<void*>(base + kInputFind), kInputFindEntry.data(), kInputFindEntry.size()) != 0 ||
+            std::memcmp(reinterpret_cast<void*>(base + kInputInsert), kInputInsertEntry.data(), kInputInsertEntry.size()) != 0 ||
+            std::memcmp(reinterpret_cast<void*>(base + kInputErase), kInputEraseEntry.data(), kInputEraseEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kSpawn), kSpawnEntry.data(), kSpawnEntry.size()) != 0) throw static_cast<DWORD>(ERROR_REVISION_MISMATCH);
         original = reinterpret_cast<WithDevice>(*slot); originalPlayer = reinterpret_cast<PlayerUpdate>(*playerSlot); originalDamage = reinterpret_cast<NpcDamage>(*damageSlot);
         originalPlayerDamage = reinterpret_cast<NpcDamage>(*playerDamageSlot); originalCollision = reinterpret_cast<Collision>(*pickupSlot); originalSlotCollision = reinterpret_cast<Collision>(*slotSlot);
@@ -2102,6 +2281,7 @@ void Begin(const Setup& setup) {
         FILETIME clock{}; GetSystemTimeAsFileTime(&clock);   // this start's number: the clock in tenths of a second, and higher than the last start's
         session = NextSession(session, (static_cast<std::uint64_t>(clock.dwHighDateTime) << 32 | clock.dwLowDateTime) / 1000000ull);
         doing = faulted = 0; for (auto& faults : ruleFaults) faults = 0; for (auto& seen : seenSession) seen = 0; ownBehaviourCount = 0;
+        AcquireSRWLockExclusive(&inputLock); remoteInputCount = 0; fedFrame = 0xffffffff; ReleaseSRWLockExclusive(&inputLock); inputsDistrusted = false;
         for (auto& perPeer : assemblies) for (auto& assembly : perPeer) assembly.Reset();
         counters[0] = 0; counters[1] = 0; stats = Stats{}; sequence = worldSequence = frame = 0;
         published = Published{}; published.magic = kBodyMagic; publishedWorld = PublishedWorld{}; publishedWorld.magic = kWorldMagic;
@@ -2197,11 +2377,24 @@ void Begin(const Setup& setup) {
                 ExchangeSlot(playerDamageSlot, reinterpret_cast<void*>(&OnPlayerDamage), reinterpret_cast<void*>(originalPlayerDamage));
             }
         }
+        // Nobody waits for a remote player's input, host and guest alike: the listener first, then the gate that is fed from it.
+        if (!failure && (rules & kGate)) {
+            failure = HookCode(inputHook); if (!failure) failure = HookCode(gateHook);
+            if (failure) {
+                UnhookCode(gateHook); UnhookCode(inputHook); UnhookGrid(); UnhookClear();
+                ExchangeSlot(slotSlot, reinterpret_cast<void*>(&OnSlotCollision), reinterpret_cast<void*>(originalSlotCollision));
+                ExchangeSlot(pickupSlot, reinterpret_cast<void*>(&OnPickupCollision), reinterpret_cast<void*>(originalCollision));
+                ExchangeSlot(slot, reinterpret_cast<void*>(&OnInput), reinterpret_cast<void*>(original));
+                ExchangeSlot(playerSlot, reinterpret_cast<void*>(&OnPlayer), reinterpret_cast<void*>(originalPlayer));
+                ExchangeSlot(damageSlot, reinterpret_cast<void*>(&OnNpcDamage), reinterpret_cast<void*>(originalDamage));
+                ExchangeSlot(playerDamageSlot, reinterpret_cast<void*>(&OnPlayerDamage), reinterpret_cast<void*>(originalPlayerDamage));
+            }
+        }
         // Every member judges who may come into the running match, host and guest alike.
         if (!failure && !joinsHooked && (rules & kJoin)) {
             failure = HookJoins();
             if (failure) {
-                UnhookJoins(); UnhookGrid(); UnhookClear();
+                UnhookJoins(); UnhookCode(gateHook); UnhookCode(inputHook); UnhookGrid(); UnhookClear();
                 ExchangeSlot(slotSlot, reinterpret_cast<void*>(&OnSlotCollision), reinterpret_cast<void*>(originalSlotCollision));
                 ExchangeSlot(pickupSlot, reinterpret_cast<void*>(&OnPickupCollision), reinterpret_cast<void*>(originalCollision));
                 ExchangeSlot(slot, reinterpret_cast<void*>(&OnInput), reinterpret_cast<void*>(original));
@@ -2229,7 +2422,7 @@ DWORD End(bool restoreCompare) {
     DWORD result = ERROR_NOT_READY;
     if (running.load()) {
         running.store(false, std::memory_order_release);
-        UnhookJoins(); UnhookGrid(); UnhookClear();
+        UnhookJoins(); UnhookCode(gateHook); UnhookCode(inputHook); UnhookGrid(); UnhookClear();
         result = ExchangeSlot(slot, reinterpret_cast<void*>(&OnInput), reinterpret_cast<void*>(original));
         const DWORD second = ExchangeSlot(playerSlot, reinterpret_cast<void*>(&OnPlayer), reinterpret_cast<void*>(originalPlayer));
         const DWORD third = ExchangeSlot(damageSlot, reinterpret_cast<void*>(&OnNpcDamage), reinterpret_cast<void*>(originalDamage));
@@ -2278,7 +2471,7 @@ void FollowLog(const std::filesystem::path& path) {
 
 // The state, where the player sees it without looking for a file: the end of the game window's title. It is there from the
 // main menu on ("loaded"), so that a player knows the module is in before a match begins.
-constexpr wchar_t kVersionText[] = L"0.1.3";
+constexpr wchar_t kVersionText[] = L"0.1.4";
 void ShowState(const wchar_t* text) {
     static HWND window = nullptr;
     if (!window || !IsWindow(window)) {
