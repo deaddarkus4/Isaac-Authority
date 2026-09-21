@@ -414,6 +414,20 @@ constexpr std::array<std::uint8_t, 6> kInitDealEntry{0x55, 0x8B, 0xEC, 0x6A, 0xF
 // entity keeps its cell at +0x24.
 constexpr std::uintptr_t kRefVariant = 0x4, kRefSpawnerType = 0x8, kRefPosition = 0x10, kRefVelocity = 0x18, kRefEntity = 0x24, kGridIndex = 0x24;
 constexpr std::uint32_t kDamageCountdown = 0x40, kRefBytes = 0x40; constexpr float kMostDamage = 1.0e6f;
+// What a guest's twin misses because its state is the host's and its blows are held (docs/j460-twins-seen-and-fires.md).
+// Shown or not: Entity's "visible" byte, +0x171. Entity_NPC::Update (RVA 0x2c4b30) hides an enemy that starts to appear
+// (state 1, the state it had kept at +0xb68) and shows it again from inside that state; a twin written out of state 1
+// from outside never gets there and stays unseen. The flame: the fireplace's AI (RVA 0x2d18d0, kinds 0 and 1, burning is
+// state 8) sets the scale of the sprite's layer 1 to hit points / most hit points (times the vector at RVA 0x83793c, which
+// is 1, 1) - but only in the branch that handles damage that has just been dealt (Entity's pending damage, +0x14), and a
+// guest's fireplace is dealt none: its flame stayed whole until the host's word put it out. ANM2::GetLayer(int) is RVA
+// 0xb220 (thiscall on the sprite, Entity+0x48; the layers' count at +0x80 of the sprite), a layer's scale is at +0x34.
+// Pending damage becomes lost hit points inside the enemy's Update (its base, RVA 0x2ae820): several blows of one frame,
+// or hit points the host's snapshot lowered after a blow, killed a twin before the host's word, and the host's list made
+// it anew a moment later - so what is pending is held below the hit points right before that Update.
+constexpr std::uintptr_t kVisible = 0x171, kPendingDamage = 0x14, kGetLayer = 0xb220, kSpriteLayers = 0x80, kLayerScale = 0x34, kVectorOne = 0x83793c;
+constexpr std::int32_t kFireBurning = 8; constexpr std::uint32_t kFlameLayer = 1;
+constexpr std::array<std::uint8_t, 6> kGetLayerEntry{0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68};
 // The rules that can be left out: the third word of the configuration is their mask in hex.
 constexpr std::uint32_t kFollow = 1, kBehaviour = 2, kClear = 4, kTaken = 8, kGridRule = 16, kFire = 32, kProjectiles = 64, kTears = 128, kDrops = 256,
     kCounters = 512, kDoors = 1024, kTraps = 2048, kBombsRule = 4096, kHurt = 8192, kSlotsRule = 16384, kPets = 32768, kLead = 65536, kLook = 131072, kJoin = 262144, kGate = 524288,
@@ -444,6 +458,8 @@ struct Stats {
     std::uint32_t blowsSent, blowsPlayed, blowsMissed, blowsLost, copyBlowsIgnored;
     // The host's worlds (a guest): dropped because this game had run the room past them; times the clock started anew; the cushion now, in frames.
     std::uint32_t worldsLate, worldsRebased, worldCushion;
+    // A guest's twins: shown or hidden by the host's word; flames sized to the host's hit points; deaths held back right before the twin's update.
+    std::uint32_t visibleFixes, flameFixes, deathsHeldAtUpdate;
     float correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax;
 };
 #pragma pack(pop)
@@ -473,6 +489,7 @@ using ProcessJoins = void(__thiscall*)(void*, std::uint32_t);
 using EraseJoin = std::uint32_t(__thiscall*)(void*, const std::uint64_t*);
 using DequeClear = void(__thiscall*)(void*);
 using DequePush = void(__thiscall*)(void*, const float*);   // a deque of points: the point is copied
+using GetLayer = std::uintptr_t(__thiscall*)(void*, int);         // the sprite: the layer's number
 using DealDoor = char(__thiscall*)(void*, char, char);            // the room: animate, force
 using InitDeal = void(__thiscall*)(void*, char, char);            // the game (its level): force an angel's room, force a devil's
 using RoomByIdx = std::uintptr_t(__thiscall*)(void*, int, int);   // the game (its level): grid index, dimension (-1: the present one)
@@ -948,7 +965,7 @@ void PublishWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t room
         std::memcpy(npc.v1, reinterpret_cast<void*>(entity + kV1), 8); std::memcpy(npc.v2, reinterpret_cast<void*>(entity + kV2), 8);
         std::memcpy(npc.target, reinterpret_cast<void*>(entity + kTarget), 8);
         AnimationOf(entity, npc.animation);
-        npc.linked = (At<std::uintptr_t>(entity + kParent) ? 1u : 0u) | (At<std::uintptr_t>(entity + kChild) ? 2u : 0u);
+        npc.linked = (At<std::uintptr_t>(entity + kParent) ? 1u : 0u) | (At<std::uintptr_t>(entity + kChild) ? 2u : 0u) | (At<std::uint8_t>(entity + kVisible) ? 0u : kNpcHidden);
         npc.collisionDamage = At<float>(entity + kCollisionDamage);
         npc.gridCollision = At<std::uint32_t>(entity + kGridCollision); npc.entityCollision = At<std::uint32_t>(entity + kEntityCollision); npc.renderZ = At<std::int32_t>(entity + kRenderZ);
         std::memcpy(npc.position, reinterpret_cast<void*>(entity + kPosition), 8); std::memcpy(npc.velocity, reinterpret_cast<void*>(entity + kVelocity), 8);
@@ -1265,6 +1282,19 @@ void ApplyCounters(std::uintptr_t game, std::uintptr_t player, const World& worl
     for (int k = 0; k < 3; ++k) lastCounters[k] = At<std::int32_t>(player + offsets[k]);
 }
 
+// Guest: a burning fireplace's flame as large as the host's hit points make it - what the game's own AI does where it
+// handles damage just dealt, which a guest's fireplace never is (see kVisible).
+void FlameToHitPoints(std::uintptr_t entity) {
+    const float most = At<float>(entity + kMaxHitPoints); const auto sprite = entity + kSprite;
+    if (!(most > 0.0f) || At<std::uint32_t>(sprite + kSpriteLayers) <= kFlameLayer) return;
+    const auto layer = reinterpret_cast<GetLayer>(base + kGetLayer)(reinterpret_cast<void*>(sprite), static_cast<int>(kFlameLayer));
+    if (!layer) return;
+    const float hitPoints = At<float>(entity + kHitPoints) > 1.0f ? At<float>(entity + kHitPoints) : 1.0f, part = hitPoints / most;
+    const float wide = part * At<float>(base + kVectorOne), high = part * At<float>(base + kVectorOne + 4);
+    if (At<float>(layer + kLayerScale) == wide && At<float>(layer + kLayerScale + 4) == high) return;
+    At<float>(layer + kLayerScale) = wide; At<float>(layer + kLayerScale + 4) = high; stats.flameFixes++;
+}
+
 // Guest: the host's enemies over the local ones.
 void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIndex) {
     static World world;  // the game's thread only
@@ -1330,7 +1360,7 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
         }
         if (best < 0) {
             stats.npcOnlyHost++;
-            if (world.npcs[n].linked) { stats.npcPartsLeft++; continue; }   // a part of something: only the game's own code can make it
+            if (world.npcs[n].linked & kNpcParts) { stats.npcPartsLeft++; continue; }   // a part of something: only the game's own code can make it
             std::uint32_t m = 0;
             while (m < missingCount && missing[m].seed != world.npcs[n].seed) ++m;
             if (m == missingCount && missingCount < kMaxNpcs) missing[missingCount++] = Missing{world.npcs[n].seed, 0, 0};
@@ -1364,6 +1394,7 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
         const float dx = npc.position[0] - position[0], dy = npc.position[1] - position[1], distance = std::sqrt(dx * dx + dy * dy);
         std::memcpy(position, npc.position, 8); std::memcpy(reinterpret_cast<void*>(entity + kVelocity), npc.velocity, 8);
         if (At<float>(entity + kHitPoints) != npc.hitPoints) { At<float>(entity + kHitPoints) = npc.hitPoints; stats.hitPointFixes++; }
+        if (On(kFire) && npc.type == kFireplace && npc.variant <= 1 && npc.state == kFireBurning) { doing = kFire; FlameToHitPoints(entity); doing = 0; }
         if (npc.collisionDamage >= 0.0f && npc.collisionDamage < 1000.0f) At<float>(entity + kCollisionDamage) = npc.collisionDamage;
         // What the enemy does: the host's. The guest's own code goes on from here, so it plays the host's attack.
         if (!On(kBehaviour) || BehavesAlone(At<std::uint32_t>(entity + kType), At<std::uint32_t>(entity + kVariant))) {
@@ -1387,6 +1418,9 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
         std::memcpy(reinterpret_cast<void*>(entity + kTarget), npc.target, 8);
         // What the host's enemy collides with and where it is drawn: its own code sets these where it changes state - which a guest's twin never does by itself.
         At<std::uint32_t>(entity + kGridCollision) = npc.gridCollision; At<std::uint32_t>(entity + kEntityCollision) = npc.entityCollision; At<std::int32_t>(entity + kRenderZ) = npc.renderZ;
+        // And whether it is shown: the game hides and shows an enemy on its way through a state (see kVisible).
+        const std::uint8_t shown = npc.linked & kNpcHidden ? 0 : 1;
+        if (At<std::uint8_t>(entity + kVisible) != shown) { At<std::uint8_t>(entity + kVisible) = shown; stats.visibleFixes++; }
         if (npc.animation[0]) {
             char own[kAnimationName]; AnimationOf(entity, own);
             if (std::memcmp(own, npc.animation, kAnimationName) != 0) {
@@ -1854,8 +1888,20 @@ void AfterNpcFault(std::uintptr_t entity) noexcept {
     } __except (EXCEPTION_EXECUTE_HANDLER) { TakeFault(); }
 }
 
+// A guest's twin dies by the host's word. What has been dealt to it becomes lost hit points inside its Update: held below
+// the hit points here, whatever the blows of this frame add up to and whatever the host's snapshot has made of the hit
+// points since (see kVisible).
+void HoldDeath(std::uintptr_t entity) noexcept {
+    __try {
+        const float pending = At<float>(entity + kPendingDamage), hitPoints = At<float>(entity + kHitPoints);
+        if (!(At<float>(entity + kMaxHitPoints) > 0.0f) || At<std::uint32_t>(entity + kType) == kFireplace || !(pending > 0.0f) || pending < hitPoints || !HostRules()) return;
+        At<float>(entity + kPendingDamage) = hitPoints > 0.02f ? hitPoints - 0.01f : 0.0f; stats.deathsHeldAtUpdate++;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 void __fastcall OnNpcUpdate(void* self, void*) {
     if (!Live() || host) { reinterpret_cast<PlayerUpdate>(gridHooks[kNpcUpdateHook].original)(self); return; }
+    if (On(kBehaviour)) HoldDeath(reinterpret_cast<std::uintptr_t>(self));
     if (!UpdatedWhole(self)) AfterNpcFault(reinterpret_cast<std::uintptr_t>(self));
 }
 
@@ -2355,7 +2401,8 @@ void WriteStatus() {
         if (host) status << "; neighbours' blows played " << stats.blowsPlayed << " / with no target here " << stats.blowsMissed << " / never come " << stats.blowsLost << ", copies' blows that counted for nothing "
                          << stats.copyBlowsIgnored;
         else status << "; own blows told " << stats.blowsSent << "; enemies made by the host's list " << stats.npcSpawned << " / removed as not the host's " << stats.npcRemoved << " / killed by the host's word "
-                    << stats.npcKilled << ", states taken from the host " << stats.stateFixes << ", animations " << stats.animationFixes << "; worlds dropped as overtaken " << stats.worldsLate
+                    << stats.npcKilled << ", states taken from the host " << stats.stateFixes << ", animations " << stats.animationFixes << ", shown or hidden by the host's word " << stats.visibleFixes
+                    << ", deaths held at the update " << stats.deathsHeldAtUpdate << ", flames sized " << stats.flameFixes << "; worlds dropped as overtaken " << stats.worldsLate
                     << " of " << stats.worldReceived << " (cushion " << stats.worldCushion << " frames, clock started anew " << stats.worldsRebased << " times); deal: own rolls held " << stats.dealsHeld << ", doors made by the host's word "
                     << stats.dealDoorsMade << " (failed " << stats.dealDoorFailures << ", in another place " << stats.dealElsewhere << ", of another kind " << stats.dealOtherKind << ")";
         if (stats.roomFollowsRefused) status << "; ROOMS NOT FOLLOWED INTO (this game's floor has no such room) " << stats.roomFollowsRefused;
@@ -2496,6 +2543,7 @@ void Begin(const Setup& setup) {
             std::memcmp(reinterpret_cast<void*>(base + kInputFind), kInputFindEntry.data(), kInputFindEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kInputInsert), kInputInsertEntry.data(), kInputInsertEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kInputErase), kInputEraseEntry.data(), kInputEraseEntry.size()) != 0 ||
+            std::memcmp(reinterpret_cast<void*>(base + kGetLayer), kGetLayerEntry.data(), kGetLayerEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kInitDeal), kInitDealEntry.data(), kInitDealEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kRoomByIdx), kRoomByIdxEntry.data(), kRoomByIdxEntry.size()) != 0 ||
             std::memcmp(reinterpret_cast<void*>(base + kSpawn), kSpawnEntry.data(), kSpawnEntry.size()) != 0) throw static_cast<DWORD>(ERROR_REVISION_MISMATCH);
@@ -2718,7 +2766,7 @@ void FollowLog(const std::filesystem::path& path) {
 
 // The state, where the player sees it without looking for a file: the end of the game window's title. It is there from the
 // main menu on ("loaded"), so that a player knows the module is in before a match begins.
-constexpr wchar_t kVersionText[] = L"0.1.5";
+constexpr wchar_t kVersionText[] = L"0.1.6";
 void ShowState(const wchar_t* text) {
     static HWND window = nullptr;
     if (!window || !IsWindow(window)) {

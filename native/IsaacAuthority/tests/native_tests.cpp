@@ -54,6 +54,8 @@ void Ranges() {
     world = Room(); world->npcs[1].hitPoints = std::numeric_limits<float>::quiet_NaN(); Check(!ValidWorld(*world), "hit points that are no number");
     world = Room(); world->npcs[0].entityCollision = kEntityCollisionClasses; Check(!ValidWorld(*world), "a collision class the game does not have");
     world = Room(); world->npcs[1].gridCollision = 3; world->npcs[1].entityCollision = 4; world->npcs[0].renderZ = -1000; Check(ValidWorld(*world), "a fireplace that burns beside one that has gone out: no collisions, drawn under everything");
+    world = Room(); world->npcs[0].linked = kNpcHidden | 1; Check(ValidWorld(*world), "a part of something that the host's game does not show");
+    world = Room(); world->npcs[0].linked = 8; Check(!ValidWorld(*world), "a bit of an enemy's record that there is not");
     world = Room(); world->sequence = 0; Check(!ValidWorld(*world), "sequences start at one");
     world = Room(); world->doors = kMaxDoors + 1; Check(!ValidWorld(*world), "more doors than the list holds");
     world = Room(); world->door[0].deal = 3; Check(!ValidWorld(*world), "a door to a deal leads to a devil's room or an angel's");

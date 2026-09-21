@@ -17,8 +17,11 @@ constexpr std::uint8_t kOfBody = 1, kOfShots = 2, kOfWorld = 3, kOfHello = 4;
 // 5: the game no longer waits for a remote player's input - which a game that still waits must not be matched with.
 // 6: a player's blows at the world are told by its owner (they ride with its shots) and a copy's count nowhere; a door to a
 //    deal is the host's (its kind rides with the door, the seed its room was made from with the world).
-constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 6;   // "HEL1"
+// 7: whether the host's enemy is shown at all rides in its record (kNpcHidden in linked): a guest that does not know the bit
+//    would take a hidden enemy for a part of something.
+constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 7;   // "HEL1"
 constexpr std::uint32_t kGridCollisionClasses = 8, kEntityCollisionClasses = 5;   // the game's enums: GRIDCOLL_NONE..PITSONLY, ENTCOLL_NONE..ALL
+constexpr std::uint32_t kNpcParts = 3, kNpcHidden = 4;                              // in Npc::linked
 constexpr std::uint8_t kDevilRoom = 14, kAngelRoom = 15;                           // the game's RoomType of the two deals
 constexpr std::uint8_t kHere = 0, kCompareOff = 1, kLive = 2;
 constexpr int kHealthFields = 10, kMaxTaken = 8, kAnimationName = 24, kMaxNpcs = 48, kMaxDeaths = 16;
@@ -37,7 +40,11 @@ struct Npc {
     std::uint32_t seed, type, variant, subtype; float position[2], velocity[2], hitPoints;
     std::int32_t state, stateFrame, cooldown; float v1[2], v2[2]; std::int32_t i1, i2; float target[2];
     char animation[kAnimationName];   // empty: none, or a name too long to carry
-    std::uint32_t linked;             // 1 has a parent, 2 has a child: a part of something, never created or removed by the lists
+    // 1 has a parent, 2 has a child: a part of something, never created or removed by the lists. 4 (kNpcHidden): the host's
+    // game does not show it (Entity's "visible", +0x171). The game hides an enemy for the first frames of its appearing
+    // (state 1) and shows it from inside that state; a guest's twin whose state is written from outside leaves the state
+    // without that and stays unseen - reported from a match through Steam as enemies that are there and cannot be seen.
+    std::uint32_t linked;
     float collisionDamage;            // what touching it costs
     // Whom and what it collides with at all (the game's GridCollisionClass and EntityCollisionClass) and the layer it is
     // drawn in (RenderZOffset). Read in a live pair: a fireplace the host's game has put out keeps its collision damage of
