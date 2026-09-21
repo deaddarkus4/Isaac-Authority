@@ -118,10 +118,21 @@ template <class T, class Keep> void Prune(T* table, std::uint32_t& count, Keep k
 
 // The match as the game's own log tells it, line by line: "Start Networked" opens one, the lines that add players name the
 // own device and the others (Steam id, this game's device number), "Menu Game Init" and "Leaving current lobby" close it, a
-// disconnected input device is a player who has left.
+// disconnected input device is a player who has left. A player the game lets into a running match is added by the same line
+// as at the start.
 struct MatchLog {
-    bool on = false, expectOwn = false; int own = -1; std::uint32_t number = 0, roster = 0; std::uint64_t changedAt = 0;   // roster: counts the players who have left
+    bool on = false, expectOwn = false; int own = -1; std::uint32_t number = 0, roster = 0; std::uint64_t changedAt = 0;   // roster: counts the players who have come or left
     std::uint64_t remoteIds[8]{}; int remoteDevices[8]{}; int remotes = 0;
 };
 void TakeLogLine(MatchLog& match, const std::string& line, std::uint64_t now);
+
+// Who may come into a match that runs (the user's rule): a player whose save has at least every unlock of the session's
+// shared save. What a lobby member tells the others of its save (the game's writer, RVA 0x51b130) begins with the
+// achievements: 642 flags of a bit each, least significant first, in (642 >> 3) + 1 bytes. The game's shared save is these
+// flags ANDed over the members (its builder, RVA 0x51a450), so an unlock of the session is a flag every member has.
+constexpr std::uint32_t kSaveAchievements = 642, kSaveAchievementBytes = (kSaveAchievements >> 3) + 1;
+// The session's unlocks from its members' blocks; of no members, none.
+void SharedUnlocks(const std::uint8_t* const* members, std::uint32_t count, std::uint8_t* shared);
+// How many unlocks of the session a save lacks: 0 and its player may come in. Bits past the last achievement say nothing.
+std::uint32_t UnlocksLacking(const std::uint8_t* shared, const std::uint8_t* joiner);
 }

@@ -139,12 +139,33 @@ void Log() {
     TakeLogLine(match, "[INFO] - Adding remote player, UserID = 76561198000000002, device ID = 14", 140);
     Check(match.remotes == 2 && match.remoteIds[0] == 76561198000000001ull && match.remoteDevices[0] == 13 && match.remoteIds[1] == 76561198000000002ull && match.remoteDevices[1] == 14,
         "the other players: Steam id and this game's device number");
-    TakeLogLine(match, "[INFO] - Input device (ID = 99) disconnected", 150); Check(match.remotes == 2 && match.roster == 0 && match.changedAt == 140, "a device of nobody's");
+    TakeLogLine(match, "[INFO] - Input device (ID = 99) disconnected", 150); Check(match.remotes == 2 && match.roster == 2 && match.changedAt == 140, "a device of nobody's");
     TakeLogLine(match, "[INFO] - Input device (ID = 13) disconnected", 160);
-    Check(match.remotes == 1 && match.remoteDevices[0] == 14 && match.remoteIds[0] == 76561198000000002ull && match.roster == 1 && match.changedAt == 160, "a player has left, the others remain");
+    Check(match.remotes == 1 && match.remoteDevices[0] == 14 && match.remoteIds[0] == 76561198000000002ull && match.roster == 3 && match.changedAt == 160, "a player has left, the others remain");
+    TakeLogLine(match, "[INFO] - [Frame: 5120] Adding remote player, UserID = 76561198000000003, device ID = 15", 165);
+    Check(match.remotes == 2 && match.remoteDevices[1] == 15 && match.remoteIds[1] == 76561198000000003ull && match.roster == 4 && match.changedAt == 165, "a player has come into the running match");
     TakeLogLine(match, "[INFO] - Menu Game Init", 170); Check(!match.on && match.number == 1, "the match closes");
     TakeLogLine(match, "[INFO] - Start Networked", 200); Check(match.on && match.number == 2 && match.remotes == 0 && match.own < 0 && match.roster == 0, "the next match starts from nothing");
     TakeLogLine(match, "[INFO] - Leaving current lobby", 210); Check(!match.on, "leaving the lobby closes it as well");
+}
+
+void Unlocks() {
+    std::uint8_t host[kSaveAchievementBytes]{}, guest[kSaveAchievementBytes]{}, joiner[kSaveAchievementBytes]{}, shared[kSaveAchievementBytes]{};
+    const auto set = [](std::uint8_t* save, std::uint32_t n) { save[n >> 3] |= static_cast<std::uint8_t>(1u << (n & 7)); };
+    for (std::uint32_t n : {0u, 7u, 8u, 100u, 641u}) set(host, n);
+    for (std::uint32_t n : {7u, 8u, 100u, 300u, 641u}) set(guest, n);
+    const std::uint8_t* members[] = {host, guest};
+    SharedUnlocks(members, 2, shared);
+    Check(shared[0] == 0x80 && shared[1] == 0x01 && UnlocksLacking(shared, host) == 0 && UnlocksLacking(shared, guest) == 0, "the session's unlocks are what every member has");
+    Check(UnlocksLacking(shared, joiner) == 4, "an empty save lacks them all");
+    for (std::uint32_t n : {7u, 8u, 100u}) set(joiner, n);
+    Check(UnlocksLacking(shared, joiner) == 1, "the last achievement counts too");
+    set(joiner, 641); set(joiner, 5);
+    Check(UnlocksLacking(shared, joiner) == 0, "a save with more than the session's unlocks may come in");
+    shared[kSaveAchievementBytes - 1] |= 0xfc;   // bits 642..647: no achievements
+    Check(UnlocksLacking(shared, joiner) == 0, "bits past the last achievement say nothing");
+    SharedUnlocks(members, 0, shared);
+    Check(shared[0] == 0 && shared[kSaveAchievementBytes - 1] == 0 && UnlocksLacking(shared, joiner) == 0, "of no members nothing is shared");
 }
 
 void Contract(const wchar_t* path) {
@@ -159,8 +180,8 @@ void Contract(const wchar_t* path) {
 }
 int wmain(int argc, wchar_t** argv) {
     try {
-        Packing(); Ranges(); Frames(); Sessions(); Handshake(); Tables(); Log();
+        Packing(); Ranges(); Frames(); Sessions(); Handshake(); Tables(); Log(); Unlocks();
         for (int i = 1; i < argc; ++i) Contract(argv[i]);
-        std::cout << "PASS native packing, ranges, frame assembly, sessions, handshake, tables, match log, module contract\n"; return 0;
+        std::cout << "PASS native packing, ranges, frame assembly, sessions, handshake, tables, match log, unlocks, module contract\n"; return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }

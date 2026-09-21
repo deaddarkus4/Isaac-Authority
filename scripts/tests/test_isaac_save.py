@@ -88,6 +88,15 @@ class SaveTests(unittest.TestCase):
         # The order of the guests does not matter.
         self.assertEqual(save.merge([host, third, second]), merged)
 
+    def test_who_may_come_into_a_running_session(self):
+        host, guest = sample(chunk_1={0: 1, 7: 1, 8: 1, 641: 1}, chunk_2={7: 600}), sample(chunk_1={7: 1, 8: 1, 300: 1, 641: 1}, chunk_2={7: 20})
+        shared = save.merge_shared([save.shared_view(host), save.shared_view(guest)])
+        self.assertEqual(save.lacking_unlocks(shared, save.shared_view(sample())), [7, 8, 641])
+        self.assertEqual(save.lacking_unlocks(shared, save.shared_view(sample(chunk_1={7: 1, 8: 1}))), [641])
+        # More than the session's unlocks is fine, and so are smaller counters: only the unlocks are asked for.
+        self.assertEqual(save.lacking_unlocks(shared, save.shared_view(sample(chunk_1={5: 1, 7: 1, 8: 1, 641: 1}, chunk_2={7: 1}))), [])
+        self.assertEqual(save.lacking_unlocks(shared, save.shared_view(host)), [])
+
     def test_counters_compare_as_the_game_compares_them(self):
         # The game takes the smallest counter as an unsigned number, and the smallest cutscene counter as a signed one.
         minus = 0xFFFFFFFF

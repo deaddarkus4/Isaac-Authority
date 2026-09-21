@@ -208,6 +208,12 @@ def encode_shared(shared):
     return raw + struct.pack("<4Q", *(list(shared.get("members", [])) + [0] * 4)[:4])
 
 
+def lacking_unlocks(shared, joiner):
+    """Who may come into a match that runs (the user's rule, as in native_state.cpp): a player whose save has at least every
+    unlock of the session's shared save. The achievements of the shared view that the joiner's view lacks; none - may join."""
+    return [index for index, (ours, theirs) in enumerate(zip(shared["chunks"][1], joiner["chunks"][1])) if ours and not theirs]
+
+
 def difference(expected, actual):
     """Where two shared views differ: {part: [(index or key, expected, actual), ...]}. Achievements 0 to 31 are reported as
     the part 'firstBytes': in a dump of the game they are the four bytes a released buffer loses to the allocator."""
@@ -248,7 +254,14 @@ def main():
     compared = commands.add_parser("compare", help="a shared save dumped by the game against the merge of its members' saves")
     compared.add_argument("--shared", type=Path, required=True, help="sharedsave_begin.dat of the session")
     compared.add_argument("files", type=Path, nargs="+", help="every member's save as it was before the session")
+    joining = commands.add_parser("joinable", help="may a save's player come into a session that runs: has it every unlock the members share")
+    joining.add_argument("--joiner", type=Path, required=True); joining.add_argument("files", type=Path, nargs="+", help="the saves of the session's members")
     args = parser.parse_args()
+    if args.command == "joinable":
+        shared = merge_shared([shared_view(parse(path.read_bytes())) for path in args.files])
+        lacking = lacking_unlocks(shared, shared_view(parse(args.joiner.read_bytes())))
+        print(f"the session shares {sum(shared['chunks'][1])} unlocks; the joiner lacks {len(lacking)}" + (f": achievements {lacking[:20]}{' ...' if len(lacking) > 20 else ''}" if lacking else " - may join"))
+        return 1 if lacking else 0
     if args.command == "overlay":
         if args.output.exists():
             raise SystemExit("The output file exists; a save is never overwritten")

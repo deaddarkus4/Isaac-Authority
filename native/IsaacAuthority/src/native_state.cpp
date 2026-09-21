@@ -121,6 +121,10 @@ void TakeLogLine(MatchLog& match, const std::string& line, std::uint64_t now) {
         if (device != std::string::npos && match.remotes < 8) {
             match.remoteIds[match.remotes] = std::strtoull(line.c_str() + remote + 31, nullptr, 10);
             match.remoteDevices[match.remotes++] = static_cast<int>(std::strtol(line.c_str() + device + 14, nullptr, 10));
+            // A player may also come into a match that runs: the game lets one in where the floor changes ("Join Existing
+            // Game"), and the others add that player with this same line. Counted like a leaving, so that whoever follows
+            // the roster starts anew with the player; the adds of a match's start come before anybody has settled on it.
+            ++match.roster;
         }
         match.expectOwn = false; match.changedAt = now;
     } else if (line.find("Adding local player") != std::string::npos) { match.expectOwn = true; match.changedAt = now; }
@@ -136,5 +140,20 @@ void TakeLogLine(MatchLog& match, const std::string& line, std::uint64_t now) {
             break;
         }
     }
+}
+
+void SharedUnlocks(const std::uint8_t* const* members, std::uint32_t count, std::uint8_t* shared) {
+    for (std::uint32_t at = 0; at < kSaveAchievementBytes; ++at) {
+        std::uint8_t all = count ? 0xff : 0;
+        for (std::uint32_t m = 0; m < count; ++m) all &= members[m][at];
+        shared[at] = all;
+    }
+}
+
+std::uint32_t UnlocksLacking(const std::uint8_t* shared, const std::uint8_t* joiner) {
+    std::uint32_t lacking = 0;
+    for (std::uint32_t n = 0; n < kSaveAchievements; ++n)
+        if ((shared[n >> 3] >> (n & 7) & 1) && !(joiner[n >> 3] >> (n & 7) & 1)) ++lacking;
+    return lacking;
 }
 }
