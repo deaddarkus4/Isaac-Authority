@@ -417,7 +417,7 @@ constexpr std::uint32_t kDamageCountdown = 0x40, kRefBytes = 0x40; constexpr flo
 // The rules that can be left out: the third word of the configuration is their mask in hex.
 constexpr std::uint32_t kFollow = 1, kBehaviour = 2, kClear = 4, kTaken = 8, kGridRule = 16, kFire = 32, kProjectiles = 64, kTears = 128, kDrops = 256,
     kCounters = 512, kDoors = 1024, kTraps = 2048, kBombsRule = 4096, kHurt = 8192, kSlotsRule = 16384, kPets = 32768, kLead = 65536, kLook = 131072, kJoin = 262144, kGate = 524288,
-    kDeal = 1048576, kHits = 2097152, kAllRules = 0x3FFFFF;
+    kDeal = 1048576, kHits = 2097152, kSteady = 4194304, kAllRules = 0x7FFFFF;
 constexpr int kTakenRetryFrames = 30, kAliveBodies = 5; constexpr float kTakenReach = 120.0f;
 #pragma pack(push, 1)
 // What a reader outside copies: generation is odd while the content is being written.
@@ -442,6 +442,8 @@ struct Stats {
     std::uint32_t roomFollowsRefused, dealsHeld, dealDoorsMade, dealDoorFailures, dealElsewhere, dealOtherKind;
     // Blows of the own player told (a guest) / a neighbour's blows played on this world, with no target here, never come (the host) / blows of a copy's that counted for nothing (the host).
     std::uint32_t blowsSent, blowsPlayed, blowsMissed, blowsLost, copyBlowsIgnored;
+    // The host's worlds (a guest): dropped because this game had run the room past them; times the clock started anew; the cushion now, in frames.
+    std::uint32_t worldsLate, worldsRebased, worldCushion;
     float correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax;
 };
 #pragma pack(pop)
@@ -514,7 +516,12 @@ Known knownProjectiles{}, knownTears[kControllers]{}, knownBombs[kControllers]{}
 struct Age { std::uint32_t seed, age; } dropAges[kAges]{}; std::uint32_t dropAgeCount = 0;
 std::uint64_t tearsHeardAt[kControllers]{}; std::uint32_t shotsSequence = 0;
 Inbox inbox[kControllers];
-World worldInbox{}; std::uint64_t worldAt = 0; std::uint32_t worldApplied = 0;
+// The host's worlds that have come and wait for their moment (see Dejitter in native_state.hpp): a ring, the oldest first,
+// with the time and this game's frame each came in; the last sequence played, the frame it was played in, and the room the
+// clock was last started for. All under inboxLock. frameNow: this game's frame, for the thread that receives.
+struct WaitingWorld { World world; std::uint64_t at; std::uint32_t arrived; };
+WaitingWorld worldQueue[kWorldQueue]{}; std::uint32_t worldHead = 0, worldWaiting = 0, worldApplied = 0, worldPlayedAt = 0, worldClockRoom = 0xffffffff;
+Dejitter worldClock; std::atomic<std::uint32_t> frameNow{0}; constexpr std::uint64_t kWaitingMs = 600;
 SOCKET udp = INVALID_SOCKET; HANDLE worker = nullptr; bool winsock = false; unsigned short port = 0;
 sockaddr_in peers[kMaxPeers]{}; std::uint32_t peerCount = 0; std::atomic<bool> peerHeard{false};
 // The handshake: this module's stage, per neighbour the stage it last named plus one (0: not heard yet) with what its hello
@@ -1261,13 +1268,29 @@ void ApplyCounters(std::uintptr_t game, std::uintptr_t player, const World& worl
 // Guest: the host's enemies over the local ones.
 void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIndex) {
     static World world;  // the game's thread only
-    bool fresh = false;
-    AcquireSRWLockShared(&inboxLock);
-    if (worldInbox.sequence && worldInbox.sequence != worldApplied && GetTickCount64() - worldAt <= kFreshMs) { world = worldInbox; fresh = true; }
-    ReleaseSRWLockShared(&inboxLock);
+    bool fresh = false; const auto now = GetTickCount64(); const auto gameNow = At<std::uintptr_t>(base + kGame); const auto floorNow = gameNow ? Floor(gameNow) : 0;
+    AcquireSRWLockExclusive(&inboxLock);
+    const auto leave = [&] {   // the oldest leaves the queue; one of another room or floor is counted as it always was
+        const auto& gone = worldQueue[worldHead].world;
+        if (gone.room != roomIndex) stats.otherRoom++; else if (gameNow && gone.floor != floorNow) stats.otherFloor++;
+        worldHead = (worldHead + 1) % kWorldQueue; --worldWaiting;
+    };
+    while (worldWaiting && (now - worldQueue[worldHead].at > kWaitingMs || worldQueue[worldHead].world.sequence <= worldApplied)) leave();
+    std::uint32_t sequences[kWorldQueue], arrived[kWorldQueue], where[kWorldQueue], ofThisRoom = 0;
+    for (std::uint32_t n = 0; n < worldWaiting; ++n) {
+        const auto& waiting = worldQueue[(worldHead + n) % kWorldQueue];
+        if (waiting.world.room != roomIndex || (gameNow && waiting.world.floor != floorNow)) continue;
+        sequences[ofThisRoom] = waiting.world.sequence; arrived[ofThisRoom] = waiting.arrived; where[ofThisRoom++] = n;
+    }
+    // Another room: both games stood still on the way in, each for its own while - the clock starts from what comes now.
+    if (worldClockRoom != roomIndex) { worldClockRoom = roomIndex; worldClock.count = 0; }
+    Picked picked{-1, 0, 0, false};
+    if (ofThisRoom) picked = On(kSteady) ? PickWorld(worldClock, sequences, arrived, ofThisRoom, frame, frame - worldPlayedAt) : Picked{static_cast<int>(ofThisRoom) - 1, ofThisRoom, 0, false};
+    if (picked.play >= 0) { world = worldQueue[(worldHead + where[picked.play]) % kWorldQueue].world; fresh = true; worldApplied = world.sequence; worldPlayedAt = frame; }
+    if (picked.drop) { const auto upTo = sequences[picked.drop - 1]; while (worldWaiting && worldQueue[worldHead].world.sequence <= upTo) leave(); }
+    stats.worldsLate += picked.late; if (picked.rebased) stats.worldsRebased++; stats.worldCushion = static_cast<std::uint32_t>(worldClock.cushion);
+    ReleaseSRWLockExclusive(&inboxLock);
     if (!fresh) return;
-    if (const auto game = At<std::uintptr_t>(base + kGame)) if (world.floor != Floor(game)) { stats.otherFloor++; return; }
-    if (world.room != roomIndex) { stats.otherRoom++; return; }
     hostClearRoom.store(world.room); hostClear.store(world.clear); hostHeardAt.store(GetTickCount64());
     if (aliasRoom != roomIndex) { aliasRoom = roomIndex; aliasCount = 0; orphanCount = 0; missingCount = 0; dropAgeCount = 0; doorMemoryCount = 0; slotAgeCount = 0; }
     if (On(kCounters)) if (const auto game = At<std::uintptr_t>(base + kGame)) { doing = kCounters; ApplyCounters(game, player, world); doing = 0; }
@@ -1411,7 +1434,7 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
     if (On(kDoors)) { doing = kDoors; ApplyDoors(room, world); }
     if (On(kDeal) && game) { doing = kDeal; ApplyDeal(game, room, world); }
     doing = 0;
-    stats.worldApplied++; worldApplied = world.sequence;
+    stats.worldApplied++;
 }
 
 // What tells a pickup taken, opened or bought from the same pickup a moment earlier.
@@ -1697,7 +1720,7 @@ void AfterUpdate(std::uintptr_t player) noexcept {
         if (!game) return;
         const auto room = At<std::uintptr_t>(game + kRoom); const auto roomIndex = At<std::uint32_t>(game + kRoomIndex);
         if (controller == ownController) {
-            ++frame;
+            ++frame; frameNow.store(frame, std::memory_order_relaxed);
             // How evenly this game's frames come, measured here: reading it from outside is a frame's jitter too coarse.
             static std::uint64_t lastFrameUs = 0; const auto nowUs = NowUs();
             if (lastFrameUs && frame > 60) {
@@ -2223,7 +2246,14 @@ bool DeliverShots(const Shots& shots, bool anew) {
 bool DeliverWorld(const World& world, bool anew) {
     if (host || !ValidWorld(world)) return false;   // the host takes nobody's world
     AcquireSRWLockExclusive(&inboxLock);
-    if (anew || world.sequence > worldInbox.sequence) { worldInbox = world; worldAt = GetTickCount64(); stats.worldReceived++; }
+    if (anew) { worldWaiting = 0; worldApplied = 0; worldClock = Dejitter{}; }   // the host's module has started anew: it counts from 1 again
+    const auto newest = worldWaiting ? worldQueue[(worldHead + worldWaiting - 1) % kWorldQueue].world.sequence : worldApplied;
+    if (anew || world.sequence > newest) {
+        if (worldWaiting == kWorldQueue) { worldHead = (worldHead + 1) % kWorldQueue; --worldWaiting; }   // full: the oldest gives way
+        auto& waiting = worldQueue[(worldHead + worldWaiting++) % kWorldQueue];
+        waiting.world = world; waiting.at = GetTickCount64(); waiting.arrived = frameNow.load(std::memory_order_relaxed);
+        worldClock.Came(world.sequence, waiting.arrived); stats.worldReceived++;
+    }
     ReleaseSRWLockExclusive(&inboxLock);
     return true;
 }
@@ -2325,7 +2355,8 @@ void WriteStatus() {
         if (host) status << "; neighbours' blows played " << stats.blowsPlayed << " / with no target here " << stats.blowsMissed << " / never come " << stats.blowsLost << ", copies' blows that counted for nothing "
                          << stats.copyBlowsIgnored;
         else status << "; own blows told " << stats.blowsSent << "; enemies made by the host's list " << stats.npcSpawned << " / removed as not the host's " << stats.npcRemoved << " / killed by the host's word "
-                    << stats.npcKilled << ", states taken from the host " << stats.stateFixes << ", animations " << stats.animationFixes << "; deal: own rolls held " << stats.dealsHeld << ", doors made by the host's word "
+                    << stats.npcKilled << ", states taken from the host " << stats.stateFixes << ", animations " << stats.animationFixes << "; worlds dropped as overtaken " << stats.worldsLate
+                    << " of " << stats.worldReceived << " (cushion " << stats.worldCushion << " frames, clock started anew " << stats.worldsRebased << " times); deal: own rolls held " << stats.dealsHeld << ", doors made by the host's word "
                     << stats.dealDoorsMade << " (failed " << stats.dealDoorFailures << ", in another place " << stats.dealElsewhere << ", of another kind " << stats.dealOtherKind << ")";
         if (stats.roomFollowsRefused) status << "; ROOMS NOT FOLLOWED INTO (this game's floor has no such room) " << stats.roomFollowsRefused;
         status << ", datagrams refused " << stats.rejected << ", frames lost in pieces " << stats.framesBroken
@@ -2499,7 +2530,7 @@ void Begin(const Setup& setup) {
         hostClearRoom = 0xfffffffe; hostClear = 0; hostHeardAt = 0;
         lastRoom = followRoom = 0xfffffffe; roomEpoch = heardEpoch = followTried = 0; following = false;
         lastFloor = followFloor = 0xffffffff; floorEpoch = heardFloorEpoch = floorTried = 0; followingFloor = false;
-        worldInbox = World{}; worldAt = 0; worldApplied = 0; livedRoom = aliasRoom = 0xffffffff; livedCount = deathCount = aliasCount = orphanCount = missingCount = 0;
+        worldHead = worldWaiting = worldApplied = worldPlayedAt = 0; worldClockRoom = 0xffffffff; worldClock = Dejitter{}; frameNow = 0; livedRoom = aliasRoom = 0xffffffff; livedCount = deathCount = aliasCount = orphanCount = missingCount = 0;
         WSADATA data{};
         if (const int started = WSAStartup(MAKEWORD(2, 2), &data)) throw static_cast<DWORD>(started);
         winsock = true; udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -2710,7 +2741,7 @@ void ShowState(const wchar_t* text) {
 }
 
 DWORD WINAPI Supervise(void*) noexcept {
-    std::uint32_t doneNumber = 0, startedNumber = 0, startedRoster = 0; bool unsupported = false; std::filesystem::path gameLog; const wchar_t* why = L"";
+    Done done; std::uint32_t startedNumber = 0, startedRoster = 0; bool unsupported = false; std::filesystem::path gameLog; const wchar_t* why = L"";
     try {
         static wchar_t image[32768]{};
         unsupported = !GetModuleFileNameW(nullptr, image, 32768) || !isaac_probe::AnalyzeBytes(isaac_probe::ReadFile(image)).supported;
@@ -2738,11 +2769,11 @@ DWORD WINAPI Supervise(void*) noexcept {
                           discord.load() == static_cast<std::uint8_t>(Discord::Hosts) ? L"off in this match - the modules did not agree on the host" : L"off in this match - not every player has the module";
                 else if (match.on && startedNumber == match.number) why = L"off - the other players have left";
                 End(!goesOn);
-                if (!goesOn) doneNumber = startedNumber;
+                // Done with the match as it stands now: a player who comes (back) into it later is a reason to start again.
+                if (!goesOn) done = Done{startedNumber, match.roster};
             }
             if (!match.on) why = L"";
-            const bool settled = match.on && match.own > 0 && match.remotes > 0 && GetTickCount64() - match.changedAt > 1500;
-            if (!running.load() && settled && match.number != doneNumber) {
+            if (!running.load() && MayStart(match, done, GetTickCount64())) {
                 setup.controller = match.own; setup.host = true; bool known = true;
                 for (int n = 0; n < match.remotes; ++n) {
                     // The lowest device number is the host's. The numbers are each process's own, but every game adds the
@@ -2759,8 +2790,8 @@ DWORD WINAPI Supervise(void*) noexcept {
                 if (!setup.outsideTests && setup.peerCount == 1 && match.remotes == 1) setup.peerControllers[0] = match.remoteDevices[0];
                 known = known && match.remotes <= static_cast<int>(kMaxPeers) && (setup.steamPeerCount || setup.peerCount);
                 startedNumber = match.number; startedRoster = match.roster;
-                if (!known) { doneNumber = match.number; why = L"off - the other players are not reachable through Steam"; }
-                else try { Begin(setup); } catch (...) { doneNumber = match.number; why = L"off - the module could not start in this game"; }
+                if (!known) { done = Done{match.number, match.roster}; why = L"off - the other players are not reachable through Steam"; }
+                else try { Begin(setup); } catch (...) { done = Done{match.number, match.roster}; why = L"off - the module could not start in this game"; }
             }
             const bool on = running.load(); const auto at = stage.load();
             ReleaseSRWLockExclusive(&lifecycle);

@@ -138,6 +138,14 @@ struct MatchLog {
     std::uint64_t remoteIds[8]{}; int remoteDevices[8]{}; int remotes = 0;
 };
 void TakeLogLine(MatchLog& match, const std::string& line, std::uint64_t now);
+// When the installed module may start in the match the log tells of: the match is on, the own device and somebody else are
+// known, and the log has said nothing new of it for kSettleMs. A match the module is done with - everybody left, not every
+// player has the module, it could not start - is done with as it stood then: when a player comes or leaves afterwards, the
+// module tries again. (Seen in a match through Steam: the one guest left and came back into the running match at the next
+// floor, and the host's module stayed "off - the other players have left" to the end.)
+constexpr std::uint64_t kSettleMs = 1500;
+struct Done { std::uint32_t number = 0, roster = 0; };
+bool MayStart(const MatchLog& match, const Done& done, std::uint64_t now);
 
 // The game's lockstep counts a frame only when every player's input for that frame has come, and drops an input that comes
 // for a frame already counted: with a real ping between the players every late packet is a frame that waits (measured in
@@ -183,6 +191,39 @@ bool ValidHits(const Hit* hits, std::uint32_t count);
 // Where in a list that came the blows not played yet begin (count: none). done: the last number played, 0 while nothing is
 // known of this sender; a list that ends below it is of a sender that has started anew. lost: numbers that never came.
 std::uint32_t FreshHits(const Hit* hits, std::uint32_t count, std::uint32_t& done, std::uint32_t& lost);
+
+// A guest leads its room by the host's snapshots and lets the game's own code run it in between: an enemy's state, the frame
+// of that state, its timers and its place are written from every snapshot, and between two of them the twin runs by itself.
+// The host counts a snapshot every frame and sends every second one; while they come as evenly as they were sent, the twin
+// has run just as far as the host had when the next one is written, and the writing changes nothing. With a ping that
+// trembles they do not: a snapshot that comes j frames late turns the twin's clock j frames back, and the next one, on
+// time again, j frames forward. What the enemy's code does at a certain frame of a state - a spawn, a shot, showing itself
+// - is then done twice or not at all. Reported from a match with 100 ms and more between the players: enemies that vanish
+// and come back (the twin that was made twice is removed without a death, the one never made is created late), and nothing
+// of it with bosses or on one machine.
+// So snapshots are played by a steady clock, as a remote player's input is. A snapshot's lead is this game's frame when it
+// came minus its sequence; what a tenth of the last kLeadWindow leads stay under is the path itself (not the very least:
+// snapshots that come while this game stands still look early), what lies above it is trembling. A
+// snapshot's moment is its sequence plus the least lead plus a cushion - the trembling nine snapshots of ten stay under,
+// between kLeastCushion and kMostCushion frames; it grows at once and shrinks a frame after kCushionPatience calm arrivals.
+// In a frame the newest snapshot whose moment has come is played. One whose moment passed more than kLateSlack frames ago
+// has been overtaken by this game's own running of the room and is dropped - unless nothing has been played for
+// kStarveFrames: then the path has changed or the host's game has stood still, the newest is played and the clock starts from it.
+constexpr std::uint32_t kLeadWindow = 32, kStarveFrames = 8, kCushionPatience = 64, kWorldQueue = 8;
+constexpr std::int32_t kLeastCushion = 1, kMostCushion = 6, kLateSlack = 1;
+struct Dejitter {
+    std::int32_t leads[kLeadWindow]{}; std::uint32_t count = 0, next = 0, calm = 0; std::int32_t cushion = 2;
+    void Came(std::uint32_t sequence, std::uint32_t frame);     // a snapshot came in this frame of this game
+    void Rebase(std::uint32_t sequence, std::uint32_t frame);   // everything before is forgotten
+    std::int32_t Least() const;
+    // How many frames past its moment (negative: before it) a snapshot is in this frame.
+    std::int32_t Past(std::uint32_t sequence, std::uint32_t frame) const { return static_cast<std::int32_t>(frame - sequence) - (Least() + cushion); }
+};
+// play: which of the waiting snapshots is played in this frame (-1: none); drop: how many of the oldest leave the queue,
+// the played one among them; late: how many of those were dropped as overtaken; rebased: the clock started anew.
+struct Picked { int play; std::uint32_t drop, late; bool rebased; };
+// sequences rise; arrived: the frame each came in; idle: frames since a snapshot was last played.
+Picked PickWorld(Dejitter& clock, const std::uint32_t* sequences, const std::uint32_t* arrived, std::uint32_t count, std::uint32_t frame, std::uint32_t idle);
 
 // Who may come into a match that runs (the user's rule): a player whose save has at least every unlock of the session's
 // shared save. The game's shared save is its members' achievements ANDed (its builder, RVA 0x51a450), so an unlock of the

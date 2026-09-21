@@ -61,6 +61,56 @@ bool ValidHits(const Hit* hits, std::uint32_t count) {
     return true;
 }
 
+namespace {
+// The leads in rising order: at most 32 numbers, an insertion sort.
+std::uint32_t Sorted(const Dejitter& clock, std::int32_t* sorted) {
+    for (std::uint32_t n = 0; n < clock.count; ++n) {
+        std::uint32_t at = n; const auto lead = clock.leads[n];
+        while (at && sorted[at - 1] > lead) { sorted[at] = sorted[at - 1]; --at; }
+        sorted[at] = lead;
+    }
+    return clock.count;
+}
+}
+
+// The path itself: what a tenth of the arrivals stay under, not the very least - a few snapshots that came while this
+// game stood still (its frames did not count on, the host's did) look early and are nothing of the path's.
+std::int32_t Dejitter::Least() const {
+    std::int32_t sorted[kLeadWindow]; const auto have = Sorted(*this, sorted);
+    return have ? sorted[(have - 1) / 10] : 0;
+}
+
+void Dejitter::Rebase(std::uint32_t sequence, std::uint32_t frame) {
+    leads[0] = static_cast<std::int32_t>(frame - sequence); count = 1; next = 1 % kLeadWindow; calm = 0;
+}
+
+void Dejitter::Came(std::uint32_t sequence, std::uint32_t frame) {
+    leads[next] = static_cast<std::int32_t>(frame - sequence); next = (next + 1) % kLeadWindow; if (count < kLeadWindow) ++count;
+    if (count < 8) return;   // too few to tell trembling from the path
+    std::int32_t sorted[kLeadWindow]; Sorted(*this, sorted);
+    auto wanted = sorted[(count - 1) * 9 / 10] - sorted[(count - 1) / 10];
+    wanted = wanted < kLeastCushion ? kLeastCushion : wanted > kMostCushion ? kMostCushion : wanted;
+    if (wanted > cushion) { cushion = wanted; calm = 0; }
+    else if (wanted == cushion) calm = 0;
+    else if (++calm >= kCushionPatience) { --cushion; calm = 0; }
+}
+
+Picked PickWorld(Dejitter& clock, const std::uint32_t* sequences, const std::uint32_t* arrived, std::uint32_t count, std::uint32_t frame, std::uint32_t idle) {
+    Picked picked{-1, 0, 0, false};
+    if (!count) return picked;
+    if (!clock.count) { clock.Rebase(sequences[count - 1], arrived[count - 1]); picked.rebased = true; }
+    int due = static_cast<int>(count) - 1;
+    while (due >= 0 && clock.Past(sequences[due], frame) < 0) --due;
+    if (due < 0) return picked;   // their moments have not come
+    if (clock.Past(sequences[due], frame) <= kLateSlack) { picked.play = due; picked.drop = static_cast<std::uint32_t>(due) + 1; return picked; }
+    if (idle >= kStarveFrames) {
+        clock.Rebase(sequences[count - 1], arrived[count - 1]);
+        picked.play = static_cast<int>(count) - 1; picked.drop = count; picked.rebased = true; return picked;
+    }
+    picked.drop = picked.late = static_cast<std::uint32_t>(due) + 1;
+    return picked;
+}
+
 std::uint32_t FreshHits(const Hit* hits, std::uint32_t count, std::uint32_t& done, std::uint32_t& lost) {
     if (!count) return 0;
     if (hits[count - 1].number < done) done = 0;   // the sender counts from 1 again
@@ -146,6 +196,10 @@ std::uint8_t NextStage(std::uint8_t now, const Heard* heard, std::uint32_t neigh
 void TakeLogLine(MatchLog& match, const std::string& line, std::uint64_t now) {
     if (line.find("Start Networked") != std::string::npos) { const auto number = match.number + 1; match = MatchLog{}; match.on = true; match.number = number; match.changedAt = now; return; }
     if (line.find("Menu Game Init") != std::string::npos || line.find("Leaving current lobby") != std::string::npos) { match.on = false; match.changedAt = now; return; }
+    // Whoever comes into a match that runs never starts one: the game reads the running match's state and says so (the reader
+    // of "Join Existing Game", RVA 0x517fd0), and only then adds the players - for a newcomer that line opens the match. The
+    // members read the same message and write the same line: for them the match is on already, and it changes nothing.
+    if (!match.on && line.find("Joining existing game on frame") != std::string::npos) { const auto number = match.number + 1; match = MatchLog{}; match.on = true; match.number = number; match.changedAt = now; return; }
     if (!match.on) return;
     if (const auto remote = line.find("Adding remote player, UserID = "); remote != std::string::npos) {
         const auto device = line.find(", device ID = ", remote);
@@ -171,6 +225,10 @@ void TakeLogLine(MatchLog& match, const std::string& line, std::uint64_t now) {
             break;
         }
     }
+}
+
+bool MayStart(const MatchLog& match, const Done& done, std::uint64_t now) {
+    return match.on && match.own > 0 && match.remotes > 0 && now - match.changedAt > kSettleMs && (match.number != done.number || match.roster != done.roster);
 }
 
 void Playout::Take(const InputRecord& record) {

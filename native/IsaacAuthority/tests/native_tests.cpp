@@ -148,6 +148,31 @@ void Log() {
     TakeLogLine(match, "[INFO] - Menu Game Init", 170); Check(!match.on && match.number == 1, "the match closes");
     TakeLogLine(match, "[INFO] - Start Networked", 200); Check(match.on && match.number == 2 && match.remotes == 0 && match.own < 0 && match.roster == 0, "the next match starts from nothing");
     TakeLogLine(match, "[INFO] - Leaving current lobby", 210); Check(!match.on, "leaving the lobby closes it as well");
+    // The host's log of the match through Steam in which the one guest left and came back at the next floor.
+    MatchLog host; Done done;
+    TakeLogLine(host, "[INFO] - Start Networked ", 1000); TakeLogLine(host, "[INFO] - [Frame: 0] Adding local player, device ID = 0 ", 1001);
+    TakeLogLine(host, "[INFO] - Entity_Player::SetControllerId() Setting controller ID to 2, (Prev: 0) ", 1002);
+    TakeLogLine(host, "[INFO] - [Frame: 0] Adding remote player, UserID = 76561198000000001, device ID = 3 ", 1003);
+    Check(!MayStart(host, done, 2000) && MayStart(host, done, 1003 + kSettleMs + 1), "the module starts once the log has been quiet about the match for a while");
+    TakeLogLine(host, "[INFO] - [Frame: 23380] Input device (ID = 3) disconnected ", 50000);
+    Check(host.remotes == 0 && !MayStart(host, done, 60000), "alone in the match: nothing to start for");
+    done = Done{host.number, host.roster};   // the module has stopped: the other players have left
+    TakeLogLine(host, "[INFO] - [Frame 24492] Adding pending join for player 76561198000000001 ", 70000);
+    Check(!MayStart(host, done, 80000), "a newcomer that waits in the lobby is not in the match");
+    TakeLogLine(host, "[INFO] - [Frame: 26190] Adding remote player, UserID = 76561198000000001, device ID = 4 ", 90000);
+    TakeLogLine(host, "[INFO] - Joining existing game on frame 26190", 90001);
+    TakeLogLine(host, "[INFO] - Entity_Player::SetControllerId() Setting controller ID to 2, (Prev: 0) ", 90002);
+    Check(host.number == 1 && host.own == 2 && host.remotes == 1 && host.remoteDevices[0] == 4, "for a member the newcomer's entry is no new match, and its own device stays what it was");
+    Check(MayStart(host, done, 90003 + kSettleMs), "the player is back in the same match: the module starts again");
+    done = Done{host.number, host.roster}; Check(!MayStart(host, done, 99000), "and what it is done with stays done while nobody comes or leaves");
+    // The newcomer itself never starts a match: the game says that it joins one, and then adds the players.
+    MatchLog joiner;
+    TakeLogLine(joiner, "[INFO] - Menu Game Init", 10); TakeLogLine(joiner, "[INFO] - Joining existing game on frame 26190", 500);
+    Check(joiner.on && joiner.number == 1, "coming into a running match opens the match for the newcomer");
+    TakeLogLine(joiner, "[INFO] - [Frame: 26190] Adding remote player, UserID = 76561198000000009, device ID = 2 ", 501);
+    TakeLogLine(joiner, "[INFO] - [Frame: 26190] Adding local player, device ID = 0 ", 502);
+    TakeLogLine(joiner, "[INFO] - Entity_Player::SetControllerId() Setting controller ID to 3, (Prev: 0) ", 503);
+    Check(joiner.own == 3 && joiner.remotes == 1 && MayStart(joiner, Done{}, 503 + kSettleMs + 1), "and its module starts as in any match");
 }
 
 void Unlocks() {
@@ -232,6 +257,51 @@ void Hits() {
     Check(!UnpackShots(carried.data(), static_cast<std::uint32_t>(carried.size()), *back), "more blows than the list holds are refused");
 }
 
+void Steady() {
+    // An even path: every second frame of the host's, ten frames on the way.
+    Dejitter clock;
+    for (std::uint32_t s = 100; s < 180; s += 2) clock.Came(s, s + 10);
+    Check(clock.Least() == 10 && clock.cushion == 2, "an even path: its lead is known, the cushion is still the one it started with");
+    for (std::uint32_t s = 180; s < 308; s += 2) clock.Came(s, s + 10);
+    Check(clock.cushion == kLeastCushion, "a calm path: the cushion shrinks to the least, a frame at a time and only after a long calm");
+    std::uint32_t one[1] = {300}, came[1] = {310};
+    auto picked = PickWorld(clock, one, came, 1, 310, 2);
+    Check(picked.play == -1 && picked.drop == 0, "a snapshot waits for its moment: its sequence, the path, the cushion");
+    picked = PickWorld(clock, one, came, 1, 311, 3);
+    Check(picked.play == 0 && picked.drop == 1 && picked.late == 0 && !picked.rebased, "and is played in it");
+    // One that trembled four frames late: this game has run the room past it already.
+    one[0] = 302; came[0] = 316; picked = PickWorld(clock, one, came, 1, 316, 5);
+    Check(picked.play == -1 && picked.drop == 1 && picked.late == 1, "a snapshot overtaken by this game's own running is dropped, not played backwards");
+    // Two at once after a gap: the newer one is on time.
+    std::uint32_t two[2] = {304, 306}, cameTwo[2] = {317, 317}; picked = PickWorld(clock, two, cameTwo, 2, 317, 6);
+    Check(picked.play == 1 && picked.drop == 2 && picked.late == 0, "of several whose moment has come the newest is played");
+    // A snapshot a frame past its moment is still this moment's: frames are whole, and the two games' do not begin together.
+    one[0] = 308; came[0] = 320; picked = PickWorld(clock, one, came, 1, 320, 3);
+    Check(picked.play == 0, "a frame of slack");
+    // The host's game stood still, or the path grew longer: everything is late, and after kStarveFrames the clock starts anew.
+    std::uint32_t after[2] = {320, 322}, cameAfter[2] = {340, 340}; picked = PickWorld(clock, after, cameAfter, 2, 340, kStarveFrames - 1);
+    Check(picked.play == -1 && picked.late == 2, "late, but something was played a moment ago: dropped");
+    picked = PickWorld(clock, after, cameAfter, 2, 340, kStarveFrames);
+    Check(picked.play == 1 && picked.drop == 2 && picked.rebased && clock.Least() == 18, "nothing played for too long: the newest is played and the clock starts from it");
+    clock.Came(324, 342); one[0] = 324; came[0] = 342;
+    Check(PickWorld(clock, one, came, 1, 342, 2).play == -1 && PickWorld(clock, one, came, 1, 343, 3).play == 0, "and from then on the new path is the path");
+    // Trembling: half of the snapshots four frames late. The cushion covers it at once; three wild ones of 32 do not move it.
+    Dejitter shaky;
+    for (std::uint32_t n = 0; n < 32; ++n) shaky.Came(1000 + 2 * n, 1010 + 2 * n + (n % 2 ? 4 : 0));
+    Check(shaky.Least() == 10 && shaky.cushion == 4, "the cushion grows to what nine of ten stay under");
+    Dejitter spiky;
+    for (std::uint32_t n = 0; n < 32; ++n) spiky.Came(1000 + 2 * n, 1010 + 2 * n + (n % 11 == 5 ? 20 : 0));
+    Check(spiky.cushion == 2, "rare spikes are dropped as late, not waited for by everything else");
+    // This game stood still for five frames: three snapshots came meanwhile and look early. They are not the path.
+    Dejitter stalled;
+    for (std::uint32_t n = 0; n < 32; ++n) stalled.Came(1000 + 2 * n, 1010 + 2 * n - (n >= 20 && n < 23 ? 5 : 0));
+    Check(stalled.Least() == 10, "a few snapshots that look early do not move the path");
+    // A new room: the adapter empties the clock, and it starts from the newest snapshot of that room.
+    clock.count = 0; one[0] = 400; came[0] = 450; picked = PickWorld(clock, one, came, 1, 450, 0);
+    Check(picked.rebased && picked.play == -1 && PickWorld(clock, one, came, 1, 451, 1).play == 0, "an emptied clock starts from the newest snapshot, which waits out the cushion");
+    Check(PickWorld(clock, nullptr, nullptr, 0, 500, 100).play == -1, "nothing waits: nothing is played");
+}
+
 void Contract(const wchar_t* path) {
     HMODULE dll = LoadLibraryW(path); Check(dll != nullptr, "load native adapter");
     using Export = DWORD(WINAPI*)(void*);
@@ -244,8 +314,8 @@ void Contract(const wchar_t* path) {
 }
 int wmain(int argc, wchar_t** argv) {
     try {
-        Packing(); Ranges(); Frames(); Sessions(); Handshake(); Tables(); Log(); Unlocks(); Inputs(); Hits();
+        Packing(); Ranges(); Frames(); Sessions(); Handshake(); Tables(); Log(); Unlocks(); Inputs(); Hits(); Steady();
         for (int i = 1; i < argc; ++i) Contract(argv[i]);
-        std::cout << "PASS native packing, ranges, frame assembly, sessions, handshake, tables, match log, unlocks, input playout, blows, module contract\n"; return 0;
+        std::cout << "PASS native packing, ranges, frame assembly, sessions, handshake, tables, match log, unlocks, input playout, blows, steady worlds, module contract\n"; return 0;
     } catch (const std::exception& e) { std::cerr << e.what() << '\n'; return 1; }
 }
