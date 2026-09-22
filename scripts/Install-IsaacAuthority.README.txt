@@ -102,6 +102,6 @@ F7 - двадцатикратный урон врагам, F8 - убить вр�
 ЕСЛИ ЧТО-ТО ВЕДЁТ СЕБЯ ПЛОХО
 Любое правило отключается при установке, у всех игроков одинаково, например:
   powershell -ExecutionPolicy Bypass -File Install-IsaacAuthority.ps1 -Without lead,doors
-Правила: follow behaviour clear taken grid fire projectiles tears drops counters doors traps bombs hurt slots pets lead look join gate deal hits steady maze
+Правила: follow behaviour clear taken grid fire projectiles tears drops counters doors traps bombs hurt slots pets lead look join gate deal hits steady maze summons
 Что прислать, если сломалось: снимок экрана обоих игроков и файл
   %LOCALAPPDATA%\IsaacAuthority\native-<число>.status (самый свежий).

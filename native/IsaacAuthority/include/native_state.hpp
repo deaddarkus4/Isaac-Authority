@@ -27,7 +27,10 @@ constexpr std::uint8_t kOfBody = 1, kOfShots = 2, kOfWorld = 3, kOfHello = 4;
 //     still took its own rewards the moment a room was cleared would take what nobody else has, and leave its pickups lying.
 // 11: a world says which frame of its sender's game it was made on (World::senderFrame) - the world is longer by it, so a
 //     member of the older protocol would read every world of this one as a wrong size and throw them all away.
-constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 11;   // "HEL1"
+// 12: a guest's enemies summon nothing of their own that the host has not got (the rule "summons"), and a pedestal emptied
+//     here is not filled again for another player's taking. The rules' mask is wider by the new rule: an 11 would be told
+//     "the players' rules differ" instead of being told it is another version.
+constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 12;   // "HEL1"
 constexpr std::uint32_t kGridCollisionClasses = 8, kEntityCollisionClasses = 5;   // the game's enums: GRIDCOLL_NONE..PITSONLY, ENTCOLL_NONE..ALL
 constexpr std::uint32_t kNpcParts = 3, kNpcHidden = 4;                              // in Npc::linked
 constexpr std::uint8_t kDevilRoom = 14, kAngelRoom = 15;                           // the game's RoomType of the two deals

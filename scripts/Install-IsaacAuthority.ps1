@@ -12,7 +12,7 @@ param(
 # itself on only when EVERY player of the match runs it - any other match stays the game's own, untouched.
 # No file of the game is changed; removing the two files is the whole uninstall.
 $ErrorActionPreference = 'Stop'
-$rules = [ordered]@{follow=1; behaviour=2; clear=4; taken=8; grid=16; fire=32; projectiles=64; tears=128; drops=256; counters=512; doors=1024; traps=2048; bombs=4096; hurt=8192; slots=16384; pets=32768; lead=65536; look=131072; join=262144; gate=524288; deal=1048576; hits=2097152; steady=4194304; maze=8388608}
+$rules = [ordered]@{follow=1; behaviour=2; clear=4; taken=8; grid=16; fire=32; projectiles=64; tears=128; drops=256; counters=512; doors=1024; traps=2048; bombs=4096; hurt=8192; slots=16384; pets=32768; lead=65536; look=131072; join=262144; gate=524288; deal=1048576; hits=2097152; steady=4194304; maze=8388608; summons=16777216}
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $files = 'version.dll', 'IsaacAuthorityNative.dll'
 
@@ -56,8 +56,8 @@ try {
     foreach ($file in $files) { if (-not (Test-Path -LiteralPath (Join-Path $here $file))) { throw "$file must lie beside this script." } }
     foreach ($file in $files) { Copy-Item -LiteralPath (Join-Path $here $file) -Destination (Join-Path $GameFolder $file) -Force }
     New-Item -ItemType Directory -Force -Path $settings | Out-Null
-    $mask = 0xFFFFFF; foreach ($name in $Without) { if ($name) { $mask = $mask -band (-bnot $rules[$name]) } }
-    if ($mask -ne 0xFFFFFF) { [IO.File]::WriteAllText((Join-Path $settings 'native.cfg'), ('auto {0:x}' -f $mask), [Text.Encoding]::ASCII) }
+    $mask = 0x1FFFFFF; foreach ($name in $Without) { if ($name) { $mask = $mask -band (-bnot $rules[$name]) } }
+    if ($mask -ne 0x1FFFFFF) { [IO.File]::WriteAllText((Join-Path $settings 'native.cfg'), ('auto {0:x}' -f $mask), [Text.Encoding]::ASCII) }
     else { Remove-Item -LiteralPath (Join-Path $settings 'native.cfg') -ErrorAction SilentlyContinue }
     Write-Host "Installed into $GameFolder."
     Write-Host 'Play as usual. The window title ends with "Authority <version>: loaded" from the main menu on, and with "ON, host" or "ON, guest" in an online match of players who ALL have the same version installed.'
