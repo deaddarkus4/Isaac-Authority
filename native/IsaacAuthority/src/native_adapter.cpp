@@ -1633,8 +1633,12 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
     doing = 0;
     if (On(kHurt) && world.hurt && !At<std::uint8_t>(room + kRoomHurt)) { At<std::uint8_t>(room + kRoomHurt) = 1; stats.hurtTaken++; }
     if (On(kSlotsRule)) { doing = kSlotsRule; ApplySlots(room, world); }
-    if (On(kDrops)) { doing = kDrops; ApplyDrops(room, world); }
+    // Grants before the host's list of pickups: taking an item makes the game put the next one on that pedestal under a
+    // seed of its own (seen on the stand, 23 September: Rotten Meat taken, Mom's Coin Purse there at once, the same seed in
+    // both games). The world that carries the grant already names the host's new item; the list played first made it here
+    // as missing, and the grant played after made this game's own as well - two of one seed.
     if (On(kTaken) && world.grants) { doing = kTaken; ApplyGrants(player, room, world); }
+    if (On(kDrops)) { doing = kDrops; ApplyDrops(room, world); }
     if (On(kDoors)) { doing = kDoors; ApplyDoors(room, world); }
     if (On(kDeal) && game) { doing = kDeal; ApplyDeal(game, room, world); }
     doing = 0;
