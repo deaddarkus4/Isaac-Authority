@@ -3,9 +3,11 @@ after EVERY key a picture of that game's window is saved, and before every key t
 its memory or log - above all that its network service is the LOCALHOST one before anything is pressed inside Online. Any
 mismatch stops the run where it is. All pictures end up on one sheet for review.
 
-Enter-IsaacNativeLobby.py host|guest|ready PID intro|title|lobby OUTPUT_SHEET.png
+Enter-IsaacNativeLobby.py host|guest|wait|queue|ready PID intro|title|file|menu|online|lobby OUTPUT_SHEET.png
 
-The games come from Start-IsaacNativePair.ps1. Order: host (the first game) - guest (each other game) - ready (the host again).
+The games come from Start-IsaacNativePair.ps1. Order: host (the first game) - guest (each other game) - ready (the host
+again). A game that is to sit in the lobby while the others play goes in as "wait" (in, but not ready) before the match
+starts, and asks to be let in later with "queue" (ready, from inside the lobby of the running match).
 Whether the intro or already the title is on the screen is told from the first picture (the intro ends by itself); "intro"
 only allows one key to skip it. The pictures show one game window
 only, cut by its visible frame, and only while that window is in front - never the desktop."""
@@ -82,19 +84,29 @@ def save():
 since = len(log_path.read_text(encoding="utf-8", errors="replace"))
 control = pair.HostWindow(pid)
 try:
-    if role in ("host", "guest"):
+    if role in ("host", "guest", "wait"):
         step(control, None, 0.3, "before any key")
-        # The intro ends by itself, so what was seen a minute ago does not count: the picture decides.
-        if not title(pictures[-1]):
-            need(screen == "intro", "neither the title nor an expected intro is on the screen")
+        # Where on the way in this game already is. Windows hands the foreground over only when the person at the machine
+        # is not using it, and a walk that is stopped halfway (see the message below) leaves the game on whatever screen
+        # it had reached: naming that screen carries on from there instead of pressing the title's keys into a menu that
+        # is no longer there.
+        stages = ("intro", "title", "file", "menu", "online")
+        need(screen in stages, "the screen to start from must be one of: " + ", ".join(stages))
+        at = stages.index(screen)
+        if at <= stages.index("intro") and not title(pictures[-1]):
+            # The intro ends by itself, so what was seen a minute ago does not count: the picture decides.
             step(control, "space", 2.0, "space: skip the intro -> title")
-        need(title(pictures[-1]), "the title is not on the screen")
-        step(control, "enter", 2.0, "enter: title -> file select")
-        need(not title(pictures[-1]), "the title is still on the screen")
-        step(control, "space", 2.0, "space: file 1 -> main menu")
-        need(service() == "none", "a network service exists before Online was entered")
-        step(control, "down", 1.0, "down: cursor to Online")
-        step(control, "space", 2.0, "space: enter Online")
+        if at <= stages.index("title"):
+            need(title(pictures[-1]), "the title is not on the screen")
+            step(control, "enter", 2.0, "enter: title -> file select")
+            need(not title(pictures[-1]), "the title is still on the screen")
+        if at <= stages.index("file"):
+            step(control, "space", 2.0, "space: file 1 -> main menu")
+        if at <= stages.index("menu"):
+            need(service() == "none", "a network service exists before Online was entered")
+            step(control, "down", 1.0, "down: cursor to Online")
+            step(control, "space", 2.0, "space: enter Online")
+        # Nothing is pressed inside Online until the service is the localhost one.
         need(service() == "LOCALHOST", f"the network service is {service()}, not LOCALHOST; nothing more is pressed")
         step(control, "space", 5.0, "space: Quick Match")
         need(service() == "LOCALHOST", "the network service changed")
@@ -106,7 +118,17 @@ try:
             need(log_has("Successfully created lobby", since), "the log does not say the lobby was created")
         else:
             need(log_has("Successfully joined lobby", since), "the log does not say the lobby was joined")
-            step(control, "tab", 2.0, "tab: ready")
+            # "wait" stops here, in the lobby and not ready: the match starts without it and it stays where a player who
+            # wants into a running match sits. A lobby is only announced while somebody's lobby menu is open, so on the
+            # localhost service a game that is outside when the match starts never finds it again (tried three ways on
+            # 22 September: with the modules, without them, and with no ping) - it has to be inside beforehand.
+            if role == "guest":
+                step(control, "tab", 2.0, "tab: ready")
+    elif role == "queue":
+        # Ready from inside the lobby of a match that runs: this is what puts a player into everybody's queue of newcomers.
+        step(control, None, 0.3, "the lobby of the running match")
+        need(service() == "LOCALHOST", "the network service is not LOCALHOST")
+        step(control, "tab", 3.0, "tab: ready -> the queue of newcomers")
     elif role == "ready":
         step(control, None, 0.3, "the host's lobby before ready")
         need(service() == "LOCALHOST", "the network service is not LOCALHOST")

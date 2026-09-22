@@ -181,10 +181,12 @@
 //   the installed module starts anew with the newcomer as a neighbour, and the newcomer's module starts by its own
 //   "Start Networked". Not yet: a newcomer without this module is not told apart - it would end the match for everybody.
 // A tester's help, for getting through floors to what is to be tried (the word "cheats" in the configuration, which the
-// harness gives to the host's game alone): the own player takes no damage (F6 turns that off and on), every blow to an
-// enemy in this game counts twentyfold (F7), and F8 kills the room's enemies with the game's own Kill - on the host only,
-// whose enemies they are, so that the guests see them die as they see any death. All of it on hooks that are there
-// anyway. It exists in an isolated test instance only: the installed module, in a game of Steam's, never reads the word.
+// harness gives to every game of the stand, so that whichever window the tester plays in helps him): the own player takes
+// no damage (F6 turns that on and off), every blow to an enemy in this game counts twentyfold (F7), and F8 kills the
+// room's enemies with the game's own Kill - on the host only, whose enemies they are, so that the guests see them die as
+// they see any death. A guest's twentyfold is counted once and not twice: its blow is told to the host as this game asked
+// for it, and the host plays it past this hook. All of it on hooks that are there anyway. It exists in an isolated test
+// instance only: the installed module, in a game of Steam's, never reads the word.
 // Every rule of this module can be left out when it starts (the third word of the configuration, a mask in hex), so that
 // a rule that misbehaves in a live run is switched off without a rebuild.
 //
@@ -252,6 +254,21 @@ constexpr std::uintptr_t kManager = 0x857b18, kManagerTable = 0x782950, kWithDev
 constexpr std::uintptr_t kCompare = 0x50d4a0, kSaveLeaf = 0x77e04c;
 constexpr std::array<std::uint8_t, 8> kCompareEntry{0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x18, 0x53, 0x56};
 constexpr std::array<std::uint8_t, 8> kCompareEqual{0xB8, 0x01, 0x00, 0x00, 0x00, 0xC2, 0x04, 0x00};  // mov eax, 1; ret 4
+// Curse of the Maze (the curses' bit 0x20) throws a player who walks through a door into another room instead. The game
+// does it inside Level::ChangeRoom (RVA 0x33fc80), under the curse's own branch, with two rolls of its own generator:
+// one in ten sends the player to a "candidate" room - any room of the floor bar the secret, super secret and curse ones,
+// reached through a door on the opposite side - and one in five shuffles the floor besides. Each game rolls for itself,
+// so one player is thrown and the others are not: their rooms part, and this module then drags everybody after whoever
+// moved last. Seen on the stand of four (22 September: the host left a curse room and arrived a room further on, the
+// guests walked the honest way and were pulled after him) and reported from matches through Steam.
+// The floor's rolls are the host's, as the deal's are (see kDeal): a guest does not roll at all - the two branches are
+// jumped over in its game - and reaches the same room by following the host. Both jumps are conditional ones the game
+// itself takes when a roll comes to nothing, so nothing is invented here: it is the roll that is held, not its answer.
+constexpr std::uintptr_t kMazeRoll = 0x33ff00, kMazeShuffle = 0x340236;
+constexpr std::array<std::uint8_t, 6> kMazeRollEntry{0x0F, 0x85, 0x20, 0x03, 0x00, 0x00};   // jnz past the candidate search
+constexpr std::array<std::uint8_t, 6> kMazeRollHeld{0xE9, 0x21, 0x03, 0x00, 0x00, 0x90};    // jmp there, always
+constexpr std::array<std::uint8_t, 6> kMazeShuffleEntry{0x0F, 0x85, 0x02, 0x01, 0x00, 0x00};
+constexpr std::array<std::uint8_t, 6> kMazeShuffleHeld{0xE9, 0x03, 0x01, 0x00, 0x00, 0x90};
 constexpr char kIsolated[] = "IsaacAuthority-";
 constexpr int kKeyboard = 0;
 // Entity: exists +0x172, dead +0x173, position +0x33c, velocity +0x360, hit points +0x380, maximum +0x384, seed +0x3ec.
@@ -386,6 +403,9 @@ constexpr std::uintptr_t kPickupSetPrice = 0x2e2570;
 constexpr std::array<std::uint8_t, 8> kPickupSetPriceEntry{0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68, 0x57, 0xB0};
 constexpr std::uint32_t kPickup = 5, kCollectible = 100, kAges = 128, kMaxDropSpawns = 16;
 constexpr std::uint32_t kDropMadeHereSnapshots = 6, kDropGoneSnapshots = 20, kDropItemSnapshots = 15;
+// How long a guest's own player is held off a pickup the host has not named yet (see OnPickupCollision): long enough for a
+// snapshot to cross a real ping, short enough not to be felt as the pickup refusing to be taken.
+constexpr std::uint32_t kOwnTouchWait = 30;
 constexpr std::uintptr_t kKeys = 0x135c, kBombs = 0x1364, kCoins = 0x1368, kPlayers = 0x1baa8; constexpr std::uint32_t kCountersHoldFrames = 45;
 constexpr std::uintptr_t kDoorTable = 0x768698, kDoorBusted = 0x391, kDoorRefresh = 0x30ee40; constexpr std::uint32_t kGridDoor = 16;
 constexpr std::array<std::uint8_t, 8> kDoorRefreshEntry{0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68, 0x6D, 0xC9};
@@ -431,7 +451,7 @@ constexpr std::array<std::uint8_t, 6> kGetLayerEntry{0x55, 0x8B, 0xEC, 0x6A, 0xF
 // The rules that can be left out: the third word of the configuration is their mask in hex.
 constexpr std::uint32_t kFollow = 1, kBehaviour = 2, kClear = 4, kTaken = 8, kGridRule = 16, kFire = 32, kProjectiles = 64, kTears = 128, kDrops = 256,
     kCounters = 512, kDoors = 1024, kTraps = 2048, kBombsRule = 4096, kHurt = 8192, kSlotsRule = 16384, kPets = 32768, kLead = 65536, kLook = 131072, kJoin = 262144, kGate = 524288,
-    kDeal = 1048576, kHits = 2097152, kSteady = 4194304, kAllRules = 0x7FFFFF;
+    kDeal = 1048576, kHits = 2097152, kSteady = 4194304, kMaze = 8388608, kAllRules = 0xFFFFFF;
 constexpr int kTakenRetryFrames = 30, kAliveBodies = 5, kGoneBodies = 5, kRevivalGraceFrames = 90; constexpr float kTakenReach = 120.0f;
 // A dead player of several becomes a ghost (Entity_Player::MorphToCoopGhost, RVA 0x3d96f0: the death is taken back with
 // Revive, the ghost byte +0x20a9 is set, the collisions go) and comes back with Entity_Player::RevivePlayerGhost (RVA
@@ -476,6 +496,22 @@ struct Stats {
     std::uint32_t copyGhostRevivals;   // copies brought back from the ghost by their owner's word, with the game's own RevivePlayerGhost
     // Pedestals given the owner's item before its copy took from them; newcomers held outside a match the modules have changed.
     std::uint32_t takenItemFixes, joinsHeld;
+    // Touches of the own player held while the host had not named the pickup (a guest), and what the takings counted as
+    // missed were made of: the record never came in a body, it was taken in a room this game had left or never saw, or
+    // there was nothing here to take it from. Three quite different faults, told apart so that a match through Steam says
+    // which one it was.
+    std::uint32_t ownTouchesHeld, takenNoRecord, takenElsewhere, takenNoTwin;
+    // Pickups of the host's list this game did not make because they had been taken here (see takenDrops). A number that
+    // grows while a pickup is visibly missing means the guard is catching what it should not.
+    std::uint32_t dropsNotMadeAsTaken;
+    // Pairings of an enemy here with an enemy of the host's let go of because the host no longer has its side. A number
+    // that stays at 0 through a fight full of enemies born in it means the pairings held; one that climbs with every
+    // snapshot means they are being made and broken again, and the enemies are being told apart by place too loosely.
+    std::uint32_t npcPairsDropped;
+    // The last world played here: which frame of its sender's game it was made on, and which frame this game was counting
+    // when it played it. The two together are what lets a reader outside hold a guest's record of the game's own ring
+    // against the host's record of the frame it really belongs to (docs/j460-divergence-plan.md).
+    std::uint32_t senderFramePlayed, ownFrameThen;
     float correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax;
 };
 #pragma pack(pop)
@@ -525,7 +561,7 @@ Taken takenLog[kMaxTaken]{}; std::uint32_t takenTotal = 0, takenDone[kController
 std::uint32_t lastRoom = 0xfffffffe, roomEpoch = 0, heardEpoch = 0, followRoom = 0xfffffffe, followTried = 0; bool following = false;
 // Floors: the floor this game was on a frame ago, its epoch, the newest epoch heard of, and the floor being followed to.
 std::uint32_t lastFloor = 0xffffffff, floorEpoch = 0, heardFloorEpoch = 0, followFloor = 0xffffffff, floorTried = 0; bool followingFloor = false;
-int ownController = -1; bool host = false;
+int ownController = -1; bool host = false; bool mazeHeld = false;   // mazeHeld: this game's rolls for Curse of the Maze are jumped over (a guest)
 // The tester's help (see the head of this file): allowed at all, and what of it is on. The game's thread only.
 bool cheating = false, cheatGod = false, cheatDamage = false; constexpr float kCheatDamage = 20.0f;
 // Blows that landed on the own player; per copy, how many of its owner's this game has played, and whether that count is known yet.
@@ -548,7 +584,17 @@ ShotsInbox shotsInbox[kControllers];
 // The seeds a list has brought here: a shot of such a seed that is missing here has ended here, and is not made again.
 struct Known { std::uint32_t seeds[kKnownShots]; std::uint32_t next; };
 Known knownProjectiles{}, knownTears[kControllers]{}, knownBombs[kControllers]{}, knownEnemyBombs{}, knownDrops{};
+// Pickups taken in this room, here or by another player's word. Kept apart from knownDrops, which says only that the host
+// has named a seed at some point: asking "have we seen it" where the question is "has it been taken" cost a guest a red
+// heart on the stand of four (22 September) - the seed was known, the pickup was gone, and the host's one was never made
+// here again. Emptied with the room, as every table of this module is meant to be (docs/j460-divergence-plan.md).
+Known takenDrops{};
 struct Age { std::uint32_t seed, age; } dropAges[kAges]{}; std::uint32_t dropAgeCount = 0;
+// When the own player first touched a pickup the host has not named: the wait is counted from there, per pickup. Emptied
+// with the room and at every start, as the counts above are: a frame kept from before a start (where the count begins at
+// 0 again) would read as long past, and a table that fills up begins to evict by seed - where two pickups of one slot
+// would keep setting each other's wait back, and the escape after kOwnTouchWait would never come.
+struct Age touchAges[kAges]{}; std::uint32_t touchAgeCount = 0;
 std::uint64_t tearsHeardAt[kControllers]{}; std::uint32_t shotsSequence = 0;
 Inbox inbox[kControllers];
 // The host's worlds that have come and wait for their moment (see Dejitter in native_state.hpp): a ring, the oldest first,
@@ -623,7 +669,33 @@ inline bool On(std::uint32_t rule) { return (rules & ~faulted & rule) != 0; }
 // The module runs and the handshake with every neighbour is through. Until then nothing of the game is changed: a module
 // that runs in one game only must leave it exactly the game its unpatched neighbour compares checksums with.
 bool Live();
-DWORD Patch(std::uintptr_t rva, const std::array<std::uint8_t, 8>& bytes, const std::array<std::uint8_t, 8>& expected);
+// Writes over the game's own code, and only where the bytes are still the ones expected. Already in place counts as
+// done: an earlier start of this module leaves what it wrote behind when it stops.
+template <std::size_t N>
+DWORD Patch(std::uintptr_t rva, const std::array<std::uint8_t, N>& bytes, const std::array<std::uint8_t, N>& expected) {
+    auto* at = reinterpret_cast<std::uint8_t*>(base + rva); DWORD old = 0;
+    if (!VirtualProtect(at, N, PAGE_EXECUTE_READWRITE, &old)) return GetLastError();
+    const bool matches = std::memcmp(at, expected.data(), N) == 0 || std::memcmp(at, bytes.data(), N) == 0;
+    if (matches) std::memcpy(at, bytes.data(), N);
+    DWORD ignored = 0; const BOOL restored = VirtualProtect(at, N, old, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), at, N);
+    return !matches ? ERROR_REVISION_MISMATCH : restored ? ERROR_SUCCESS : GetLastError();
+}
+// A guest does not roll for Curse of the Maze: the floor's rolls are the host's, and it arrives where the host was thrown
+// by following him. Written and taken back exactly where the comparison of checksums is - never while the module is only
+// "here", or a guest in a match with a player who has no module would skip a roll that player made, on a floor where both
+// walk through a door, and split the lobby this module promises to leave the game's own. Both are written or neither is:
+// one of the two alone would still part the floors.
+void HoldMazeRolls() {
+    if (host || !On(kMaze) || mazeHeld) return;
+    if (Patch(kMazeRoll, kMazeRollHeld, kMazeRollEntry)) return;
+    if (Patch(kMazeShuffle, kMazeShuffleHeld, kMazeShuffleEntry)) { Patch(kMazeRoll, kMazeRollEntry, kMazeRollHeld); return; }
+    mazeHeld = true;
+}
+void ReleaseMazeRolls() {
+    if (!mazeHeld) return;
+    Patch(kMazeRoll, kMazeRollEntry, kMazeRollHeld); Patch(kMazeShuffle, kMazeShuffleEntry, kMazeShuffleHeld); mazeHeld = false;
+}
 void SendAll(std::uint8_t kind, std::uint32_t number, const std::uint8_t* payload, std::uint32_t size);
 // Pickups: the seeds the host's list has brought, for how many snapshots a pickup has been out of step; the counters as
 // they were here a frame ago and until when the host's wait; per door what it was here and for how long it differs.
@@ -653,6 +725,13 @@ int __fastcall OnInput(void* self, void*, int controller, void* reader, void* in
 
 // The floor as one number: the game's stage and stage type.
 std::uint32_t Floor(std::uintptr_t game) { return (*reinterpret_cast<std::uint32_t*>(game) & 0xffff) | (*reinterpret_cast<std::uint32_t*>(game + 4) << 16); }
+
+// The frame this game's own network manager counts. Not a clock shared with anybody - with the rule "gate" the games count
+// apart, and that is the whole reason a world carries its sender's (see World::senderFrame).
+std::uint32_t NetFrame() {
+    const auto manager = *reinterpret_cast<std::uintptr_t*>(base + kIsaacManager);
+    return manager ? *reinterpret_cast<std::uint32_t*>(manager + kNetManager + kNetFrame) : 0;
+}
 
 // Microseconds of the performance counter: the tick count is too coarse to tell a body's age within a frame.
 std::uint64_t NowUs() {
@@ -971,6 +1050,7 @@ void PublishWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t room
     if (roomIndex != livedRoom) { livedRoom = roomIndex; livedCount = 0; deathCount = 0; }
     publishedWorld.generation |= 1;   // odd: being written, also after a write that never finished
     auto& world = publishedWorld.world; world.magic = kWorldMagic; world.sequence = ++worldSequence; world.room = roomIndex; world.count = 0;
+    world.senderFrame = NetFrame();   // the key a reader outside lines two games' records up by (see native_state.hpp)
     if (const auto game = At<std::uintptr_t>(base + kGame)) world.floor = Floor(game);
     const auto descriptor = At<std::uintptr_t>(room + kDescriptor); world.clear = descriptor ? At<std::uint32_t>(descriptor + kRoomFlags) & 1 : 0;
     world.npcTotal = 0;
@@ -1111,6 +1191,13 @@ std::uint32_t& AgeOf(std::uint32_t seed) {
 // In step again: forget the count, without making an entry for every pickup that never was out of step.
 void InStep(std::uint32_t seed) { for (std::uint32_t a = 0; a < dropAgeCount; ++a) if (dropAges[a].seed == seed) dropAges[a].age = 0; }
 
+// The frame the own player first touched this pickup while the host had not named it (0: not touched yet).
+std::uint32_t& TouchedSince(std::uint32_t seed) {
+    for (std::uint32_t a = 0; a < touchAgeCount; ++a) if (touchAges[a].seed == seed) return touchAges[a].age;
+    auto& fresh = touchAges[touchAgeCount < kAges ? touchAgeCount++ : seed % kAges]; fresh = Age{seed, 0};
+    return fresh.age;
+}
+
 // Guest: exactly the host's pickups.
 void ApplyDrops(std::uintptr_t room, const World& world) {
     const auto data = At<std::uintptr_t>(room + kListData); const auto listCount = At<std::uint32_t>(room + kListCount);
@@ -1152,7 +1239,10 @@ void ApplyDrops(std::uintptr_t room, const World& world) {
     const auto game = At<std::uintptr_t>(base + kGame); std::uint32_t spawned = 0;
     for (std::uint32_t n = 0; n < world.drops && game && spawned < kMaxDropSpawns; ++n) {
         const auto& drop = world.drop[n];
-        if (taken[n] || !drop.seed || Knows(knownDrops, drop.seed)) continue;
+        // Not made again only where it was taken here: a seed the host has merely named before is no reason to leave a
+        // pickup of his out of this game for good (see takenDrops).
+        if (taken[n] || !drop.seed) continue;
+        if (Knows(takenDrops, drop.seed)) { stats.dropsNotMadeAsTaken++; continue; }
         Learn(knownDrops, drop.seed);
         if (!drop.subtype) { stats.dropsSkipped++; continue; }   // subtype 0 asks the game to roll one
         const auto entity = reinterpret_cast<std::uintptr_t>(reinterpret_cast<Spawn>(base + kSpawn)(reinterpret_cast<void*>(game), kPickup, drop.variant, drop.position, drop.velocity,
@@ -1337,13 +1427,16 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
     if (worldClockRoom != roomIndex) { worldClockRoom = roomIndex; worldClock.count = 0; }
     Picked picked{-1, 0, 0, false};
     if (ofThisRoom) picked = On(kSteady) ? PickWorld(worldClock, sequences, arrived, ofThisRoom, frame, frame - worldPlayedAt) : Picked{static_cast<int>(ofThisRoom) - 1, ofThisRoom, 0, false};
-    if (picked.play >= 0) { world = worldQueue[(worldHead + where[picked.play]) % kWorldQueue].world; fresh = true; worldApplied = world.sequence; worldPlayedAt = frame; }
+    if (picked.play >= 0) {
+        world = worldQueue[(worldHead + where[picked.play]) % kWorldQueue].world; fresh = true; worldApplied = world.sequence; worldPlayedAt = frame;
+        stats.senderFramePlayed = world.senderFrame; stats.ownFrameThen = NetFrame();   // the pair a reader outside lines the two rings up by
+    }
     if (picked.drop) { const auto upTo = sequences[picked.drop - 1]; while (worldWaiting && worldQueue[worldHead].world.sequence <= upTo) leave(); }
     stats.worldsLate += picked.late; if (picked.rebased) stats.worldsRebased++; stats.worldCushion = static_cast<std::uint32_t>(worldClock.cushion);
     ReleaseSRWLockExclusive(&inboxLock);
     if (!fresh) return;
     hostClearRoom.store(world.room); hostClear.store(world.clear); hostHeardAt.store(GetTickCount64());
-    if (aliasRoom != roomIndex) { aliasRoom = roomIndex; aliasCount = 0; orphanCount = 0; missingCount = 0; dropAgeCount = 0; doorMemoryCount = 0; slotAgeCount = 0; }
+    if (aliasRoom != roomIndex) { aliasRoom = roomIndex; aliasCount = 0; orphanCount = 0; missingCount = 0; dropAgeCount = 0; touchAgeCount = 0; doorMemoryCount = 0; slotAgeCount = 0; takenDrops = Known{}; }
     if (On(kCounters)) if (const auto game = At<std::uintptr_t>(base + kGame)) { doing = kCounters; ApplyCounters(game, player, world); doing = 0; }
     const auto data = At<std::uintptr_t>(room + kListData); const auto count = At<std::uint32_t>(room + kListCount);
     if (!data || count > 4096) return;
@@ -1365,9 +1458,18 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
         Prune(missing, missingCount, [&](const Missing& absent) { for (std::uint32_t n = 0; n < world.count; ++n) if (world.npcs[n].seed == absent.seed) return true; return false; });
     // 1. by seed, or by the pairing remembered from an earlier snapshot
     for (std::uint32_t l = 0; l < locals; ++l) {
-        auto seed = At<std::uint32_t>(local[l] + kSeed);
-        for (std::uint32_t a = 0; a < aliasCount; ++a) if (aliases[a].localSeed == seed) { seed = aliases[a].hostSeed; break; }
+        const auto ownSeed = At<std::uint32_t>(local[l] + kSeed); auto seed = ownSeed; bool byAlias = false;
+        for (std::uint32_t a = 0; a < aliasCount; ++a) if (aliases[a].localSeed == ownSeed) { seed = aliases[a].hostSeed; byAlias = true; break; }
         for (std::uint32_t n = 0; n < world.count; ++n) if (!taken[n] && world.npcs[n].seed == seed) { partner[l] = static_cast<int>(n); taken[n] = true; break; }
+        // A remembered pairing whose enemy the host no longer has is stale, and holding on to it is worse than having
+        // none: step 3 kills a local enemy when the host's side of its pairing dies, so a stale one kills the wrong
+        // enemy - a boss died in a guest's game while it went on moving in the host's (22 September, The Haunt). Let go
+        // of it, and this enemy is paired afresh below. Only where the host's list is whole: a list cut short at kMaxNpcs
+        // says nothing about who is gone.
+        if (byAlias && partner[l] < 0 && world.npcTotal <= static_cast<std::uint32_t>(kMaxNpcs)) {
+            Prune(aliases, aliasCount, [&](const Alias& alias) { return alias.localSeed != ownSeed; });
+            stats.npcPairsDropped++;
+        }
     }
     // 2. what is left: the nearest unpaired enemy of the same kind
     for (std::uint32_t n = 0; n < world.count; ++n) {
@@ -1390,7 +1492,12 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
             continue;
         }
         partner[best] = static_cast<int>(n); taken[n] = true; stats.npcPaired++;
-        if (aliasCount < kMaxNpcs) aliases[aliasCount++] = Alias{world.npcs[n].seed, At<std::uint32_t>(local[best] + kSeed)};
+        // One enemy of the host to one enemy here, and the other way about: a pairing added beside an older one for the
+        // same enemy is never read (step 1 takes the first it finds) and turns into a wrong answer about who died. The
+        // newest pairing is the true one - the older ones for either side go.
+        const auto localSeed = At<std::uint32_t>(local[best] + kSeed);
+        Prune(aliases, aliasCount, [&](const Alias& alias) { return alias.localSeed != localSeed && alias.hostSeed != world.npcs[n].seed; });
+        if (aliasCount < kMaxNpcs) aliases[aliasCount++] = Alias{world.npcs[n].seed, localSeed};
     }
     // 3. the host's state over the partners; who has none grows older and is removed in the end; who died at the host dies here
     std::uintptr_t doomed[kMaxNpcs], unwanted[kMaxNpcs]; std::uint32_t doomedCount = 0, unwantedCount = 0;
@@ -1515,13 +1622,28 @@ bool __fastcall OnPickupCollision(void* self, void*, void* collider, std::uint32
         return At<std::int32_t>(reinterpret_cast<std::uintptr_t>(self) + kPrice) != 0 || At<std::int32_t>(reinterpret_cast<std::uintptr_t>(self) + kWait) > 0;
     }
     const auto pickup = reinterpret_cast<std::uintptr_t>(self); const Shape before = ShapeOf(pickup);
+    // A guest takes only what the host has. When a room is cleared every game rolls its own rewards, and a guest's list is
+    // brought to the host's over the next few snapshots (see ApplyDrops); a player quick enough takes one of its own in
+    // between, and in the other games there is nothing to take - the taking is lost and the pickup stays lying there.
+    // Reported from the stand of four, in a boss's room right after the players were revived: 23 takings, three of them
+    // nowhere to be played, and the guest at 150 ms left with its own rewards still on the floor. So a pickup the host has
+    // not named is held for kOwnTouchWait frames - the answer is the game's own, the one a copy's touch gets - and taken
+    // anyway after that, so that nothing the host never names (a list past kMaxDrops) locks a player out of it for good.
+    if (!host && On(kDrops) && !Knows(knownDrops, before.seed)) {
+        auto& since = TouchedSince(before.seed);
+        if (!since) since = frame ? frame : 1;
+        if (frame - since < kOwnTouchWait) {
+            stats.ownTouchesHeld++;
+            return At<std::int32_t>(pickup + kPrice) != 0 || At<std::int32_t>(pickup + kWait) > 0;
+        }
+    }
     float position[2]; std::memcpy(position, reinterpret_cast<void*>(pickup + kPosition), 8);
     const bool result = originalCollision(self, collider, low);
     if (!Same(before, ShapeOf(pickup))) {
         const auto game = At<std::uintptr_t>(base + kGame);
         takenLog[takenTotal % kMaxTaken] = Taken{takenTotal + 1, game ? At<std::uint32_t>(game + kRoomIndex) : 0, before.seed, before.variant, before.subtype, low & 0xff,
                                                  {position[0], position[1]}};
-        ++takenTotal; stats.taken++;
+        ++takenTotal; stats.taken++; Learn(takenDrops, before.seed);   // taken here: the host may go on naming it for a few snapshots yet
     }
     return result;
 }
@@ -1587,12 +1709,12 @@ void ApplyTaken(std::uintptr_t player, int controller, const Body& body, std::ui
     while (takenDone[controller] < body.takenTotal) {
         const std::uint32_t number = takenDone[controller] + 1; const Taken* taken = nullptr;
         for (const auto& t : body.taken) if (t.number == number) taken = &t;
-        if (!taken) { takenDone[controller] = number; takenSince[controller] = 0; stats.takenMissed++; continue; }
+        if (!taken) { takenDone[controller] = number; takenSince[controller] = 0; stats.takenMissed++; stats.takenNoRecord++; continue; }
         if (taken->room != roomIndex) {
             // Taken in a room this game is not in. While its owner still stands there it waits for this game to come after it;
             // an owner that has gone on took it in a room this game has left, or never saw - that one is lost here.
             if (body.room == taken->room) return;
-            takenDone[controller] = number; takenSince[controller] = 0; stats.takenMissed++; continue;
+            takenDone[controller] = number; takenSince[controller] = 0; stats.takenMissed++; stats.takenElsewhere++; continue;
         }
         if (taken->low & kSlotTouch) {
             // A touch of a machine. Most machines are the host's: it alone plays the touch, once, whatever comes of it. A donation
@@ -1643,9 +1765,9 @@ void ApplyTaken(std::uintptr_t player, int controller, const Body& body, std::ui
             doing = 0;
             done = !Same(before, ShapeOf(found));
         }
-        if (done) stats.takenApplied++;
+        if (done) { stats.takenApplied++; Learn(takenDrops, At<std::uint32_t>(found + kSeed)); Learn(takenDrops, taken->seed); }
         else if (frame - takenSince[controller] < static_cast<std::uint32_t>(kTakenRetryFrames)) return;   // in order: again next frame
-        else stats.takenMissed++;
+        else { stats.takenMissed++; stats.takenNoTwin++; }
         takenDone[controller] = number; takenSince[controller] = 0;
     }
 }
@@ -1712,7 +1834,13 @@ void FollowRoom(std::uintptr_t game, std::uint32_t roomIndex) {
         if (box.body.roomEpoch > heardEpoch) heardEpoch = box.body.roomEpoch;
         if (box.body.floor != Floor(game)) continue;   // another floor: its room numbers are not this floor's
         const bool newer = box.body.roomEpoch > roomEpoch || (box.body.roomEpoch == roomEpoch && box.body.host && !host);
-        if (newer && box.body.room != roomIndex && (!found || box.body.roomEpoch > leader.roomEpoch)) { leader = box.body; found = true; }
+        // Two players who walk into two different doors in the same moment number their changes alike, and a game that
+        // hears both has to choose. Taking whichever was read first sends the games to different rooms, and they follow
+        // one another about until they happen to meet: seen on the stand of four (22 September, a guest at 150 ms) - the
+        // host into 1.777, one guest into 7.1, and the other guest to 1.777, then to 7.1, then back. The host's room is
+        // the one that counts, here as everywhere else in this module.
+        const bool better = !found || box.body.roomEpoch > leader.roomEpoch || (box.body.roomEpoch == leader.roomEpoch && box.body.host && !leader.host);
+        if (newer && box.body.room != roomIndex && better) { leader = box.body; found = true; }
     }
     ReleaseSRWLockShared(&inboxLock);
     if (!found || At<std::uint32_t>(game + kRoomTransition) != 0 || (followTried && frame - followTried < kFollowRetryFrames)) return;
@@ -1746,6 +1874,7 @@ void Handshake() {
     const std::uint8_t before = now;
     if (disagreed == Discord::None) now = NextStage(now, heard, neighbours);
     if (before == kHere && now != kHere && Patch(kCompare, kCompareEqual, kCompareEntry)) { gaveUp.store(true, std::memory_order_relaxed); stats.gameFaults++; return; }
+    if (before == kHere && now != kHere) HoldMazeRolls();   // every player of the match has the module: from here the game's code may be changed
     if (now != before) { stage.store(now, std::memory_order_relaxed); if (now == kLive) matchChanged.store(true, std::memory_order_relaxed); }
     if (now == kHere && GetTickCount64() - startedAt > kHelloPatienceMs) { gaveUp.store(true, std::memory_order_relaxed); return; }   // not a match of modules
     if (now != before || frame % kHelloEveryFrames == 0) {
@@ -1754,8 +1883,9 @@ void Handshake() {
     }
 }
 
-// The tester's keys, once per update of the own player and only while this window has the focus: F6 no damage to the own
-// player, F7 twentyfold damage to enemies, F8 (the host) kills the room's enemies with the game's own Kill.
+// The tester's keys, once per update of the own player and only while this window has the focus - so each window is turned
+// on and off by itself, and every game of the stand starts with all of it off: F6 no damage to the own player, F7
+// twentyfold damage to enemies, F8 (the host) kills the room's enemies with the game's own Kill.
 void TesterKeys(std::uintptr_t room) {
     static bool held[3]{}; const int keys[3] = {VK_F6, VK_F7, VK_F8}; bool pressed[3]{};
     for (int k = 0; k < 3; ++k) { const bool down = Focused() && (GetAsyncKeyState(keys[k]) & 0x8000) != 0; pressed[k] = down && !held[k]; held[k] = down; }
@@ -2467,7 +2597,8 @@ void WriteStatus() {
         status << (at == kLive ? "LIVE" : at == kCompareOff ? "comparison off, waiting for the neighbours to say the same" : gaveUp.load() ? (disagreed == Discord::None ? "gave up: not every player answered" : "gave up: the modules did not agree") : waiting)
                << " as " << (host ? "host" : "guest") << ", device " << ownController << "; neighbours answered " << answered << " of " << neighbours
                << ", hellos of another version " << otherProtocol.load() << "; neighbour heard: " << (peerHeard.load() ? "yes" : "NO") << "; sent " << stats.bytesSent / 1024 << " KB, received " << stats.bytesReceived / 1024
-               << " KB" << (cheating ? (cheatGod ? (cheatDamage ? "; TESTER'S HELP: no damage, x20" : "; TESTER'S HELP: no damage") : cheatDamage ? "; TESTER'S HELP: x20" : "; TESTER'S HELP: all off") : "")
+               << " KB" << (mazeHeld ? "; the maze's rolls are the host's here" : "")
+               << (cheating ? (cheatGod ? (cheatDamage ? "; TESTER'S HELP: no damage, x20" : "; TESTER'S HELP: no damage") : cheatDamage ? "; TESTER'S HELP: x20" : "; TESTER'S HELP: all off") : "")
                << "; bodies applied " << stats.applied << ", worlds applied " << stats.worldApplied << "; faults " << stats.gameFaults;
         if (stats.faultRules) status << " (rules switched off after them: " << std::hex << stats.faultRules << std::dec << ")";
         if (stats.inputsHeard)
@@ -2485,7 +2616,11 @@ void WriteStatus() {
                     << " of " << stats.worldReceived << " (cushion " << stats.worldCushion << " frames, clock started anew " << stats.worldsRebased << " times); deal: own rolls held " << stats.dealsHeld << ", doors made by the host's word "
                     << stats.dealDoorsMade << " (failed " << stats.dealDoorFailures << ", in another place " << stats.dealElsewhere << ", of another kind " << stats.dealOtherKind << ")";
         status << "; copies: sent to their death " << stats.copyDeaths << ", brought back " << stats.copyRevivals << " (from the ghost " << stats.copyGhostRevivals << ", could not be " << stats.copyRevivalsMissed
-               << "); takings told " << stats.taken << " / played from others " << stats.takenApplied << " / missed " << stats.takenMissed << " (pedestals given the owner's item first " << stats.takenItemFixes << "), machines' touches told " << stats.slotTouchesSent << " / played "
+               << "); takings told " << stats.taken << " / played from others " << stats.takenApplied << " / missed " << stats.takenMissed
+               << " (no record " << stats.takenNoRecord << ", elsewhere " << stats.takenElsewhere << ", nothing here to take " << stats.takenNoTwin
+               << "; own touches held for the host's word " << stats.ownTouchesHeld << ", host's pickups not made as taken here " << stats.dropsNotMadeAsTaken
+               << ", pedestals given the owner's item first " << stats.takenItemFixes
+               << "), machines' touches told " << stats.slotTouchesSent << " / played "
                << stats.slotTouchesPlayed;
         if (stats.roomFollowsRefused) status << "; ROOMS NOT FOLLOWED INTO (this game's floor has no such room) " << stats.roomFollowsRefused;
         status << ", datagrams refused " << stats.rejected << ", frames lost in pieces " << stats.framesBroken
@@ -2527,17 +2662,6 @@ void CloseNetwork() {
     if (worker) { WaitForSingleObject(worker, 2000); CloseHandle(worker); worker = nullptr; }
     if (udp != INVALID_SOCKET) { closesocket(udp); udp = INVALID_SOCKET; }
     if (winsock) { WSACleanup(); winsock = false; }
-}
-
-DWORD Patch(std::uintptr_t rva, const std::array<std::uint8_t, 8>& bytes, const std::array<std::uint8_t, 8>& expected) {
-    auto* at = reinterpret_cast<std::uint8_t*>(base + rva); DWORD old = 0;
-    if (!VirtualProtect(at, bytes.size(), PAGE_EXECUTE_READWRITE, &old)) return GetLastError();
-    // Already in place counts as done: an earlier start of this module leaves the comparison off when it stops.
-    const bool matches = std::memcmp(at, expected.data(), expected.size()) == 0 || std::memcmp(at, bytes.data(), bytes.size()) == 0;
-    if (matches) std::memcpy(at, bytes.data(), bytes.size());
-    DWORD ignored = 0; const BOOL restored = VirtualProtect(at, bytes.size(), old, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), at, bytes.size());
-    return !matches ? ERROR_REVISION_MISMATCH : restored ? ERROR_SUCCESS : GetLastError();
 }
 
 std::filesystem::path OwnFolder() {
@@ -2637,8 +2761,12 @@ void Begin(const Setup& setup) {
         if (std::memcmp(reinterpret_cast<void*>(base + kCompare), kCompareEntry.data(), kCompareEntry.size()) != 0 &&
             std::memcmp(reinterpret_cast<void*>(base + kCompare), kCompareEqual.data(), kCompareEqual.size()) != 0) throw static_cast<DWORD>(ERROR_REVISION_MISMATCH);
         ownController = controller; host = setup.host; rules = mask; peerHeard = false;
+        // The rolls of Curse of the Maze are held where the comparison of checksums goes off (see HoldMazeRolls): not here,
+        // because until the handshake is through this module may still turn out to be the only one in the match.
         // The tester's help: in an isolated test instance only, whatever the configuration says elsewhere.
-        cheating = setup.cheats && std::memcmp(reinterpret_cast<const char*>(base + kSaveLeaf), kIsolated, sizeof(kIsolated) - 1) == 0; cheatGod = cheatDamage = cheating;
+        // Allowed here, and off until a key says otherwise: the help is meant for the window the tester plays in, and a
+        // run where every game is deathless from the start tests nothing.
+        cheating = setup.cheats && std::memcmp(reinterpret_cast<const char*>(base + kSaveLeaf), kIsolated, sizeof(kIsolated) - 1) == 0; cheatGod = cheatDamage = false;
         stage = kHere; gaveUp = false; discord = 0; otherProtocol = 0; helloNumber = 0; startedAt = GetTickCount64();
         for (std::uint32_t n = 0; n < kMaxPeers; ++n) { heardStage[n] = 0; heardHost[n] = 0; heardRules[n] = 0; peerSession[n] = 0; peerHeardAt[n] = 0; peerAnew[n] = 0; }
         FILETIME clock{}; GetSystemTimeAsFileTime(&clock);   // this start's number: the clock in tenths of a second, and higher than the last start's
@@ -2648,8 +2776,8 @@ void Begin(const Setup& setup) {
         for (auto& perPeer : assemblies) for (auto& assembly : perPeer) assembly.Reset();
         counters[0] = 0; counters[1] = 0; stats = Stats{}; sequence = worldSequence = frame = 0;
         published = Published{}; published.magic = kBodyMagic; publishedWorld = PublishedWorld{}; publishedWorld.magic = kWorldMagic;
-        publishedShots = PublishedShots{}; publishedShots.magic = kShotsMagic; shotsSequence = 0; knownProjectiles = Known{}; knownDrops = Known{}; knownEnemyBombs = Known{};
-        dropAgeCount = doorMemoryCount = countersHeldUntil = 0; lastCounters[0] = lastCounters[1] = lastCounters[2] = -1;
+        publishedShots = PublishedShots{}; publishedShots.magic = kShotsMagic; shotsSequence = 0; knownProjectiles = Known{}; knownDrops = Known{}; takenDrops = Known{}; knownEnemyBombs = Known{};
+        dropAgeCount = touchAgeCount = doorMemoryCount = countersHeldUntil = 0; lastCounters[0] = lastCounters[1] = lastCounters[2] = -1;
         for (int c = 0; c < kControllers; ++c) { shotsInbox[c] = ShotsInbox{}; knownTears[c] = Known{}; knownBombs[c] = Known{}; tearsHeardAt[c] = 0; }
         for (auto& box : inbox) box = Inbox{};
         for (auto& tried : deathTried) tried = 0;
@@ -2677,6 +2805,7 @@ void Begin(const Setup& setup) {
         // there are no hellos: it goes off at once, as it always did on that path.
         const bool carried = !peerCount && !steamPeerCount;
         if (carried) if (const DWORD failure = Patch(kCompare, kCompareEqual, kCompareEntry)) { CloseNetwork(); throw failure; }
+        if (carried) HoldMazeRolls();   // no hellos on this path either: the maze goes with the comparison
         running.store(true, std::memory_order_release);
         worker = CreateThread(nullptr, 0, &Receive, nullptr, 0, nullptr);
         DWORD failure = worker ? ExchangeSlot(slot, reinterpret_cast<void*>(original), reinterpret_cast<void*>(&OnInput)) : GetLastError();
@@ -2782,7 +2911,9 @@ void Begin(const Setup& setup) {
                 ExchangeSlot(playerDamageSlot, reinterpret_cast<void*>(&OnPlayerDamage), reinterpret_cast<void*>(originalPlayerDamage));
             }
         }
-        if (failure) { running = false; CloseNetwork(); if (carried) Patch(kCompare, kCompareEntry, kCompareEqual); throw failure; }
+        // Nothing written over the game's code may outlive a start that failed: End() runs only while the module does, and
+        // a game left without the maze's rolls would go on without them through every run of its own until it is closed.
+        if (failure) { running = false; CloseNetwork(); ReleaseMazeRolls(); if (carried) Patch(kCompare, kCompareEntry, kCompareEqual); throw failure; }
         std::ofstream descriptor(folder / (L"native-" + std::to_wstring(GetCurrentProcessId()) + L".json"), std::ios::trunc);
         descriptor << "{\"pid\":" << GetCurrentProcessId() << ",\"role\":\"" << (host ? "native-host" : "native-guest") << "\",\"ownController\":" << ownController
                    << ",\"rules\":" << rules << ",\"peers\":" << peerCount << ",\"steamPeers\":" << steamPeerCount
@@ -2813,6 +2944,7 @@ DWORD End(bool restoreCompare) {
         const DWORD sixth = ExchangeSlot(slotSlot, reinterpret_cast<void*>(&OnSlotCollision), reinterpret_cast<void*>(originalSlotCollision));
         if (!result) result = second ? second : third ? third : fourth ? fourth : fifth ? fifth : sixth;
         CloseNetwork();
+        ReleaseMazeRolls();
         if (restoreCompare) Patch(kCompare, kCompareEntry, kCompareEqual);
         stage.store(kHere, std::memory_order_relaxed);
     }
@@ -2853,7 +2985,7 @@ void FollowLog(const std::filesystem::path& path) {
 
 // The state, where the player sees it without looking for a file: the end of the game window's title. It is there from the
 // main menu on ("loaded"), so that a player knows the module is in before a match begins.
-constexpr wchar_t kVersionText[] = L"0.1.7";
+constexpr wchar_t kVersionText[] = L"0.1.10";
 void ShowState(const wchar_t* text) {
     static HWND window = nullptr;
     if (!window || !IsWindow(window)) {

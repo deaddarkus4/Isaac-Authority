@@ -21,7 +21,13 @@ constexpr std::uint8_t kOfBody = 1, kOfShots = 2, kOfWorld = 3, kOfHello = 4;
 //    would take a hidden enemy for a part of something.
 // 8: a match of live modules takes no newcomer in, at every member alike (one member that still did would stand alone before
 //    a player nobody else has), and a pedestal gives a copy the item it gave the owner.
-constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 8;   // "HEL1"
+// 9: Curse of the Maze is rolled by the host alone (the rule "maze"). A member that still rolled for itself would be thrown
+//    into a room of its own and drag everybody else after it - which is what the curse has looked like in matches so far.
+// 10: a guest takes only what the host has named, holding its own touch for a moment (see kOwnTouchWait). A member that
+//     still took its own rewards the moment a room was cleared would take what nobody else has, and leave its pickups lying.
+// 11: a world says which frame of its sender's game it was made on (World::senderFrame) - the world is longer by it, so a
+//     member of the older protocol would read every world of this one as a wrong size and throw them all away.
+constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 11;   // "HEL1"
 constexpr std::uint32_t kGridCollisionClasses = 8, kEntityCollisionClasses = 5;   // the game's enums: GRIDCOLL_NONE..PITSONLY, ENTCOLL_NONE..ALL
 constexpr std::uint32_t kNpcParts = 3, kNpcHidden = 4;                              // in Npc::linked
 constexpr std::uint8_t kDevilRoom = 14, kAngelRoom = 15;                           // the game's RoomType of the two deals
@@ -67,6 +73,13 @@ struct SlotState { std::uint32_t seed, variant, subtype; float position[2]; std:
 struct World {
     std::uint32_t magic, sequence, room, count, deaths, clear, cells, shots, drops, dropsTotal, doors, npcTotal, hurt, enemyBombs, floor, slots, born;
     std::uint32_t dealSeed;   // what the level's generator of deals held before the host's game made this floor's deal room from it; 0: not known
+    // The frame the sender's own game counted when it made this world (NetManager's +0xc). The games do not count the same
+    // frames - with the rule "gate" nobody waits for anybody, and in a match of ten minutes they were 92 frames apart while
+    // the game's own ring of frame states holds 32 - so the game's frame is no clock shared between them. This is the key
+    // that lines two games' records up all the same: a guest notes it beside its own frame when it plays the world, and a
+    // reader outside knows which frame of the host a frame of the guest is to be held against. Nothing in the game is
+    // changed by it; it is carried for the sake of telling divergences apart from lateness (docs/j460-divergence-plan.md).
+    std::uint32_t senderFrame;
     std::int32_t coins, bombs, keys;
     Npc npcs[kMaxNpcs]; std::uint32_t died[kMaxDeaths]; Cell grid[kMaxCells]; Shot shot[kMaxShots]; Drop drop[kMaxDrops]; DoorState door[kMaxDoors]; Shot enemyBomb[kMaxEnemyBombs]; SlotState slot[kMaxSlots]; Born bornCell[kMaxBorn]; std::uint8_t gridMap[kGridMapBytes];
 };
@@ -86,7 +99,7 @@ struct Hello { std::uint32_t magic, protocol, rules; std::uint8_t controller, ho
 static_assert(sizeof(Taken) == 32 && sizeof(Body) == 76 + 4 * kHealthFields + kMaxTaken * 32 && sizeof(Npc) == 124 && sizeof(Pet) == 32 && sizeof(Cell) == 8 && sizeof(Shot) == 108 && sizeof(Hit) == 36 &&
               sizeof(Shots) == 32 + kMaxTears * 108 + kMaxPets * 32 + kMaxHits * 36 &&
               sizeof(Drop) == 44 && sizeof(DoorState) == 12 && sizeof(SlotState) == 64 && sizeof(Born) == 16 && sizeof(FrameHeader) == 20 && sizeof(Hello) == 16 &&
-              sizeof(World) == 84 + kMaxNpcs * 124 + kMaxDeaths * 4 + kMaxCells * 8 + kMaxShots * 108 + kMaxDrops * 44 + kMaxDoors * 12 + kMaxEnemyBombs * 108 + kMaxSlots * 64 +
+              sizeof(World) == 88 + kMaxNpcs * 124 + kMaxDeaths * 4 + kMaxCells * 8 + kMaxShots * 108 + kMaxDrops * 44 + kMaxDoors * 12 + kMaxEnemyBombs * 108 + kMaxSlots * 64 +
                                    kMaxBorn * 16 + kGridMapBytes && sizeof(Shots) != sizeof(Body) && sizeof(FrameHeader) + kChunkBytes <= 1200 &&
               sizeof(World) <= kMaxChunks * kChunkBytes, "wire layout");
 

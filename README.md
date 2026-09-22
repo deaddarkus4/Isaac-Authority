@@ -46,7 +46,7 @@
 powershell -ExecutionPolicy Bypass -File Install-IsaacAuthority.ps1 -Without lead,doors
 ```
 
-Правила: `follow behaviour clear taken grid fire projectiles tears drops counters doors traps bombs hurt slots pets lead look`.
+Правила: `follow behaviour clear taken grid fire projectiles tears drops counters doors traps bombs hurt slots pets lead look join gate deal hits steady maze`.
 
 ## Сборка из исходников
 

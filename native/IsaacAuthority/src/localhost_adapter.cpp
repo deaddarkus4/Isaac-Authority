@@ -37,7 +37,16 @@ constexpr std::uintptr_t kLocalUser = 0x873674, kWindow = 0x87999c, kPlatform = 
 constexpr std::uint32_t kWin32 = 0x60001, kLocalhostUser = 0xfefefefe;
 constexpr std::array<std::uint8_t, 6> kEntry{0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08};  // push ebx; mov ebx, esp; sub esp, 8
 constexpr char kIsolated[] = "IsaacAuthority-";
-std::uint8_t* stub = nullptr; std::uint8_t* entry = nullptr;
+// The game's own "may this lobby be joined": it looks the lobby up and, where it finds none, sets the pointer to zero and
+// reads a byte of it all the same - xor edx,edx; jmp to mov al,[edx+2Ch]. Through Steam the question is only ever asked
+// about a lobby this game has heard of, so the branch never runs. The localhost service tells every window of the game
+// about every lobby, and a game that is not in the online menu at that moment is asked about a lobby it has never heard
+// of: three of four instances of the stand died there at once, the moment the first created its lobby (the dumps of
+// 22 September, all three at RVA 0x673ec2, reading 0x2c). The answer the game itself gives for a lobby that cannot be
+// joined is two instructions further on, so the jump is pointed at it: a lobby that is not there cannot be joined.
+constexpr std::uintptr_t kJoinable = 0x673ea7;
+constexpr std::array<std::uint8_t, 2> kJoinableWas{0xEB, 0x19}, kJoinableNow{0xEB, 0x40};   // jmp to the read -> jmp to "no"
+std::uint8_t* stub = nullptr; std::uint8_t* entry = nullptr; std::uint8_t* joinable = nullptr;
 volatile LONG counters[2]{};  // requests for a service; requests turned into localhost
 std::uint32_t* identity = nullptr; std::uint32_t steamIdentity[2]{};  // kept in memory only, to put it back on Stop
 
@@ -101,15 +110,19 @@ bool Rename(std::uintptr_t base) {
 void Put(std::uint8_t*& at, std::initializer_list<std::uint8_t> bytes) { for (const auto byte : bytes) *at++ = byte; }
 void Put32(std::uint8_t*& at, std::uint32_t value) { std::memcpy(at, &value, 4); at += 4; }
 
-DWORD Write(const std::array<std::uint8_t, 6>& bytes, const std::array<std::uint8_t, 6>& expected) {
+// Written only where the bytes are still the ones expected: another build of the game is left as it is.
+template <std::size_t N>
+DWORD WriteAt(std::uint8_t* at, const std::array<std::uint8_t, N>& bytes, const std::array<std::uint8_t, N>& expected) {
     DWORD old = 0;
-    if (!VirtualProtect(entry, bytes.size(), PAGE_EXECUTE_READWRITE, &old)) return GetLastError();
-    const bool matches = std::memcmp(entry, expected.data(), expected.size()) == 0;
-    if (matches) std::memcpy(entry, bytes.data(), bytes.size());
-    DWORD ignored = 0; const BOOL restored = VirtualProtect(entry, bytes.size(), old, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), entry, bytes.size());
+    if (!VirtualProtect(at, N, PAGE_EXECUTE_READWRITE, &old)) return GetLastError();
+    const bool matches = std::memcmp(at, expected.data(), N) == 0;
+    if (matches) std::memcpy(at, bytes.data(), N);
+    DWORD ignored = 0; const BOOL restored = VirtualProtect(at, N, old, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), at, N);
     return !matches ? ERROR_REVISION_MISMATCH : restored ? ERROR_SUCCESS : GetLastError();
 }
+
+DWORD Write(const std::array<std::uint8_t, 6>& bytes, const std::array<std::uint8_t, 6>& expected) { return WriteAt(entry, bytes, expected); }
 
 std::array<std::uint8_t, 6> Jump() {
     std::array<std::uint8_t, 6> jump{0xE9, 0, 0, 0, 0, 0x90};
@@ -145,6 +158,11 @@ extern "C" DWORD WINAPI IsaacAuthorityLocalhostStart(void*) noexcept {
         stub = code;
         const DWORD failure = Write(Jump(), kEntry);
         if (failure) { stub = nullptr; VirtualFree(code, 0, MEM_RELEASE); return failure; }
+        // The service is on now, and with it the lobby messages that reach every window: the game's own answer for a lobby
+        // it does not know has to be mended before the first of them arrives. A stand of two never saw this - both games
+        // were in the online menu by the time a lobby was made.
+        joinable = reinterpret_cast<std::uint8_t*>(base + kJoinable);
+        if (WriteAt(joinable, kJoinableNow, kJoinableWas)) joinable = nullptr;   // not these bytes: left alone, and said so below
         const bool renamed = Rename(base);
         wchar_t local[32768]{}; const DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", local, 32768);
         if (n && n < 32768) {
@@ -152,7 +170,8 @@ extern "C" DWORD WINAPI IsaacAuthorityLocalhostStart(void*) noexcept {
             std::ofstream descriptor(directory / (L"localhost-" + std::to_wstring(GetCurrentProcessId()) + L".json"), std::ios::trunc);
             descriptor << "{\"pid\":" << GetCurrentProcessId() << ",\"role\":\"localhost-service\",\"factoryRva\":" << kFactory
                        << ",\"stub\":" << reinterpret_cast<std::uintptr_t>(stub) << ",\"counters\":" << reinterpret_cast<std::uintptr_t>(&counters)
-                       << ",\"localUserRenamed\":" << (renamed ? "true" : "false") << ",\"pingCounters\":" << reinterpret_cast<std::uintptr_t>(&pingCounters) << "}\n";
+                       << ",\"localUserRenamed\":" << (renamed ? "true" : "false") << ",\"pingCounters\":" << reinterpret_cast<std::uintptr_t>(&pingCounters)
+                       << ",\"joinableMended\":" << (joinable ? "true" : "false") << "}\n";
             // The ping: only where the window is known, and its procedure is this game's own thread's business from now on.
             if (renamed && gameWindow && !gameProcedure) {
                 LARGE_INTEGER per; QueryPerformanceFrequency(&per); frequency = per.QuadPart ? per.QuadPart : 1;
@@ -167,6 +186,10 @@ extern "C" DWORD WINAPI IsaacAuthorityLocalhostStart(void*) noexcept {
 extern "C" DWORD WINAPI IsaacAuthorityLocalhostStop(void*) noexcept {
     if (!stub) return ERROR_NOT_READY;
     const DWORD failure = Write(kEntry, Jump());
+    // The game's own answer back, defect and all - but only together with the service that makes the defect reachable. If
+    // the hook above could not be taken out, this game still hands lobbies to windows that know nothing of them, and
+    // giving it back the branch that reads a null pointer would kill them as it did on the first run of four.
+    if (!failure && joinable) { WriteAt(joinable, kJoinableWas, kJoinableNow); joinable = nullptr; }
     if (identity) { identity[2] = steamIdentity[0]; identity[3] = steamIdentity[1]; identity = nullptr; }
     // The stub stays allocated: a thread may still be inside it, and it is 64 bytes.
     if (!failure) stub = nullptr;

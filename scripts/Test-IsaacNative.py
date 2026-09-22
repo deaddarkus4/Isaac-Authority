@@ -47,9 +47,11 @@ COUNTERS = ("published", "received", "applied", "stale", "rejected", "otherRoom"
             "roomFollowsRefused", "dealsHeld", "dealDoorsMade", "dealDoorFailures", "dealElsewhere", "dealOtherKind",
             "blowsSent", "blowsPlayed", "blowsMissed", "blowsLost", "copyBlowsIgnored",
             "worldsLate", "worldsRebased", "worldCushion",
-            "visibleFixes", "flameFixes", "deathsHeldAtUpdate", "copyGhostRevivals", "takenItemFixes", "joinsHeld")   # rejected: datagrams refused; gameFaults: exceptions on the game's thread - FAULTS; faultRules: the rules switched off after them
+            "visibleFixes", "flameFixes", "deathsHeldAtUpdate", "copyGhostRevivals", "takenItemFixes", "joinsHeld",
+            "ownTouchesHeld", "takenNoRecord", "takenElsewhere", "takenNoTwin", "dropsNotMadeAsTaken", "npcPairsDropped",
+            "senderFramePlayed", "ownFrameThen")   # rejected: datagrams refused; gameFaults: exceptions on the game's thread - FAULTS; faultRules: the rules switched off after them
 # The module's rules, each of which can be left out (--without): the same bits as in native_adapter.cpp.
-RULES = dict(follow=1, behaviour=2, clear=4, taken=8, grid=16, fire=32, projectiles=64, tears=128, drops=256, counters=512, doors=1024, traps=2048, bombs=4096, hurt=8192, slots=16384, pets=32768, lead=65536, look=131072, join=262144, gate=524288, deal=1048576, hits=2097152, steady=4194304)
+RULES = dict(follow=1, behaviour=2, clear=4, taken=8, grid=16, fire=32, projectiles=64, tears=128, drops=256, counters=512, doors=1024, traps=2048, bombs=4096, hurt=8192, slots=16384, pets=32768, lead=65536, look=131072, join=262144, gate=524288, deal=1048576, hits=2097152, steady=4194304, maze=8388608)
 STATS = struct.Struct(f"<{len(COUNTERS)}I4f"); SUM = len(COUNTERS)   # four floats follow: correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax
 folder = Path(os.environ["LOCALAPPDATA"]) / "IsaacAuthority"
 FIRST_PORT = 27460   # the local pair: one port per game
@@ -58,25 +60,51 @@ release = root / "Binaries/authority-build/Release"
 
 def attach(instances, mask, restart, carried, auto, installed, cheats):
     """Tell each game's module which lobby device is its local player - the 'Setting controller ID to N' that follows
-    'Adding local player' in the game's own log - and attach it. A game that already runs the module is left as it is."""
+    'Adding local player' in the game's own log - and attach it. A game that already runs the module is left as it is.
+
+    A game that is in the lobby of a match it has not been let into has no such line at all: it still gets its cfg and its
+    place among the ports, so that its module starts by itself if the others ever let it in, and nothing is read from it
+    meanwhile. Returns those games' pids. Only the module that follows the log by itself (--auto, --installed) can be told
+    this little; told the old way it would need the device number the log does not have yet."""
+    ports = {instance["pid"]: FIRST_PORT + n for n, instance in enumerate(instances)}
+    waiting = set(); seen = {}
     for instance in instances:
-        pid = instance["pid"]
         log = (Path(instance["saveDirectory"]) / "log.txt").read_text(encoding="utf-8", errors="replace")
         start = log.rfind("Start Networked"); local = log.find("Adding local player", start)
         found = re.findall(r"Setting controller ID to (\d+), \(Prev: 0\)", log[local:local + 600]) if start >= 0 and local >= 0 else []
         if not found:
-            raise SystemExit(f"{instance['title']}: no running match of the game's own online in its log")
+            # Told apart by the match itself, not by the device number: a game whose "Start Networked" is there has been
+            # let into the match, and its number is only late in the log (the game writes it a moment after). Taking that
+            # for a game sitting in the lobby would drop a real player out of everybody's neighbours and out of every
+            # measurement, silently. A game that never was in this match has no such line at all - that one waits.
+            if start >= 0:
+                raise SystemExit(f"{instance['title']}: the match is in its log, but the device number is not there yet - run this again in a moment")
+            if not (auto or installed):
+                raise SystemExit(f"{instance['title']}: no running match of the game's own online in its log")
+            waiting.add(instance["pid"])
         # The game that made the lobby is the host: the authority over the enemies.
-        hosting = "Successfully created lobby" in log
+        seen[instance["pid"]] = (found[0] if found else None, "Successfully created lobby" in log)
+    # Only the games of the match are neighbours. A game waiting in the lobby answers no hello, and a module that counted
+    # it among its neighbours would wait for that hello to the end of the match: on the stand of four every module of the
+    # three playing said "neighbours answered 2 of 3" and none of them ever went live. It is given the others' addresses
+    # all the same - they cost it nothing and it will need them - but that alone does not make it heard: a module takes
+    # datagrams from named neighbours only, and the three playing are not told of it. So a newcomer that is really let in
+    # is a run of this script again, with it among the playing games, and not a matter of the addresses handed out now.
+    playing = [pid for pid in ports if pid not in waiting]
+    for instance in instances:
+        pid = instance["pid"]
+        found, hosting = seen[pid]
         # The modules send to each other by themselves (the way two machines would) unless a process outside is to carry the slots.
-        ports = {other["pid"]: FIRST_PORT + n for n, other in enumerate(instances)}
-        network = "" if carried else f" listen={ports[pid]} " + " ".join(f"peer=127.0.0.1:{port}" for other, port in ports.items() if other != pid)
+        network = "" if carried else f" listen={ports[pid]} " + " ".join(f"peer=127.0.0.1:{ports[other]}" for other in playing if other != pid)
         # Installed or --auto: the module reads the game's log by itself - device, host and the end of the match; it is told
         # only that this test instance may be touched, the rules, and the way to the neighbours (no Steam here).
-        # --cheats: the tester's help of the module, for the host's game alone (no damage to its player, twentyfold damage to enemies;
-        # F6 and F7 turn them off and on, F8 kills the room's enemies). The module takes the word in an isolated test instance only.
-        network += " cheats" if cheats and hosting else ""
-        (folder / f"native-{pid}.cfg").write_text(f"auto {mask:x}{network}" if auto or installed else f"{found[0]} {'host' if hosting else 'guest'} {mask:x}{network}", encoding="ascii")
+        # --cheats: the tester's help of the module, in every game of the stand (no damage to its own player, twentyfold
+        # damage to enemies; F6 and F7 turn them off and on in whichever window has the focus, F8 kills the room's enemies
+        # on the host, whose enemies they are). A guest's blow is told to the host and played there with the damage as this
+        # game asked for it - past the hook, so the twentyfold is counted once, not twice. The module takes the word in an
+        # isolated test instance only.
+        network += " cheats" if cheats else ""
+        (folder / f"native-{pid}.cfg").write_text(f"auto {mask:x}{network}" if auto or installed else f"{found} {'host' if hosting else 'guest'} {mask:x}{network}", encoding="ascii")
         if installed:   # the game has loaded the module itself, through the version.dll beside it
             continue
         if restart:   # the same build, other rules: stop the running module first
@@ -85,6 +113,7 @@ def attach(instances, mask, restart, carried, auto, installed, cheats):
         result = json.loads(done.stdout)["result"] if done.stdout.strip().startswith("{") else done.stderr.strip()
         if result not in (0, 1247):   # 1247: already attached
             raise SystemExit(f"{instance['title']}: the module did not start: {result}")
+    return waiting
 
 
 parser = argparse.ArgumentParser()
@@ -95,7 +124,10 @@ parser.add_argument("--installed", action="store_true", help="attach nothing: th
 parser.add_argument("--jitter-ms", type=int, default=0); parser.add_argument("--loss", type=float, default=0.0)
 parser.add_argument("--seconds", type=float, default=1.2)
 parser.add_argument("--without", default="", metavar="RULES", help="comma-separated rules to leave out: " + ", ".join(RULES))
-parser.add_argument("--cheats", action="store_true", help="the tester's help in the host's game only: its player takes no damage, enemies take twentyfold (F6, F7 toggle; F8 kills the room's enemies)")
+# The word goes to every game of the stand by default, and what it allows starts off in all of them: the tester turns it
+# on with F6/F7 in whichever window he plays in. --no-cheats leaves the word out altogether, for a run that is to be honest.
+parser.add_argument("--cheats", action=argparse.BooleanOptionalAction, default=True,
+                    help="the tester's help in every game of the stand: F6 makes the own player take no damage, F7 makes enemies take twentyfold, F8 kills the room's enemies (on the host). Every window is turned on and off by itself, and all of it starts off; the module is given the word in every game by default")
 parser.add_argument("--restart", action="store_true", help="stop the module in each game first, so that it starts again with these rules")
 parser.add_argument("--play", type=float, nargs="?", const=120.0, default=None, metavar="MINUTES",
                     help="only attach and relay while a person plays; a line of state every ten seconds, until the games close")
@@ -105,10 +137,13 @@ instances = json.loads((root / "Binaries/game-instances/native-pair.json").read_
 left_out = [name for name in args.without.split(",") if name]
 if any(name not in RULES for name in left_out):
     raise SystemExit("unknown rule; known: " + ", ".join(RULES))
-attach(instances, 0x7FFFFF & ~sum(RULES[name] for name in left_out), args.restart, args.carried, args.auto, args.installed, args.cheats)
+waiting = attach(instances, 0xFFFFFF & ~sum(RULES[name] for name in left_out), args.restart, args.carried, args.auto, args.installed, args.cheats)
 folder = Path(os.environ["LOCALAPPDATA"]) / "IsaacAuthority"
 games = []
 for instance in instances:
+    if instance["pid"] in waiting:
+        print(f"{instance['title']}: in the lobby, not in this match - its cfg is written, nothing is read from it", flush=True)
+        continue
     described = folder / f"native-{instance['pid']}.json"; waited = time.monotonic()
     while (args.auto or args.installed) and not described.exists() and time.monotonic() - waited < 20:   # the module starts itself some two seconds into the match
         time.sleep(0.25)
@@ -272,13 +307,15 @@ if args.play is not None:
             time.sleep(10)
             now = [stats(g) for g in games]; line = []
             for g, a, b in zip(games, now, previous):
-                line.append(f"{g['title'][-1]}: FAULTS {a['gameFaults']}{(' (rules switched off: %x)' % a['faultRules']) if a['faultRules'] else ''}, ENEMY UPDATES THROWN {a['npcFaults']} (kinds left to themselves {a['ownBehaviourKinds']}), needle leaps set up {a['needleLeaps']}, TWINS shown or hidden {a['visibleFixes']} / deaths held at the update {a['deathsHeldAtUpdate']} / flames sized {a['flameFixes']}, BLOWS told {a['blowsSent']} / played {a['blowsPlayed']} / no target {a['blowsMissed']} / never came {a['blowsLost']} / of copies ignored {a['copyBlowsIgnored']}, DEAL rolls held {a['dealsHeld']} / doors made {a['dealDoorsMade']} (failed {a['dealDoorFailures']}, elsewhere {a['dealElsewhere']}, other kind {a['dealOtherKind']}), ROOMS NOT FOLLOWED INTO {a['roomFollowsRefused']}, WORLDS dropped as overtaken {a['worldsLate'] - b['worldsLate']} of {a['worldReceived'] - b['worldReceived']} (cushion {a['worldCushion']} frames, clock anew {a['worldsRebased']}), REMOTE INPUT frames that did not wait {a['inputsRepeated'] - b['inputsRepeated']} of {a['inputsRepeated'] + a['inputsPlayed'] - b['inputsRepeated'] - b['inputsPlayed']} (heard {a['inputsHeard'] - b['inputsHeard']}, too late {a['inputsStale'] - b['inputsStale']}, jumped {a['inputsSkipped'] - b['inputsSkipped']}, late let through {a['inputsLate'] - b['inputsLate']}, MISREAD {a['inputsMisread']}), newcomers let in {a['joinsAdmitted']} / refused {a['joinsRefused']} (lacking {a['joinLacking']}) / not judged {a['joinsUnjudged']} / HELD IN THE LOBBY {a['joinsHeld']}, datagrams refused {a['rejected']}, sent {(a['bytesSent'] - b['bytesSent']) / 10240:.1f} KB/s, received {(a['bytesReceived'] - b['bytesReceived']) / 10240:.1f} KB/s, frames lost in pieces {a['framesBroken']}, frames over 45 ms {a['longFrames'] - b['longFrames']} of {a['published'] - b['published']} (longest ever {a['frameMaxMs']} ms), bodies {a['applied'] - b['applied']} (max fix {a['correctionMax']:.1f}), enemies matched {a['npcMatched'] - b['npcMatched']}, "
+                line.append(f"{g['title'][-1]}: FAULTS {a['gameFaults']}{(' (rules switched off: %x)' % a['faultRules']) if a['faultRules'] else ''}, ENEMY UPDATES THROWN {a['npcFaults']} (kinds left to themselves {a['ownBehaviourKinds']}), needle leaps set up {a['needleLeaps']}, TWINS shown or hidden {a['visibleFixes']} / deaths held at the update {a['deathsHeldAtUpdate']} / flames sized {a['flameFixes']}, BLOWS told {a['blowsSent']} / played {a['blowsPlayed']} / no target {a['blowsMissed']} / never came {a['blowsLost']} / of copies ignored {a['copyBlowsIgnored']}, DEAL rolls held {a['dealsHeld']} / doors made {a['dealDoorsMade']} (failed {a['dealDoorFailures']}, elsewhere {a['dealElsewhere']}, other kind {a['dealOtherKind']}), ROOMS NOT FOLLOWED INTO {a['roomFollowsRefused']}, WORLDS dropped as overtaken {a['worldsLate'] - b['worldsLate']} of {a['worldReceived'] - b['worldReceived']} (cushion {a['worldCushion']} frames, clock anew {a['worldsRebased']}), REMOTE INPUT frames that did not wait {a['inputsRepeated'] - b['inputsRepeated']} of {a['inputsRepeated'] + a['inputsPlayed'] - b['inputsRepeated'] - b['inputsPlayed']} (heard {a['inputsHeard'] - b['inputsHeard']}, too late {a['inputsStale'] - b['inputsStale']}, jumped {a['inputsSkipped'] - b['inputsSkipped']}, late let through {a['inputsLate'] - b['inputsLate']}, MISREAD {a['inputsMisread']}), newcomers let in {a['joinsAdmitted']} / refused {a['joinsRefused']} (lacking {a['joinLacking']}) / not judged {a['joinsUnjudged']} / HELD IN THE LOBBY {a['joinsHeld']}, datagrams refused {a['rejected']}, sent {(a['bytesSent'] - b['bytesSent']) / 10240:.1f} KB/s, received {(a['bytesReceived'] - b['bytesReceived']) / 10240:.1f} KB/s, frames lost in pieces {a['framesBroken']}, frames over 45 ms {a['longFrames'] - b['longFrames']} of {a['published'] - b['published']} (longest ever {a['frameMaxMs']} ms), bodies {a['applied'] - b['applied']} (max fix {a['correctionMax']:.1f}), enemies matched {a['npcMatched'] - b['npcMatched']}, pairings let go {a['npcPairsDropped']}, "
                             f"paired {a['npcPaired']}, only host {a['npcOnlyHost'] - b['npcOnlyHost']}, removed {a['npcRemoved']}, killed {a['npcKilled']}, held {a['deathsHeld']}, other room {a['otherRoom'] - b['otherRoom']}, OTHER FLOOR {a['otherFloor'] - b['otherFloor']}, floors followed {a['floorFollows']} (failed {a['floorFollowFailures']}, arrived elsewhere {a['floorsElsewhere']}); health fixes {a['healthFixes'] - b['healthFixes']}, blows to copies ignored {a['copyDamageIgnored']}, "
-                            f"copy deaths {a['copyDeaths']}, revived {a['copyRevivals']} (from the ghost {a['copyGhostRevivals']}), revivals missed {a['copyRevivalsMissed'] - b['copyRevivalsMissed']}, taken {a['taken']} / applied from others {a['takenApplied']} / missed {a['takenMissed']} (pedestals given the owner's item first {a['takenItemFixes']}; copies' touches ignored {a['copyTouchesIgnored']}), rooms followed {a['roomFollows']} (failed {a['roomFollowFailures']}), behaviour fixes {a['stateFixes'] - b['stateFixes']}, animations started {a['animationFixes'] - b['animationFixes']}, enemies created {a['npcSpawned']} (failed {a['npcSpawnFailures']}), clears held {a['clearsHeld'] - b['clearsHeld']}, clears from host {a['clearsFromHost']}, grid held {a['gridHeld']} / set from host {a['gridFixes']} / mismatch {a['gridMismatch'] - b['gridMismatch']} / cells made {a['gridBorn']} / removed {a['gridRemoved']}, blows to fireplaces held {a['fireHeld']}; projectiles made {a['projectilesMade']} / ended {a['projectilesEnded']} / own dropped {a['projectilesDropped']}, tears sent {a['tearsSent'] - b['tearsSent']} / made {a['tearsMade']} / ended {a['tearsEnded']} / copy's dropped {a['tearsDropped']}, fire holds {a['fireHolds'] - b['fireHolds']}; pickups made {a['dropsMade']} / removed {a['dropsRemoved']} / items set {a['dropsMorphed']} / skipped {a['dropsSkipped']}, counter fixes {a['counterFixes']}, door fixes {a['doorFixes']} (mismatch {a['doorMismatch'] - b['doorMismatch']}), bombs made {a['bombsMade']} / set off {a['bombsEnded']} / copy's dropped {a['bombsDropped']}, enemy bombs made {a['enemyBombsMade']} / set off {a['enemyBombsEnded']} / own dropped {a['enemyBombsDropped']}, red heart damage learnt {a['hurtTaken']}, machines set {a['slotFixes']} / made {a['slotsMade']}, touches sent {a['slotTouchesSent']} / played {a['slotTouchesPlayed']} / of copies ignored {a['slotTouchesIgnored']}; pets sent {a['petsSent'] - b['petsSent']} / placed {a['petsSet'] - b['petsSet']} / fire holds {a['petFireHolds'] - b['petFireHolds']}, parts of enemies left alone {a['npcPartsLeft'] - b['npcPartsLeft']}, copies' hits played {a['copyHitsPlayed'] - b['copyHitsPlayed']}")
+                            f"copy deaths {a['copyDeaths']}, revived {a['copyRevivals']} (from the ghost {a['copyGhostRevivals']}), revivals missed {a['copyRevivalsMissed'] - b['copyRevivalsMissed']}, taken {a['taken']} / applied from others {a['takenApplied']} / missed {a['takenMissed']} (no record {a['takenNoRecord']}, elsewhere {a['takenElsewhere']}, nothing to take {a['takenNoTwin']}; own touches held {a['ownTouchesHeld']}, host's pickups not made as taken {a['dropsNotMadeAsTaken']}) (pedestals given the owner's item first {a['takenItemFixes']}; copies' touches ignored {a['copyTouchesIgnored']}), rooms followed {a['roomFollows']} (failed {a['roomFollowFailures']}), behaviour fixes {a['stateFixes'] - b['stateFixes']}, animations started {a['animationFixes'] - b['animationFixes']}, enemies created {a['npcSpawned']} (failed {a['npcSpawnFailures']}), clears held {a['clearsHeld'] - b['clearsHeld']}, clears from host {a['clearsFromHost']}, grid held {a['gridHeld']} / set from host {a['gridFixes']} / mismatch {a['gridMismatch'] - b['gridMismatch']} / cells made {a['gridBorn']} / removed {a['gridRemoved']}, blows to fireplaces held {a['fireHeld']}; projectiles made {a['projectilesMade']} / ended {a['projectilesEnded']} / own dropped {a['projectilesDropped']}, tears sent {a['tearsSent'] - b['tearsSent']} / made {a['tearsMade']} / ended {a['tearsEnded']} / copy's dropped {a['tearsDropped']}, fire holds {a['fireHolds'] - b['fireHolds']}; pickups made {a['dropsMade']} / removed {a['dropsRemoved']} / items set {a['dropsMorphed']} / skipped {a['dropsSkipped']}, frames: host {a['senderFramePlayed']} played at own {a['ownFrameThen']}, counter fixes {a['counterFixes']}, door fixes {a['doorFixes']} (mismatch {a['doorMismatch'] - b['doorMismatch']}), bombs made {a['bombsMade']} / set off {a['bombsEnded']} / copy's dropped {a['bombsDropped']}, enemy bombs made {a['enemyBombsMade']} / set off {a['enemyBombsEnded']} / own dropped {a['enemyBombsDropped']}, red heart damage learnt {a['hurtTaken']}, machines set {a['slotFixes']} / made {a['slotsMade']}, touches sent {a['slotTouchesSent']} / played {a['slotTouchesPlayed']} / of copies ignored {a['slotTouchesIgnored']}; pets sent {a['petsSent'] - b['petsSent']} / placed {a['petsSet'] - b['petsSet']} / fire holds {a['petFireHolds'] - b['petFireHolds']}, parts of enemies left alone {a['npcPartsLeft'] - b['npcPartsLeft']}, copies' hits played {a['copyHitsPlayed'] - b['copyHitsPlayed']}")
             print(time.strftime('%H:%M:%S'), ' | '.join(line), flush=True); previous = now
     except (OSError, KeyboardInterrupt) as error:
         print('stopped:', type(error).__name__, error, flush=True)
     games_for_walks = ()
+elif len(games) < 2:
+    raise SystemExit("the walks need two games of the match; with one, play in it yourself (--play)")
 else:
     games_for_walks = ((games[0], "D"), (games[1], "W"), (games[0], "A"), (games[1], "S"))
 for game, key in games_for_walks:
