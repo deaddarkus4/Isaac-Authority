@@ -15,7 +15,7 @@ std::uint32_t PackWorld(const World& world, std::uint8_t* out) {
     auto* at = out; Put(at, reinterpret_cast<const std::uint8_t*>(&world), static_cast<std::uint32_t>(offsetof(World, npcs)));
     Put(at, world.npcs, world.count); Put(at, world.died, world.deaths); Put(at, world.grid, world.cells); Put(at, world.shot, world.shots); Put(at, world.drop, world.drops);
     Put(at, world.door, world.doors); Put(at, world.enemyBomb, world.enemyBombs); Put(at, world.slot, world.slots); Put(at, world.bornCell, world.born);
-    Put(at, world.gridMap, kGridMapBytes);
+    Put(at, world.gridMap, kGridMapBytes); Put(at, world.grant, world.grants);
     return static_cast<std::uint32_t>(at - out);
 }
 
@@ -25,7 +25,7 @@ bool UnpackWorld(const std::uint8_t* from, std::uint32_t size, World& world) {
         Take(at, end, world.npcs, world.count, kMaxNpcs) && Take(at, end, world.died, world.deaths, kMaxDeaths) && Take(at, end, world.grid, world.cells, kMaxCells) &&
         Take(at, end, world.shot, world.shots, kMaxShots) && Take(at, end, world.drop, world.drops, kMaxDrops) && Take(at, end, world.door, world.doors, kMaxDoors) &&
         Take(at, end, world.enemyBomb, world.enemyBombs, kMaxEnemyBombs) && Take(at, end, world.slot, world.slots, kMaxSlots) && Take(at, end, world.bornCell, world.born, kMaxBorn) &&
-        Take(at, end, world.gridMap, kGridMapBytes, kGridMapBytes) && at == end;
+        Take(at, end, world.gridMap, kGridMapBytes, kGridMapBytes) && Take(at, end, world.grant, world.grants, kMaxGrants) && at == end;
 }
 
 std::uint32_t PackShots(const Shots& shots, std::uint8_t* out) {
@@ -132,7 +132,7 @@ bool ValidShot(const Shot& shot) {
 
 bool ValidWorld(const World& world) {
     if (world.magic != kWorldMagic || !world.sequence || world.count > kMaxNpcs || world.deaths > kMaxDeaths || world.cells > kMaxCells || world.shots > kMaxShots ||
-        world.drops > kMaxDrops || world.doors > kMaxDoors || world.enemyBombs > kMaxEnemyBombs || world.slots > kMaxSlots || world.born > kMaxBorn) return false;
+        world.drops > kMaxDrops || world.doors > kMaxDoors || world.enemyBombs > kMaxEnemyBombs || world.slots > kMaxSlots || world.born > kMaxBorn || world.grants > kMaxGrants) return false;
     for (std::uint32_t n = 0; n < world.doors; ++n) if (world.door[n].deal && world.door[n].deal != kDevilRoom && world.door[n].deal != kAngelRoom) return false;
     for (std::uint32_t n = 0; n < world.slots; ++n) if (!Finite(world.slot[n].position) || world.slot[n].animation[kAnimationName - 1]) return false;
     for (std::uint32_t n = 0; n < world.enemyBombs; ++n) if (!ValidShot(world.enemyBomb[n])) return false;

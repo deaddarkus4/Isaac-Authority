@@ -16,13 +16,14 @@ std::unique_ptr<World> Room() {
     world->npcs[0].seed = 11; world->npcs[0].hitPoints = 10; std::memcpy(world->npcs[0].animation, "WalkVert", 9); world->npcs[1].seed = 12; world->npcs[1].position[0] = 100;
     world->died[0] = 9; world->shot[0] = Tear(); world->drop[0].seed = 31; world->drop[0].variant = 20; world->door[0].cell = 7; world->door[0].state = 2; world->door[0].deal = 14; world->dealSeed = 0xf20729e3;
     world->bornCell[0].index = 40; world->bornCell[0].type = 14; world->bornCell[0].state = 250; world->gridMap[5] = 0x80; world->coins = 15;
+    world->grants = 1; world->grant[0] = Grant{0x5f3a01u, 3, 0x1d20f6fd, 359};
     return world;
 }
 
 void Packing() {
     const auto world = Room(); std::vector<std::uint8_t> packed(sizeof(World)); auto back = std::make_unique<World>();
     const auto size = PackWorld(*world, packed.data());
-    Check(size == offsetof(World, npcs) + 2 * sizeof(Npc) + 4 + sizeof(Shot) + sizeof(Drop) + sizeof(DoorState) + sizeof(Born) + kGridMapBytes, "only the entries in use travel");
+    Check(size == offsetof(World, npcs) + 2 * sizeof(Npc) + 4 + sizeof(Shot) + sizeof(Drop) + sizeof(DoorState) + sizeof(Born) + kGridMapBytes + sizeof(Grant), "only the entries in use travel");
     Check(UnpackWorld(packed.data(), size, *back) && std::memcmp(world.get(), back.get(), sizeof(World)) == 0 && ValidWorld(*back), "a world comes back as it went");
     for (std::uint32_t n = 0; n < size; n += 7) Check(!UnpackWorld(packed.data(), n, *back), "a world cut short is no world");
     packed.resize(size + 1); Check(!UnpackWorld(packed.data(), size + 1, *back), "nor one with something behind it");
@@ -59,6 +60,7 @@ void Ranges() {
     world = Room(); world->sequence = 0; Check(!ValidWorld(*world), "sequences start at one");
     world = Room(); world->doors = kMaxDoors + 1; Check(!ValidWorld(*world), "more doors than the list holds");
     world = Room(); world->door[0].deal = 3; Check(!ValidWorld(*world), "a door to a deal leads to a devil's room or an angel's");
+    world = Room(); world->grants = kMaxGrants + 1; Check(!ValidWorld(*world), "more grants than the list holds");
 }
 
 FrameHeader Header(std::uint32_t sequence, std::uint32_t total, std::uint8_t chunk) {

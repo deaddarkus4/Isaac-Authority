@@ -391,6 +391,8 @@ constexpr std::array<std::uint8_t, 8> kTearSetScaleEntry{0x55, 0x8B, 0xEC, 0xF3,
 constexpr std::uint32_t kProjectile = 9, kTear = 2, kKnownShots = 256, kMaxShotSpawns = 24;
 constexpr std::uintptr_t kBombTable = 0x7670f4, kBombCountdown = 0x410, kBombCountdownTwin = 0x414, kBombDamage = 0x418, kBombFlags = 0x438, kBombCostumes = 0x463, kBombFetus = 0x448, kBombRadius = 0x44c;
 constexpr std::uintptr_t kSlotTable = 0x764c50, kSlotCollision = 0x2627e0, kSlotState = 0x410, kSlotPrize = 0x414, kSlotTimeout = 0x41c, kSlotDonation = 0x420, kSlotTrigger = 0x424;
+// In a taking's 'low' as well: a guest's claim of a pedestal's item, and its taking of one the host granted (see Grant).
+constexpr std::uint32_t kClaim = 0x200, kGranted = 0x400, kClaimEveryFrames = 15, kGrantFrames = 60;
 constexpr std::uint32_t kSlotEntity = 6, kSlotTouch = 0x100, kSlotTouchEveryFrames = 8, kSlotSpawnSnapshots = 10;   // kSlotTouch: in a taking's 'low', a touch of a machine
 constexpr std::uintptr_t kParent = 0x3bc, kChild = 0x3c0, kFamiliarTable = 0x76491c, kFamiliarPlayer = 0x410, kFamiliarCooldown = 0xd4c;
 constexpr std::int32_t kHeldFamiliarCooldown = 5;
@@ -518,6 +520,9 @@ struct Stats {
     // list / removed as never the host's. And takings played on a pedestal that had been emptied here already: both
     // players took the one item, each in its own game, and it is not given a second time.
     std::uint32_t summonsHeld, summonsPaired, summonsRemoved, pedestalsTakenTwice;
+    // A pedestal's item is the host's to hand out: a guest's claims sent, and taken on the host's grant; the host's grants and
+    // its refusals (its own pedestal was empty by then - it or another player had taken the item first).
+    std::uint32_t claimsSent, claimsGranted, claimsRefused, grantsPlayed;
     float correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax;
 };
 #pragma pack(pop)
@@ -595,6 +600,10 @@ Known knownProjectiles{}, knownTears[kControllers]{}, knownBombs[kControllers]{}
 // heart on the stand of four (22 September) - the seed was known, the pickup was gone, and the host's one was never made
 // here again. Emptied with the room, as every table of this module is meant to be (docs/j460-divergence-plan.md).
 Known takenDrops{};
+// The host: its grants of pedestals' items to guests' claims, told in its worlds for kGrantFrames. A guest: its last claim
+// (claimed again every kClaimEveryFrames while its player stands against the pedestal) and the claims it has taken on a grant.
+struct HostGrant { Grant grant; std::uint32_t frame; } hostGrants[kMaxGrants]{}; std::uint32_t hostGrantCount = 0;
+std::uint32_t claimedSeed = 0, claimedAt = 0, claimedLow = 0; Known grantsTaken{};
 struct Age { std::uint32_t seed, age; } dropAges[kAges]{}; std::uint32_t dropAgeCount = 0;
 // When the own player first touched a pickup the host has not named: the wait is counted from there, per pickup. Emptied
 // with the room and at every start, as the counts above are: a frame kept from before a start (where the count begins at
@@ -1147,6 +1156,8 @@ void PublishWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t room
     }
     world.dealSeed = hostDealFloor == world.floor ? hostDealSeed : 0;
     world.coins = At<std::int32_t>(player + kCoins); world.bombs = At<std::int32_t>(player + kBombs); world.keys = At<std::int32_t>(player + kKeys);
+    world.grants = 0;
+    for (std::uint32_t g = 0; g < kMaxGrants && g < hostGrantCount; ++g) if (frame - hostGrants[g].frame <= kGrantFrames) world.grant[world.grants++] = hostGrants[g].grant;
     // The grid. More changed cells than fit: a window over them that moves with every snapshot.
     world.cells = 0; std::uint32_t changed = 0, seen = 0;
     for (std::uint32_t i = 0; i < kGridCells; ++i) { const auto grid = At<std::uintptr_t>(room + kGrid + i * 4); if (grid && GridChanged(grid)) ++changed; }
@@ -1427,6 +1438,8 @@ void FlameToHitPoints(std::uintptr_t entity) {
 }
 
 // Guest: the host's enemies over the local ones.
+void ApplyGrants(std::uintptr_t player, std::uintptr_t room, const World& world);
+
 void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIndex) {
     static World world;  // the game's thread only
     bool fresh = false; const auto now = GetTickCount64(); const auto gameNow = At<std::uintptr_t>(base + kGame); const auto floorNow = gameNow ? Floor(gameNow) : 0;
@@ -1621,6 +1634,7 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
     if (On(kHurt) && world.hurt && !At<std::uint8_t>(room + kRoomHurt)) { At<std::uint8_t>(room + kRoomHurt) = 1; stats.hurtTaken++; }
     if (On(kSlotsRule)) { doing = kSlotsRule; ApplySlots(room, world); }
     if (On(kDrops)) { doing = kDrops; ApplyDrops(room, world); }
+    if (On(kTaken) && world.grants) { doing = kTaken; ApplyGrants(player, room, world); }
     if (On(kDoors)) { doing = kDoors; ApplyDoors(room, world); }
     if (On(kDeal) && game) { doing = kDeal; ApplyDeal(game, room, world); }
     doing = 0;
@@ -1657,6 +1671,20 @@ bool __fastcall OnPickupCollision(void* self, void*, void* collider, std::uint32
     // nowhere to be played, and the guest at 150 ms left with its own rewards still on the floor. So a pickup the host has
     // not named is held for kOwnTouchWait frames - the answer is the game's own, the one a copy's touch gets - and taken
     // anyway after that, so that nothing the host never names (a list past kMaxDrops) locks a player out of it for good.
+    // A pedestal's item is the host's to hand out, as the game's own match lets one player of all take it. A guest in the
+    // host's room takes none by itself: it claims it, the host's copy of it takes it in the host's game if the host's
+    // pedestal still holds an item, and the host's grant makes it taken here (ApplyGrants). Seen live (22 September): both
+    // players took 8 Inch Nails from one pedestal, each in its own game. What costs coins is left as it was: the coins are
+    // the host's, and a guest's own buying after the host's copy had paid would find them spent.
+    if (!host && before.variant == kCollectible && before.subtype && At<std::int32_t>(pickup + kPrice) <= 0 && HostRules()) {
+        if (before.seed != claimedSeed || frame - claimedAt >= kClaimEveryFrames) {
+            const auto game = At<std::uintptr_t>(base + kGame); const auto* at = reinterpret_cast<float*>(pickup + kPosition);
+            takenLog[takenTotal % kMaxTaken] = Taken{takenTotal + 1, game ? At<std::uint32_t>(game + kRoomIndex) : 0, before.seed, before.variant, before.subtype, (low & 0xff) | kClaim,
+                                                     {at[0], at[1]}};
+            ++takenTotal; stats.claimsSent++; claimedSeed = before.seed; claimedAt = frame ? frame : 1; claimedLow = low & 0xff;
+        }
+        return At<std::int32_t>(pickup + kPrice) != 0 || At<std::int32_t>(pickup + kWait) > 0;
+    }
     if (!host && On(kDrops) && !Knows(knownDrops, before.seed)) {
         auto& since = TouchedSince(before.seed);
         if (!since) since = frame ? frame : 1;
@@ -1674,6 +1702,38 @@ bool __fastcall OnPickupCollision(void* self, void*, void* collider, std::uint32
         ++takenTotal; stats.taken++; Learn(takenDrops, before.seed);   // taken here: the host may go on naming it for a few snapshots yet
     }
     return result;
+}
+
+// Guest: the host's grants of its claims. The pedestal's item is taken here now - the one the host's pedestal held - and
+// told to the others as the taking of a granted item: the host's copy has it already, any other game's copy takes it.
+void ApplyGrants(std::uintptr_t player, std::uintptr_t room, const World& world) {
+    const auto data = At<std::uintptr_t>(room + kListData); const auto count = At<std::uint32_t>(room + kListCount);
+    if (!data || count > 4096) return;
+    for (std::uint32_t g = 0; g < world.grants; ++g) {
+        const auto& grant = world.grant[g];
+        if (grant.session != session || !grant.subtype || Knows(grantsTaken, grant.number)) continue;
+        std::uintptr_t found = 0;   // of the seed; where several share it (Diplopia), one that still holds an item
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto entity = At<std::uintptr_t>(data + i * sizeof(std::uintptr_t));
+            if (!entity || !LivingPickup(entity) || At<std::uint32_t>(entity + kVariant) != kCollectible || At<std::uint32_t>(entity + kSeed) != grant.seed) continue;
+            if (!found || !At<std::uint32_t>(found + kSubtype)) found = entity;
+        }
+        if (!found) continue;   // not here: the grant is told again for a while
+        if (At<std::uint32_t>(found + kSubtype) != grant.subtype) {
+            reinterpret_cast<PickupMorph>(base + kPickupMorph)(reinterpret_cast<void*>(found), static_cast<int>(kPickup), static_cast<int>(kCollectible), static_cast<int>(grant.subtype), 1, 1, 1);
+            stats.takenItemFixes++;
+        }
+        float position[2]; std::memcpy(position, reinterpret_cast<void*>(found + kPosition), 8);
+        const Shape before = ShapeOf(found);
+        At<std::int32_t>(found + kWait) = 0;
+        applyingTaken = true; originalCollision(reinterpret_cast<void*>(found), reinterpret_cast<void*>(player), claimedLow); applyingTaken = false;
+        if (Same(before, ShapeOf(found))) continue;   // again with the next world
+        Learn(grantsTaken, grant.number); Learn(takenDrops, grant.seed); stats.grantsPlayed++;
+        const auto game = At<std::uintptr_t>(base + kGame);
+        takenLog[takenTotal % kMaxTaken] = Taken{takenTotal + 1, game ? At<std::uint32_t>(game + kRoomIndex) : 0, grant.seed, kCollectible, grant.subtype, claimedLow | kGranted,
+                                                 {position[0], position[1]}};
+        ++takenTotal; stats.taken++;
+    }
 }
 
 // The machines every game plays by itself, as the game's own lockstep does: the donation machine and the greed donation machine.
@@ -1759,6 +1819,8 @@ void ApplyTaken(std::uintptr_t player, int controller, const Body& body, std::ui
             takenDone[controller] = number; takenSince[controller] = 0; continue;
         }
         if (!On(kTaken)) { takenDone[controller] = number; takenSince[controller] = 0; continue; }
+        // A granted item taken by its claimant: the host's copy of it took the item when the host granted it.
+        if ((taken->low & kGranted) && host) { takenDone[controller] = number; takenSince[controller] = 0; continue; }
         if (!takenSince[controller]) takenSince[controller] = frame ? frame : 1;
         const auto data = At<std::uintptr_t>(room + kListData); const auto count = At<std::uint32_t>(room + kListCount);
         // The twin: of the owner's seed first - and where several share a seed (Diplopia copies the seed with the pedestal)
@@ -1776,6 +1838,26 @@ void ApplyTaken(std::uintptr_t player, int controller, const Body& body, std::ui
             if (!ofSeed && distance > kTakenReach * kTakenReach) continue;
             const int rank = (ofSeed ? 2 : 0) + (variant != kCollectible || subtype != 0 ? 1 : 0);
             if (!found || rank > foundRank || (rank == foundRank && distance < foundDistance)) { found = entity; foundDistance = distance; foundRank = rank; }
+        }
+        // A guest's claim of a pedestal's item: the host alone answers it, by what its own pedestal of that seed holds now.
+        // Still an item: the claimant's copy takes it here and the claimant is granted it. Empty: taken first - by the host
+        // or by another player's claim - and the claimant gets nothing, as in the game's own match.
+        if (taken->low & kClaim) {
+            if (host) {
+                const auto held = found && At<std::uint32_t>(found + kSeed) == taken->seed && At<std::uint32_t>(found + kVariant) == kCollectible ? At<std::uint32_t>(found + kSubtype) : 0;
+                if (!held) stats.claimsRefused++;
+                else {
+                    const Shape shape = ShapeOf(found);
+                    At<std::int32_t>(found + kWait) = 0;
+                    doing = kTaken; applyingTaken = true; originalCollision(reinterpret_cast<void*>(found), reinterpret_cast<void*>(player), taken->low & 0xff); applyingTaken = false; doing = 0;
+                    if (!Same(shape, ShapeOf(found))) {
+                        hostGrants[hostGrantCount++ % kMaxGrants] = HostGrant{Grant{seenSession[controller], taken->number, taken->seed, held}, frame};
+                        Learn(takenDrops, taken->seed); stats.claimsGranted++;
+                    } else if (frame - takenSince[controller] < static_cast<std::uint32_t>(kTakenRetryFrames)) return;   // in order: again next frame
+                    else stats.claimsRefused++;
+                }
+            }
+            takenDone[controller] = number; takenSince[controller] = 0; continue;
         }
         // A pedestal emptied here already: this game's own player - or another copy - took the item before the owner's word
         // came. Both players took the one item, each in its own game, and each keeps it; giving the pedestal the owner's
@@ -1797,7 +1879,7 @@ void ApplyTaken(std::uintptr_t player, int controller, const Body& body, std::ui
             const Shape before = ShapeOf(found);
             At<std::int32_t>(found + kWait) = 0;   // the owner's game has decided: no waiting here
             doing = kTaken;
-            applyingTaken = true; originalCollision(reinterpret_cast<void*>(found), reinterpret_cast<void*>(player), taken->low); applyingTaken = false;
+            applyingTaken = true; originalCollision(reinterpret_cast<void*>(found), reinterpret_cast<void*>(player), taken->low & 0xff); applyingTaken = false;
             doing = 0;
             done = !Same(before, ShapeOf(found));
         }
@@ -2698,6 +2780,7 @@ void WriteStatus() {
                << " (no record " << stats.takenNoRecord << ", elsewhere " << stats.takenElsewhere << ", nothing here to take " << stats.takenNoTwin
                << "; own touches held for the host's word " << stats.ownTouchesHeld << ", host's pickups not made as taken here " << stats.dropsNotMadeAsTaken
                << ", pedestals given the owner's item first " << stats.takenItemFixes << ", pedestals both took from " << stats.pedestalsTakenTwice
+               << "; pedestals claimed " << stats.claimsSent << " / taken on the host's grant " << stats.grantsPlayed << ", claims granted " << stats.claimsGranted << " / refused " << stats.claimsRefused
                << "), machines' touches told " << stats.slotTouchesSent << " / played "
                << stats.slotTouchesPlayed;
         if (stats.roomFollowsRefused) status << "; ROOMS NOT FOLLOWED INTO (this game's floor has no such room) " << stats.roomFollowsRefused;
@@ -2863,7 +2946,7 @@ void Begin(const Setup& setup) {
         ownHits = 0; ownBlows = HitLog{}; for (auto& done : blowsDone) done = 0;
         hostDealSeed = 0; hostDealFloor = 0xffffffff; dealDiffering = dealTried = 0; applyingDeal = false;
         for (auto& taken : takenLog) taken = Taken{};
-        takenTotal = 0; applyingTaken = false; applyingGrid = false; entryRoom = cellGoneRoom = 0xffffffff; touchedSlot = touchedAt = slotAgeCount = 0;
+        takenTotal = 0; applyingTaken = false; applyingGrid = false; hostGrantCount = 0; claimedSeed = claimedAt = claimedLow = 0; grantsTaken = Known{}; entryRoom = cellGoneRoom = 0xffffffff; touchedSlot = touchedAt = slotAgeCount = 0;
         hostClearRoom = 0xfffffffe; hostClear = 0; hostHeardAt = 0;
         lastRoom = followRoom = 0xfffffffe; roomEpoch = heardEpoch = followTried = 0; following = false;
         lastFloor = followFloor = 0xffffffff; floorEpoch = heardFloorEpoch = floorTried = 0; followingFloor = false;

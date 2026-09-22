@@ -29,7 +29,8 @@ constexpr std::uint8_t kOfBody = 1, kOfShots = 2, kOfWorld = 3, kOfHello = 4;
 //     member of the older protocol would read every world of this one as a wrong size and throw them all away.
 // 12: a guest's enemies summon nothing of their own that the host has not got (the rule "summons"), and a pedestal emptied
 //     here is not filled again for another player's taking. The rules' mask is wider by the new rule: an 11 would be told
-//     "the players' rules differ" instead of being told it is another version.
+//     "the players' rules differ" instead of being told it is another version. A pedestal's item is the host's to hand
+//     out: a guest claims it, and the world carries the host's grants (World::grant) - so the world is longer again.
 constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 12;   // "HEL1"
 constexpr std::uint32_t kGridCollisionClasses = 8, kEntityCollisionClasses = 5;   // the game's enums: GRIDCOLL_NONE..PITSONLY, ENTCOLL_NONE..ALL
 constexpr std::uint32_t kNpcParts = 3, kNpcHidden = 4;                              // in Npc::linked
@@ -37,7 +38,7 @@ constexpr std::uint8_t kDevilRoom = 14, kAngelRoom = 15;                        
 constexpr std::uint8_t kHere = 0, kCompareOff = 1, kLive = 2;
 constexpr int kHealthFields = 10, kMaxTaken = 8, kAnimationName = 24, kMaxNpcs = 48, kMaxDeaths = 16;
 constexpr std::uint32_t kMaxCells = 96, kGridMapBytes = 56, kMaxBorn = 48, kMaxShots = 64, kMaxTears = 32, kMaxSlots = 8, kMaxPets = 24, kMaxEnemyBombs = 16,
-    kMaxDrops = 64, kMaxDoors = 8, kMaxChunks = 31, kMaxHits = 48;
+    kMaxDrops = 64, kMaxDoors = 8, kMaxChunks = 31, kMaxHits = 48, kMaxGrants = 8;
 
 #pragma pack(push, 1)
 struct Taken { std::uint32_t number, room, seed, variant, subtype, low; float position[2]; };
@@ -72,6 +73,10 @@ struct Shot {
 struct Drop { std::uint32_t seed, variant, subtype; float position[2], velocity[2]; std::int32_t price, timeout, options, shopItemId; };
 // deal: 0, or the type of the room behind a door that leads to the floor's deal (room -1): 14 a devil's, 15 an angel's.
 struct DoorState { std::uint16_t cell; std::uint8_t busted, deal; std::int32_t variant, state; };
+// The host's answer to a guest's claim of a pedestal's item (a taking marked as a claim): its copy of the claimant took it
+// in the host's game, and the claimant takes it now - the item the host's pedestal held. session and number: the claimant's
+// start of its module and the claim's number in its takings, which together name one claim of one player.
+struct Grant { std::uint32_t session, number, seed, subtype; };
 struct SlotState { std::uint32_t seed, variant, subtype; float position[2]; std::int32_t state, prize, timeout, donation, trigger; char animation[kAnimationName]; };
 struct World {
     std::uint32_t magic, sequence, room, count, deaths, clear, cells, shots, drops, dropsTotal, doors, npcTotal, hurt, enemyBombs, floor, slots, born;
@@ -84,7 +89,9 @@ struct World {
     // changed by it; it is carried for the sake of telling divergences apart from lateness (docs/j460-divergence-plan.md).
     std::uint32_t senderFrame;
     std::int32_t coins, bombs, keys;
+    std::uint32_t grants;
     Npc npcs[kMaxNpcs]; std::uint32_t died[kMaxDeaths]; Cell grid[kMaxCells]; Shot shot[kMaxShots]; Drop drop[kMaxDrops]; DoorState door[kMaxDoors]; Shot enemyBomb[kMaxEnemyBombs]; SlotState slot[kMaxSlots]; Born bornCell[kMaxBorn]; std::uint8_t gridMap[kGridMapBytes];
+    Grant grant[kMaxGrants];
 };
 // Tears first, then bombs. A bomb in a Shot: height = frames to the explosion, fallingSpeed = radius multiplier,
 // fallingAccel = 1 for a fetus bomb, damage = explosion damage.
@@ -102,8 +109,8 @@ struct Hello { std::uint32_t magic, protocol, rules; std::uint8_t controller, ho
 static_assert(sizeof(Taken) == 32 && sizeof(Body) == 76 + 4 * kHealthFields + kMaxTaken * 32 && sizeof(Npc) == 124 && sizeof(Pet) == 32 && sizeof(Cell) == 8 && sizeof(Shot) == 108 && sizeof(Hit) == 36 &&
               sizeof(Shots) == 32 + kMaxTears * 108 + kMaxPets * 32 + kMaxHits * 36 &&
               sizeof(Drop) == 44 && sizeof(DoorState) == 12 && sizeof(SlotState) == 64 && sizeof(Born) == 16 && sizeof(FrameHeader) == 20 && sizeof(Hello) == 16 &&
-              sizeof(World) == 88 + kMaxNpcs * 124 + kMaxDeaths * 4 + kMaxCells * 8 + kMaxShots * 108 + kMaxDrops * 44 + kMaxDoors * 12 + kMaxEnemyBombs * 108 + kMaxSlots * 64 +
-                                   kMaxBorn * 16 + kGridMapBytes && sizeof(Shots) != sizeof(Body) && sizeof(FrameHeader) + kChunkBytes <= 1200 &&
+              sizeof(Grant) == 16 && sizeof(World) == 92 + kMaxNpcs * 124 + kMaxDeaths * 4 + kMaxCells * 8 + kMaxShots * 108 + kMaxDrops * 44 + kMaxDoors * 12 + kMaxEnemyBombs * 108 + kMaxSlots * 64 +
+                                   kMaxBorn * 16 + kGridMapBytes + kMaxGrants * 16 && sizeof(Shots) != sizeof(Body) && sizeof(FrameHeader) + kChunkBytes <= 1200 &&
               sizeof(World) <= kMaxChunks * kChunkBytes, "wire layout");
 
 inline bool Finite(const float* v) { return std::isfinite(v[0]) && std::isfinite(v[1]); }

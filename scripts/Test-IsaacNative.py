@@ -50,7 +50,8 @@ COUNTERS = ("published", "received", "applied", "stale", "rejected", "otherRoom"
             "visibleFixes", "flameFixes", "deathsHeldAtUpdate", "copyGhostRevivals", "takenItemFixes", "joinsHeld",
             "ownTouchesHeld", "takenNoRecord", "takenElsewhere", "takenNoTwin", "dropsNotMadeAsTaken", "npcPairsDropped",
             "senderFramePlayed", "ownFrameThen",
-            "summonsHeld", "summonsPaired", "summonsRemoved", "pedestalsTakenTwice")   # rejected: datagrams refused; gameFaults: exceptions on the game's thread - FAULTS; faultRules: the rules switched off after them
+            "summonsHeld", "summonsPaired", "summonsRemoved", "pedestalsTakenTwice",
+            "claimsSent", "claimsGranted", "claimsRefused", "grantsPlayed")   # rejected: datagrams refused; gameFaults: exceptions on the game's thread - FAULTS; faultRules: the rules switched off after them
 # The module's rules, each of which can be left out (--without): the same bits as in native_adapter.cpp.
 RULES = dict(follow=1, behaviour=2, clear=4, taken=8, grid=16, fire=32, projectiles=64, tears=128, drops=256, counters=512, doors=1024, traps=2048, bombs=4096, hurt=8192, slots=16384, pets=32768, lead=65536, look=131072, join=262144, gate=524288, deal=1048576, hits=2097152, steady=4194304, maze=8388608, summons=16777216)
 STATS = struct.Struct(f"<{len(COUNTERS)}I4f"); SUM = len(COUNTERS)   # four floats follow: correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax
