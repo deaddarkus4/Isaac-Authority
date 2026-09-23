@@ -5,14 +5,16 @@ param(
     # The folder of isaac-ng.exe; found through Steam when not given.
     [string]$GameFolder,
     # Rules of the module to leave out (for example: lead,doors) - the same for every player of a match.
-    [string[]]$Without = @())
+    [string[]]$Without = @(),
+    # Keep the game's own bar on online play with mods (lifted by default: mods.off in the settings folder keeps it).
+    [switch]$NoMods)
 # Puts the authority module into The Binding of Isaac: Repentance+ or takes it out. Installed is two files beside
 # isaac-ng.exe: version.dll, which the game loads by itself, and IsaacAuthorityNative.dll, which version.dll loads. After
 # that nothing is started or stopped by hand: the module follows the game's own log, and in an online match it switches
 # itself on only when EVERY player of the match runs it - any other match stays the game's own, untouched.
 # No file of the game is changed; removing the two files is the whole uninstall.
 $ErrorActionPreference = 'Stop'
-$rules = [ordered]@{follow=1; behaviour=2; clear=4; taken=8; grid=16; fire=32; projectiles=64; tears=128; drops=256; counters=512; doors=1024; traps=2048; bombs=4096; hurt=8192; slots=16384; pets=32768; lead=65536; look=131072; join=262144; gate=524288; deal=1048576; hits=2097152; steady=4194304; maze=8388608; summons=16777216}
+$rules = [ordered]@{follow=1; behaviour=2; clear=4; taken=8; grid=16; fire=32; projectiles=64; tears=128; drops=256; counters=512; doors=1024; traps=2048; bombs=4096; hurt=8192; slots=16384; pets=32768; lead=65536; look=131072; join=262144; gate=524288; deal=1048576; hits=2097152; steady=4194304; maze=8388608; summons=16777216; greed=33554432}
 $here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $files = 'version.dll', 'IsaacAuthorityNative.dll'
 
@@ -49,6 +51,7 @@ try {
     if ($Uninstall) {
         foreach ($file in $files) { $target = Join-Path $GameFolder $file; if (Test-Path -LiteralPath $target) { Remove-Item -LiteralPath $target -Force } }
         Remove-Item -LiteralPath (Join-Path $settings 'native.cfg') -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath (Join-Path $settings 'mods.off') -ErrorAction SilentlyContinue
         Write-Host "Removed from $GameFolder. The game is as Steam installed it."
         return
     }
@@ -56,9 +59,11 @@ try {
     foreach ($file in $files) { if (-not (Test-Path -LiteralPath (Join-Path $here $file))) { throw "$file must lie beside this script." } }
     foreach ($file in $files) { Copy-Item -LiteralPath (Join-Path $here $file) -Destination (Join-Path $GameFolder $file) -Force }
     New-Item -ItemType Directory -Force -Path $settings | Out-Null
-    $mask = 0x1FFFFFF; foreach ($name in $Without) { if ($name) { $mask = $mask -band (-bnot $rules[$name]) } }
-    if ($mask -ne 0x1FFFFFF) { [IO.File]::WriteAllText((Join-Path $settings 'native.cfg'), ('auto {0:x}' -f $mask), [Text.Encoding]::ASCII) }
+    $mask = 0x3FFFFFF; foreach ($name in $Without) { if ($name) { $mask = $mask -band (-bnot $rules[$name]) } }
+    if ($mask -ne 0x3FFFFFF) { [IO.File]::WriteAllText((Join-Path $settings 'native.cfg'), ('auto {0:x}' -f $mask), [Text.Encoding]::ASCII) }
     else { Remove-Item -LiteralPath (Join-Path $settings 'native.cfg') -ErrorAction SilentlyContinue }
+    if ($NoMods) { [IO.File]::WriteAllText((Join-Path $settings 'mods.off'), '', [Text.Encoding]::ASCII) }
+    else { Remove-Item -LiteralPath (Join-Path $settings 'mods.off') -ErrorAction SilentlyContinue }
     Write-Host "Installed into $GameFolder."
     Write-Host 'Play as usual. The window title ends with "Authority <version>: loaded" from the main menu on, and with "ON, host" or "ON, guest" in an online match of players who ALL have the same version installed.'
 } catch [UnauthorizedAccessException] {

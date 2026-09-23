@@ -269,6 +269,24 @@ constexpr std::array<std::uint8_t, 6> kMazeRollEntry{0x0F, 0x85, 0x20, 0x03, 0x0
 constexpr std::array<std::uint8_t, 6> kMazeRollHeld{0xE9, 0x21, 0x03, 0x00, 0x00, 0x90};    // jmp there, always
 constexpr std::array<std::uint8_t, 6> kMazeShuffleEntry{0x0F, 0x85, 0x02, 0x01, 0x00, 0x00};
 constexpr std::array<std::uint8_t, 6> kMazeShuffleHeld{0xE9, 0x03, 0x01, 0x00, 0x00, 0x90};
+// Greed mode (Game+0x269c8: 2 greed, 3 greedier - what Game::IsGreedMode, RVA 0x2f8120, reads) fights its waves in the
+// floor's first room, grid index 84. A wave is spawned by the room's SpawnGreedModeWave (RVA 0x416910, thiscall, one
+// argument on the stack that it never reads, ret 4), called from two places only: the room's update when the wave's timer
+// (Room+0x723c, in frames; set to 19 once the room has no enemy left) runs out (RVA 0x401f55), and the greed button's
+// update when a player stands on it with no wave running (RVA 0x583d2f). What it spawns is fixed by the wave's number
+// (Game+0x18334, counted on by the call; Lua's Level.GreedModeWave) and the floor's seed for that number (Game+0x18338 +
+// 4 * number): the room layout, its enemies and their seeds, the coins thrown at the start. So a wave spawned in two games
+// is the same wave. When it is spawned is not: each game ran its own timer and its own "the room is empty", and a guest's
+// enemies die by the host's word a ping later. In a match through Steam (23 September, seed 4GJV NEYN, six floors) the
+// host's log and the guest's name the same 66 waves in the same order, the guest's coming up to ten seconds early or a
+// second late - and every time the host's list either took the guest's early wave back, or had already made the host's
+// in the guest's game, and the guest's own spawning then made each enemy and coin a second time under the same seed
+// (read in the guest's memory: two coins of one seed, fourteen seeds in fifteen minutes). So the waves are the host's, as the
+// deal's rolls are (see kDeal): a guest spawns none of its own while the host is here to say, and spawns the host's with
+// the game's own function when the host's world names a later wave (ApplyGreedWave).
+constexpr std::uintptr_t kGreedWaveSpawn = 0x416910, kDifficulty = 0x269c8, kGreedWave = 0x18334;
+constexpr std::array<std::uint8_t, 5> kGreedWaveEntry{0x55, 0x8B, 0xEC, 0x6A, 0xFF};   // push ebp; mov ebp, esp; push -1
+constexpr std::int32_t kGreedDifficulty = 2, kGreedierDifficulty = 3; constexpr std::uint32_t kGreedArena = 84;
 constexpr char kIsolated[] = "IsaacAuthority-";
 constexpr int kKeyboard = 0;
 // Entity: exists +0x172, dead +0x173, position +0x33c, velocity +0x360, hit points +0x380, maximum +0x384, seed +0x3ec.
@@ -455,7 +473,7 @@ constexpr std::array<std::uint8_t, 6> kGetLayerEntry{0x55, 0x8B, 0xEC, 0x6A, 0xF
 // The rules that can be left out: the third word of the configuration is their mask in hex.
 constexpr std::uint32_t kFollow = 1, kBehaviour = 2, kClear = 4, kTaken = 8, kGridRule = 16, kFire = 32, kProjectiles = 64, kTears = 128, kDrops = 256,
     kCounters = 512, kDoors = 1024, kTraps = 2048, kBombsRule = 4096, kHurt = 8192, kSlotsRule = 16384, kPets = 32768, kLead = 65536, kLook = 131072, kJoin = 262144, kGate = 524288,
-    kDeal = 1048576, kHits = 2097152, kSteady = 4194304, kMaze = 8388608, kSummons = 16777216, kAllRules = 0x1FFFFFF;
+    kDeal = 1048576, kHits = 2097152, kSteady = 4194304, kMaze = 8388608, kSummons = 16777216, kGreed = 33554432, kAllRules = 0x3FFFFFF;
 constexpr int kTakenRetryFrames = 30, kAliveBodies = 5, kGoneBodies = 5, kRevivalGraceFrames = 90; constexpr float kTakenReach = 120.0f;
 // A dead player of several becomes a ghost (Entity_Player::MorphToCoopGhost, RVA 0x3d96f0: the death is taken back with
 // Revive, the ghost byte +0x20a9 is set, the collisions go) and comes back with Entity_Player::RevivePlayerGhost (RVA
@@ -523,6 +541,10 @@ struct Stats {
     // A pedestal's item is the host's to hand out: a guest's claims sent, and taken on the host's grant; the host's grants and
     // its refusals (its own pedestal was empty by then - it or another player had taken the item first).
     std::uint32_t claimsSent, claimsGranted, claimsRefused, grantsPlayed;
+    // Greed mode at a guest: its game's own spawnings of a wave held while the host was here to say; waves spawned by the
+    // host's word. And pickups removed as a second one of a seed the host names once (made from his list, and then by
+    // this game's own code as well: a wave's coins, a shop's restocking).
+    std::uint32_t greedWavesHeld, greedWavesMade, dropTwinsRemoved;
     float correctionSum, correctionMax, npcCorrectionSum, npcCorrectionMax;
 };
 #pragma pack(pop)
@@ -554,6 +576,7 @@ using DequeClear = void(__thiscall*)(void*);
 using DequePush = void(__thiscall*)(void*, const float*);   // a deque of points: the point is copied
 using GetLayer = std::uintptr_t(__thiscall*)(void*, int);         // the sprite: the layer's number
 using DealDoor = char(__thiscall*)(void*, char, char);            // the room: animate, force
+using GreedWaveSpawn = void(__thiscall*)(void*, int);              // the room; 1 from the wave's timer, 0 from the button (never read)
 using InitDeal = void(__thiscall*)(void*, char, char);            // the game (its level): force an angel's room, force a devil's
 using RoomByIdx = std::uintptr_t(__thiscall*)(void*, int, int);   // the game (its level): grid index, dimension (-1: the present one)
 std::uintptr_t base = 0;
@@ -754,6 +777,12 @@ int __fastcall OnInput(void* self, void*, int controller, void* reader, void* in
 
 // The floor as one number: the game's stage and stage type.
 std::uint32_t Floor(std::uintptr_t game) { return (*reinterpret_cast<std::uint32_t*>(game) & 0xffff) | (*reinterpret_cast<std::uint32_t*>(game + 4) << 16); }
+
+// Greed or greedier: the modes whose floors fight waves (see kGreedWaveSpawn).
+bool GreedMode(std::uintptr_t game) {
+    const auto difficulty = *reinterpret_cast<std::int32_t*>(game + kDifficulty);
+    return difficulty == kGreedDifficulty || difficulty == kGreedierDifficulty;
+}
 
 // The frame this game's own network manager counts. Not a clock shared with anybody - with the rule "gate" the games count
 // apart, and that is the whole reason a world carries its sender's (see World::senderFrame).
@@ -1080,7 +1109,12 @@ void PublishWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t room
     publishedWorld.generation |= 1;   // odd: being written, also after a write that never finished
     auto& world = publishedWorld.world; world.magic = kWorldMagic; world.sequence = ++worldSequence; world.room = roomIndex; world.count = 0;
     world.senderFrame = NetFrame();   // the key a reader outside lines two games' records up by (see native_state.hpp)
-    if (const auto game = At<std::uintptr_t>(base + kGame)) world.floor = Floor(game);
+    world.greedWave = 0;
+    if (const auto game = At<std::uintptr_t>(base + kGame)) {
+        world.floor = Floor(game);
+        const auto wave = At<std::uint32_t>(game + kGreedWave);   // a world past the range is thrown away whole
+        if (GreedMode(game)) world.greedWave = wave < kMostGreedWave ? wave : kMostGreedWave;
+    }
     const auto descriptor = At<std::uintptr_t>(room + kDescriptor); world.clear = descriptor ? At<std::uint32_t>(descriptor + kRoomFlags) & 1 : 0;
     world.npcTotal = 0;
     for (std::uint32_t i = 0; i < count; ++i) {
@@ -1239,8 +1273,20 @@ void ApplyDrops(std::uintptr_t room, const World& world) {
     for (std::uint32_t i = 0; i < listCount; ++i) {
         const auto entity = At<std::uintptr_t>(data + i * sizeof(std::uintptr_t));
         if (!entity || !LivingPickup(entity)) continue;
-        const auto seed = At<std::uint32_t>(entity + kSeed); std::uint32_t n = 0;
-        while (n < world.drops && (taken[n] || world.drop[n].seed != seed)) ++n;
+        // Of the host's pickups under this seed the one of this kind first: the game itself now and then puts two of one
+        // seed into a room (a shop's coin and heart, in both games alike), and a pairing across them fixes nothing.
+        const auto seed = At<std::uint32_t>(entity + kSeed), variant = At<std::uint32_t>(entity + kVariant); std::uint32_t n = 0;
+        while (n < world.drops && (taken[n] || world.drop[n].seed != seed || world.drop[n].variant != variant)) ++n;
+        if (n == world.drops) { n = 0; while (n < world.drops && (taken[n] || world.drop[n].seed != seed)) ++n; }
+        // A second one of a seed whose every pickup at the host has its pair here already: made from the host's list and
+        // then by this game's own code as well - a greed wave's coins, a shop's restocking (both seen in a match through
+        // Steam, 23 September: two of one seed lying in the guest's room). It would never grow old enough to go - the
+        // first of the two sets the seed's age back every snapshot (InStep) - so it goes at once.
+        if (n == world.drops && removeCount < kMaxDrops) {
+            bool named = false;
+            for (std::uint32_t m = 0; m < world.drops && !named; ++m) named = world.drop[m].seed == seed;
+            if (named) { remove[removeCount++] = entity; stats.dropTwinsRemoved++; continue; }
+        }
         if (n < world.drops) {
             const auto& drop = world.drop[n]; taken[n] = true; Learn(knownDrops, seed);
             if (At<std::uint32_t>(entity + kVariant) != drop.variant) continue;   // opened or changed here a moment ago: the owner's taking settles it
@@ -1437,6 +1483,17 @@ void FlameToHitPoints(std::uintptr_t entity) {
     At<float>(layer + kLayerScale) = wide; At<float>(layer + kLayerScale + 4) = high; stats.flameFixes++;
 }
 
+// Guest, greed mode: the host's game has spawned a later wave than this one - the next is spawned here with the game's own
+// function (its own spawnings are held, see OnGreedWave). Before the host's lists are held against the room: the wave's
+// enemies and coins are born here under the host's seeds and are his at once, instead of being made from his list and
+// then a second time by this game. One a world; a game further behind catches up over the next ones. Only in the room the
+// waves are fought in: the world is of the room this game is in, and a wave spawned in a shop would be a wave in a shop.
+void CallGreedWave(void* room);
+void ApplyGreedWave(std::uintptr_t game, std::uintptr_t room, std::uint32_t roomIndex, const World& world) {
+    if (roomIndex != kGreedArena || !GreedMode(game) || world.greedWave <= At<std::uint32_t>(game + kGreedWave)) return;
+    CallGreedWave(reinterpret_cast<void*>(room)); stats.greedWavesMade++;
+}
+
 // Guest: the host's enemies over the local ones.
 void ApplyGrants(std::uintptr_t player, std::uintptr_t room, const World& world);
 
@@ -1471,6 +1528,7 @@ void ApplyWorld(std::uintptr_t player, std::uintptr_t room, std::uint32_t roomIn
     hostClearRoom.store(world.room); hostClear.store(world.clear); hostHeardAt.store(GetTickCount64());
     if (aliasRoom != roomIndex) { aliasRoom = roomIndex; aliasCount = 0; orphanCount = 0; missingCount = 0; dropAgeCount = 0; touchAgeCount = 0; doorMemoryCount = 0; slotAgeCount = 0; takenDrops = Known{}; summonedCount = 0; }
     if (On(kCounters)) if (const auto game = At<std::uintptr_t>(base + kGame)) { doing = kCounters; ApplyCounters(game, player, world); doing = 0; }
+    if (On(kGreed) && gameNow) { doing = kGreed; ApplyGreedWave(gameNow, room, roomIndex, world); doing = 0; }   // before the list is read: the wave's enemies are in it
     const auto data = At<std::uintptr_t>(room + kListData); const auto count = At<std::uint32_t>(room + kListCount);
     if (!data || count > 4096) return;
     std::uintptr_t local[kMaxNpcs]; int partner[kMaxNpcs]; bool taken[kMaxNpcs]{}; std::uint32_t locals = 0;
@@ -2467,10 +2525,27 @@ char __fastcall OnFrameGate(void* net, void*);
 char __fastcall OnProcessInput(void* device, void*, void* message, void* control);
 char __fastcall OnDealDoor(void* room, void*, char animate, char force);
 void* __fastcall OnSpawn(void* game, void*, std::uint32_t type, std::uint32_t variant, const float* position, const float* velocity, void* spawner, std::uint32_t subtype, std::uint32_t seed);
+void __fastcall OnGreedWave(void* room, void*, int fromTimer);
 CodeHook gateHook{kFrameGate, 6, kFrameGateEntry.data(), reinterpret_cast<void*>(&OnFrameGate)}, inputHook{kProcessInput, 5, kProcessInputEntry.data(), reinterpret_cast<void*>(&OnProcessInput)},
     dealHook{kDealDoor, 6, kDealDoorEntry.data(), reinterpret_cast<void*>(&OnDealDoor)},
     // Game::Spawn: push ebp; mov ebp, esp; and esp, -8; push 0 - whole instructions, nothing in them that moves with the image.
-    spawnHook{kSpawn, 8, kSpawnEntry.data(), reinterpret_cast<void*>(&OnSpawn)};
+    spawnHook{kSpawn, 8, kSpawnEntry.data(), reinterpret_cast<void*>(&OnSpawn)},
+    // SpawnGreedModeWave: push ebp; mov ebp, esp; push -1 - the push of the handler's address that follows is left in place.
+    greedHook{kGreedWaveSpawn, 5, kGreedWaveEntry.data(), reinterpret_cast<void*>(&OnGreedWave)};
+
+// The game's own spawning of a greed wave, past this module's hold.
+void CallGreedWave(void* room) {
+    const auto spawn = greedHook.hooked ? reinterpret_cast<GreedWaveSpawn>(greedHook.trampoline) : reinterpret_cast<GreedWaveSpawn>(base + kGreedWaveSpawn);
+    spawn(room, 1);
+}
+
+// A guest's game spawns no greed wave of its own - neither when its timer runs out nor when a player steps on the button -
+// while the host is here to say when (ApplyGreedWave spawns his). A host that has gone silent or is in another room says
+// nothing, and then the game goes its own way as it always did.
+void __fastcall OnGreedWave(void* room, void*, int fromTimer) {
+    if (Live() && !host && On(kGreed) && HostRules()) { stats.greedWavesHeld++; return; }
+    reinterpret_cast<GreedWaveSpawn>(greedHook.trampoline)(room, fromTimer);
+}
 
 // An enemy made by a guest's own enemy while the host is here to say which enemies there are: hidden and harmless from
 // its first frame, and the host's list decides (see summoned). Nothing is refused - the game's own code goes on to write
@@ -2778,7 +2853,9 @@ void WriteStatus() {
                     << ", deaths held at the update " << stats.deathsHeldAtUpdate << ", flames sized " << stats.flameFixes << "; worlds dropped as overtaken " << stats.worldsLate
                     << " of " << stats.worldReceived << " (cushion " << stats.worldCushion << " frames, clock started anew " << stats.worldsRebased << " times); deal: own rolls held " << stats.dealsHeld << ", doors made by the host's word "
                     << stats.dealDoorsMade << " (failed " << stats.dealDoorFailures << ", in another place " << stats.dealElsewhere << ", of another kind " << stats.dealOtherKind << ")"
-                    << "; enemies' own summons held hidden " << stats.summonsHeld << " (became the host's " << stats.summonsPaired << ", removed " << stats.summonsRemoved << ")";
+                    << "; enemies' own summons held hidden " << stats.summonsHeld << " (became the host's " << stats.summonsPaired << ", removed " << stats.summonsRemoved << ")"
+                    << "; greed waves: own held " << stats.greedWavesHeld << ", spawned by the host's word " << stats.greedWavesMade
+                    << "; pickups two of one seed, the second removed " << stats.dropTwinsRemoved;
         status << "; copies: sent to their death " << stats.copyDeaths << ", brought back " << stats.copyRevivals << " (from the ghost " << stats.copyGhostRevivals << ", could not be " << stats.copyRevivalsMissed
                << "); takings told " << stats.taken << " / played from others " << stats.takenApplied << " / missed " << stats.takenMissed
                << " (no record " << stats.takenNoRecord << ", elsewhere " << stats.takenElsewhere << ", nothing here to take " << stats.takenNoTwin
@@ -3089,6 +3166,19 @@ void Begin(const Setup& setup) {
                 ExchangeSlot(playerDamageSlot, reinterpret_cast<void*>(&OnPlayerDamage), reinterpret_cast<void*>(originalPlayerDamage));
             }
         }
+        // In greed mode a guest's game spawns no wave of its own: when the next comes is the host's word (see kGreedWaveSpawn).
+        if (!failure && !host && (rules & kGreed)) {
+            failure = HookCode(greedHook);
+            if (failure) {
+                UnhookCode(greedHook); UnhookCode(spawnHook); UnhookCode(dealHook); UnhookJoins(); UnhookCode(gateHook); UnhookCode(inputHook); UnhookGrid(); UnhookClear();
+                ExchangeSlot(slotSlot, reinterpret_cast<void*>(&OnSlotCollision), reinterpret_cast<void*>(originalSlotCollision));
+                ExchangeSlot(pickupSlot, reinterpret_cast<void*>(&OnPickupCollision), reinterpret_cast<void*>(originalCollision));
+                ExchangeSlot(slot, reinterpret_cast<void*>(&OnInput), reinterpret_cast<void*>(original));
+                ExchangeSlot(playerSlot, reinterpret_cast<void*>(&OnPlayer), reinterpret_cast<void*>(originalPlayer));
+                ExchangeSlot(damageSlot, reinterpret_cast<void*>(&OnNpcDamage), reinterpret_cast<void*>(originalDamage));
+                ExchangeSlot(playerDamageSlot, reinterpret_cast<void*>(&OnPlayerDamage), reinterpret_cast<void*>(originalPlayerDamage));
+            }
+        }
         // Nothing written over the game's code may outlive a start that failed: End() runs only while the module does, and
         // a game left without the maze's rolls would go on without them through every run of its own until it is closed.
         if (failure) { running = false; CloseNetwork(); ReleaseMazeRolls(); if (carried) Patch(kCompare, kCompareEntry, kCompareEqual); throw failure; }
@@ -3113,7 +3203,7 @@ DWORD End(bool restoreCompare) {
         // Between two starts within one match (a player came or left) the newcomers' queue stays watched.
         if (restoreCompare || !matchChanged.load(std::memory_order_relaxed)) UnhookJoins();
         if (restoreCompare) matchChanged.store(false, std::memory_order_relaxed);
-        UnhookCode(spawnHook); UnhookCode(dealHook); UnhookCode(gateHook); UnhookCode(inputHook); UnhookGrid(); UnhookClear();
+        UnhookCode(greedHook); UnhookCode(spawnHook); UnhookCode(dealHook); UnhookCode(gateHook); UnhookCode(inputHook); UnhookGrid(); UnhookClear();
         result = ExchangeSlot(slot, reinterpret_cast<void*>(&OnInput), reinterpret_cast<void*>(original));
         const DWORD second = ExchangeSlot(playerSlot, reinterpret_cast<void*>(&OnPlayer), reinterpret_cast<void*>(originalPlayer));
         const DWORD third = ExchangeSlot(damageSlot, reinterpret_cast<void*>(&OnNpcDamage), reinterpret_cast<void*>(originalDamage));
@@ -3163,7 +3253,7 @@ void FollowLog(const std::filesystem::path& path) {
 
 // The state, where the player sees it without looking for a file: the end of the game window's title. It is there from the
 // main menu on ("loaded"), so that a player knows the module is in before a match begins.
-constexpr wchar_t kVersionText[] = L"0.1.11";
+constexpr wchar_t kVersionText[] = L"0.1.12";
 void ShowState(const wchar_t* text) {
     static HWND window = nullptr;
     if (!window || !IsWindow(window)) {
@@ -3185,13 +3275,28 @@ void ShowState(const wchar_t* text) {
     if (caption != current) SetWindowTextW(window, caption.c_str());
 }
 
+// Online with mods. The game asks one function whether online play is barred by mods (RVA 0x50e7c0): it reads the mods'
+// state (Manager+0x4a91c) and for 2, 3 and 4 puts up ONLINE_MODS_NEEDS_RESTART, ONLINE_MODS_PERMABANNED or
+// ONLINE_MODS_BANNED and says "barred"; for anything else it says nothing. The three conditional jumps to those messages
+// become no-ops, so it always says nothing - the six bytes the old patcher (IsaacOnlineModded 1.4.0, "co-op mods") wrote
+// into the EXE, written here into the running game instead, and nothing on disk changes. On by default at the user's
+// word; %LOCALAPPDATA%\IsaacAuthority\mods.off (the installer's -NoMods) leaves the game's bar in place. Every player's
+// mods must be the same ones: a mod that rolls the game's generators in Lua still diverges the games.
+constexpr std::uintptr_t kModsBar = 0x50e805;
+constexpr std::array<std::uint8_t, 15> kModsBarEntry{0x83, 0xE8, 0x02, 0x74, 0x2A, 0x83, 0xE8, 0x01, 0x74, 0x1E, 0x83, 0xE8, 0x01, 0x74, 0x12};
+constexpr std::array<std::uint8_t, 15> kModsBarLifted{0x83, 0xE8, 0x02, 0x90, 0x90, 0x83, 0xE8, 0x01, 0x90, 0x90, 0x83, 0xE8, 0x01, 0x90, 0x90};
+void LiftModsBar() {
+    std::error_code ignored;
+    if (!std::filesystem::exists(OwnFolder() / L"mods.off", ignored)) Patch(kModsBar, kModsBarLifted, kModsBarEntry);
+}
+
 DWORD WINAPI Supervise(void*) noexcept {
     Done done; std::uint32_t startedNumber = 0, startedRoster = 0; bool unsupported = false; std::filesystem::path gameLog; const wchar_t* why = L"";
     try {
         static wchar_t image[32768]{};
         unsupported = !GetModuleFileNameW(nullptr, image, 32768) || !isaac_probe::AnalyzeBytes(isaac_probe::ReadFile(image)).supported;
         base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
-        if (!unsupported) gameLog = LogPath();
+        if (!unsupported) { gameLog = LogPath(); LiftModsBar(); }
     } catch (...) { unsupported = true; }
     while (supervising.load(std::memory_order_acquire)) {
         Sleep(250);

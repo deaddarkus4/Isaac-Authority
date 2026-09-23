@@ -31,10 +31,14 @@ constexpr std::uint8_t kOfBody = 1, kOfShots = 2, kOfWorld = 3, kOfHello = 4;
 //     here is not filled again for another player's taking. The rules' mask is wider by the new rule: an 11 would be told
 //     "the players' rules differ" instead of being told it is another version. A pedestal's item is the host's to hand
 //     out: a guest claims it, and the world carries the host's grants (World::grant) - so the world is longer again.
-constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 12;   // "HEL1"
+// 13: in greed mode the next wave is the host's to start (the rule "greed"): a guest's game starts none of its own, and
+//     the world carries the host's wave (World::greedWave) - a guest that still started its own would spawn a wave the
+//     host's list then takes back, or spawn a second of one the list has made already.
+constexpr std::uint32_t kHelloMagic = 0x314C4548, kProtocol = 13;   // "HEL1"
 constexpr std::uint32_t kGridCollisionClasses = 8, kEntityCollisionClasses = 5;   // the game's enums: GRIDCOLL_NONE..PITSONLY, ENTCOLL_NONE..ALL
 constexpr std::uint32_t kNpcParts = 3, kNpcHidden = 4;                              // in Npc::linked
 constexpr std::uint8_t kDevilRoom = 14, kAngelRoom = 15;                           // the game's RoomType of the two deals
+constexpr std::uint32_t kMostGreedWave = 12;   // the game's spawning of a greed wave (RVA 0x416910) never counts past 12: greedier's last
 constexpr std::uint8_t kHere = 0, kCompareOff = 1, kLive = 2;
 constexpr int kHealthFields = 10, kMaxTaken = 8, kAnimationName = 24, kMaxNpcs = 48, kMaxDeaths = 16;
 constexpr std::uint32_t kMaxCells = 96, kGridMapBytes = 56, kMaxBorn = 48, kMaxShots = 64, kMaxTears = 32, kMaxSlots = 8, kMaxPets = 24, kMaxEnemyBombs = 16,
@@ -90,6 +94,11 @@ struct World {
     std::uint32_t senderFrame;
     std::int32_t coins, bombs, keys;
     std::uint32_t grants;
+    // Greed mode: the wave the host's game has started last on this floor (Game+0x18334, the counter behind Lua's
+    // Level.GreedModeWave), 0 in any other mode. What a wave spawns is fixed by its number and the floor's seeds - the two
+    // games spawned the same 66 waves in the same order in a match through Steam - but when it comes each game decided by
+    // itself, and they came up to ten seconds apart.
+    std::uint32_t greedWave;
     Npc npcs[kMaxNpcs]; std::uint32_t died[kMaxDeaths]; Cell grid[kMaxCells]; Shot shot[kMaxShots]; Drop drop[kMaxDrops]; DoorState door[kMaxDoors]; Shot enemyBomb[kMaxEnemyBombs]; SlotState slot[kMaxSlots]; Born bornCell[kMaxBorn]; std::uint8_t gridMap[kGridMapBytes];
     Grant grant[kMaxGrants];
 };
@@ -109,7 +118,7 @@ struct Hello { std::uint32_t magic, protocol, rules; std::uint8_t controller, ho
 static_assert(sizeof(Taken) == 32 && sizeof(Body) == 76 + 4 * kHealthFields + kMaxTaken * 32 && sizeof(Npc) == 124 && sizeof(Pet) == 32 && sizeof(Cell) == 8 && sizeof(Shot) == 108 && sizeof(Hit) == 36 &&
               sizeof(Shots) == 32 + kMaxTears * 108 + kMaxPets * 32 + kMaxHits * 36 &&
               sizeof(Drop) == 44 && sizeof(DoorState) == 12 && sizeof(SlotState) == 64 && sizeof(Born) == 16 && sizeof(FrameHeader) == 20 && sizeof(Hello) == 16 &&
-              sizeof(Grant) == 16 && sizeof(World) == 92 + kMaxNpcs * 124 + kMaxDeaths * 4 + kMaxCells * 8 + kMaxShots * 108 + kMaxDrops * 44 + kMaxDoors * 12 + kMaxEnemyBombs * 108 + kMaxSlots * 64 +
+              sizeof(Grant) == 16 && sizeof(World) == 96 + kMaxNpcs * 124 + kMaxDeaths * 4 + kMaxCells * 8 + kMaxShots * 108 + kMaxDrops * 44 + kMaxDoors * 12 + kMaxEnemyBombs * 108 + kMaxSlots * 64 +
                                    kMaxBorn * 16 + kGridMapBytes + kMaxGrants * 16 && sizeof(Shots) != sizeof(Body) && sizeof(FrameHeader) + kChunkBytes <= 1200 &&
               sizeof(World) <= kMaxChunks * kChunkBytes, "wire layout");
 

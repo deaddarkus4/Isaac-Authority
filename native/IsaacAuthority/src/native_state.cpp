@@ -132,7 +132,8 @@ bool ValidShot(const Shot& shot) {
 
 bool ValidWorld(const World& world) {
     if (world.magic != kWorldMagic || !world.sequence || world.count > kMaxNpcs || world.deaths > kMaxDeaths || world.cells > kMaxCells || world.shots > kMaxShots ||
-        world.drops > kMaxDrops || world.doors > kMaxDoors || world.enemyBombs > kMaxEnemyBombs || world.slots > kMaxSlots || world.born > kMaxBorn || world.grants > kMaxGrants) return false;
+        world.drops > kMaxDrops || world.doors > kMaxDoors || world.enemyBombs > kMaxEnemyBombs || world.slots > kMaxSlots || world.born > kMaxBorn || world.grants > kMaxGrants ||
+        world.greedWave > kMostGreedWave) return false;
     for (std::uint32_t n = 0; n < world.doors; ++n) if (world.door[n].deal && world.door[n].deal != kDevilRoom && world.door[n].deal != kAngelRoom) return false;
     for (std::uint32_t n = 0; n < world.slots; ++n) if (!Finite(world.slot[n].position) || world.slot[n].animation[kAnimationName - 1]) return false;
     for (std::uint32_t n = 0; n < world.enemyBombs; ++n) if (!ValidShot(world.enemyBomb[n])) return false;

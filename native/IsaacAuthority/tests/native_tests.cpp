@@ -16,7 +16,7 @@ std::unique_ptr<World> Room() {
     world->npcs[0].seed = 11; world->npcs[0].hitPoints = 10; std::memcpy(world->npcs[0].animation, "WalkVert", 9); world->npcs[1].seed = 12; world->npcs[1].position[0] = 100;
     world->died[0] = 9; world->shot[0] = Tear(); world->drop[0].seed = 31; world->drop[0].variant = 20; world->door[0].cell = 7; world->door[0].state = 2; world->door[0].deal = 14; world->dealSeed = 0xf20729e3;
     world->bornCell[0].index = 40; world->bornCell[0].type = 14; world->bornCell[0].state = 250; world->gridMap[5] = 0x80; world->coins = 15;
-    world->grants = 1; world->grant[0] = Grant{0x5f3a01u, 3, 0x1d20f6fd, 359};
+    world->grants = 1; world->grant[0] = Grant{0x5f3a01u, 3, 0x1d20f6fd, 359}; world->greedWave = 7;
     return world;
 }
 
@@ -61,6 +61,8 @@ void Ranges() {
     world = Room(); world->doors = kMaxDoors + 1; Check(!ValidWorld(*world), "more doors than the list holds");
     world = Room(); world->door[0].deal = 3; Check(!ValidWorld(*world), "a door to a deal leads to a devil's room or an angel's");
     world = Room(); world->grants = kMaxGrants + 1; Check(!ValidWorld(*world), "more grants than the list holds");
+    world = Room(); world->greedWave = kMostGreedWave; Check(ValidWorld(*world), "greedier's last wave");
+    world = Room(); world->greedWave = kMostGreedWave + 1; Check(!ValidWorld(*world), "a wave past any the game counts to");
 }
 
 FrameHeader Header(std::uint32_t sequence, std::uint32_t total, std::uint8_t chunk) {
